@@ -3284,10 +3284,10 @@ parse_and_exec_simple:
     jz .child_exec
     js .fork_error
 
-    ; Parent: restore cooked terminal so child gets normal I/O + ISIG
+    ; Parent: set cooked terminal with ISIG so Ctrl-Z works on child
     mov [child_pid], rax
     mov r13, rax             ; save child pid
-    call restore_termios
+    call enable_cooked_mode
     sub rsp, 16
 .paes_wait:
     mov rdi, r13
@@ -5306,6 +5306,29 @@ enable_raw_mode:
     lea rdx, [raw_termios]
     syscall
 .erm_ret:
+    ret
+
+; Enable cooked mode with ISIG for child process execution
+; Takes orig_termios and ensures ICANON, ECHO, ISIG are set
+enable_cooked_mode:
+    cmp qword [is_tty], 0
+    je .ecm_ret
+    ; Copy orig_termios to raw_termios as temp
+    lea rsi, [orig_termios]
+    lea rdi, [raw_termios]
+    mov rcx, 60
+    rep movsb
+    ; Ensure ICANON, ECHO, ISIG are set in c_lflag
+    mov eax, [raw_termios + 12]
+    or eax, (ICANON | ECHO | ISIG)
+    mov [raw_termios + 12], eax
+    ; Apply
+    mov rax, SYS_IOCTL
+    xor edi, edi
+    mov esi, TCSETSW
+    lea rdx, [raw_termios]
+    syscall
+.ecm_ret:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
