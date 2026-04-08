@@ -224,6 +224,9 @@ nick_arrow:     db " = ", 0
 clear_screen_seq: db 27, "[2J", 27, "[H"
 clear_screen_len equ $ - clear_screen_seq
 
+; Clear to end of line (used for suggestion cleanup)
+clr_eol_global: db 27, "[0K"
+
 ; Default PATH for searching executables
 default_path:   db "/usr/local/bin:/usr/bin:/bin", 0
 
@@ -443,9 +446,12 @@ brace_buf:      resb 4096
 ; History search
 search_buf:     resb 256
 search_len:     resq 1
+rs_skip_count:  resq 1              ; how many matches to skip (Ctrl-R again)
 
 ; Inline suggestion
 suggestion_buf: resb 4096
+suggestion_ptr: resq 1              ; pointer to suggestion remainder
+suggestion_len: resq 1              ; length of suggestion
 
 ; Undo stack (4 snapshots of line_buf)
 undo_stack:     resb 16384
@@ -665,6 +671,20 @@ read_line:
 
     movzx eax, byte [tmp_buf]
 
+    ; Clear any displayed suggestion (erase gray text)
+    cmp qword [suggestion_len], 0
+    je .no_clear_suggest
+    push rax
+    mov qword [suggestion_len], 0
+    ; Clear from cursor to end of display line
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, 3
+    syscall
+    pop rax
+.no_clear_suggest:
+
     ; Ctrl-D on empty line = EOF
     cmp al, 4
     je .check_eof
@@ -700,6 +720,10 @@ read_line:
     ; Ctrl-K = kill to end of line
     cmp al, 11
     je .kill_to_end
+
+    ; Ctrl-R = reverse history search
+    cmp al, 18
+    je .reverse_search
 
     ; Ctrl-A = home
     cmp al, 1
@@ -755,10 +779,49 @@ read_line:
     ; If cursor is not at end, redraw the rest and reposition
     mov rcx, [line_len]
     cmp r12, rcx
-    jge .read_char
+    jge .show_suggestion
     call redraw_from_cursor
-
     jmp .read_char
+
+.show_suggestion:
+    ; Show inline history suggestion (gray text after cursor)
+    call find_history_suggestion
+    test rax, rax
+    jz .read_char
+    ; rax = pointer to suggestion remainder, rdx = length
+    ; Save suggestion for right-arrow acceptance
+    mov [suggestion_ptr], rax
+    mov [suggestion_len], rdx
+    ; Write gray color
+    push rax
+    push rdx
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.suggest_color]
+    mov rdx, .suggest_color_len
+    syscall
+    pop rdx
+    pop rax
+    ; Write suggestion text
+    push rdx
+    mov rsi, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    pop rdx
+    syscall
+    ; Reset color + move cursor back
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.suggest_reset]
+    mov rdx, 4
+    syscall
+    ; Reposition cursor back to actual position
+    call reposition_cursor
+    jmp .read_char
+
+.suggest_color: db 27, "[38;5;240m"
+.suggest_color_len equ $ - .suggest_color
+.suggest_reset: db 27, "[0m"
 
 .backspace:
     test r12, r12
@@ -861,6 +924,179 @@ read_line:
     call reposition_cursor
     jmp .read_char
 
+.reverse_search:
+    ; Ctrl-R: incremental reverse history search
+    ; Show "(reverse-i-search)': " prompt, read chars, filter history
+    push r12                 ; save cursor pos
+    mov qword [search_len], 0
+    mov byte [search_buf], 0
+
+.rs_redraw:
+    ; Move to beginning of line and clear
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.rs_cr]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, 3
+    syscall
+    ; Print search prompt
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.rs_prompt]
+    mov rdx, .rs_prompt_len
+    syscall
+    ; Print search string
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [search_buf]
+    mov rdx, [search_len]
+    syscall
+    ; Print ': and matching history entry
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.rs_sep]
+    mov rdx, 3
+    syscall
+    ; Find matching history entry
+    call find_reverse_match
+    test rax, rax
+    jz .rs_no_match
+    ; Print the match
+    push rax
+    mov rdi, rax
+    call strlen
+    mov rdx, rax
+    pop rsi
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    syscall
+.rs_no_match:
+
+.rs_read_key:
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    test rax, rax
+    jle .rs_cancel
+
+    movzx eax, byte [tmp_buf]
+
+    ; Enter: accept the match
+    cmp al, 10
+    je .rs_accept
+    cmp al, 13
+    je .rs_accept
+
+    ; Ctrl-G or Escape: cancel
+    cmp al, 7
+    je .rs_cancel
+    cmp al, 27
+    je .rs_cancel
+
+    ; Ctrl-C: cancel
+    cmp al, 3
+    je .rs_cancel
+
+    ; Backspace: remove last search char
+    cmp al, 127
+    je .rs_backspace
+    cmp al, 8
+    je .rs_backspace
+
+    ; Ctrl-R again: search for next match (older)
+    cmp al, 18
+    je .rs_next
+
+    ; Regular char: add to search
+    cmp al, 32
+    jl .rs_read_key          ; ignore other control chars
+    mov rcx, [search_len]
+    cmp rcx, 250
+    jge .rs_read_key
+    mov [search_buf + rcx], al
+    inc rcx
+    mov [search_len], rcx
+    mov byte [search_buf + rcx], 0
+    mov qword [rs_skip_count], 0  ; reset skip on new char
+    jmp .rs_redraw
+
+.rs_backspace:
+    mov rcx, [search_len]
+    test rcx, rcx
+    jz .rs_read_key
+    dec rcx
+    mov [search_len], rcx
+    mov byte [search_buf + rcx], 0
+    mov qword [rs_skip_count], 0
+    jmp .rs_redraw
+
+.rs_next:
+    ; Search for next older match
+    inc qword [rs_skip_count]
+    jmp .rs_redraw
+
+.rs_accept:
+    ; Copy matching history entry to line_buf
+    call find_reverse_match
+    test rax, rax
+    jz .rs_cancel
+    mov rsi, rax
+    lea rdi, [line_buf]
+    xor rcx, rcx
+.rs_copy:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .rs_copy_done
+    inc rcx
+    jmp .rs_copy
+.rs_copy_done:
+    mov [line_len], rcx
+    pop r12                  ; restore saved cursor
+    mov r12, rcx             ; cursor at end
+    ; Redraw normal prompt + line
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.rs_cr]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, 3
+    syscall
+    call print_prompt
+    call full_redraw
+    jmp .read_char
+
+.rs_cancel:
+    pop r12                  ; restore cursor
+    ; Redraw normal prompt + line
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.rs_cr]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, 3
+    syscall
+    call print_prompt
+    call full_redraw
+    jmp .read_char
+
+.rs_cr: db 13
+.rs_prompt: db "(reverse-i-search)`"
+.rs_prompt_len equ $ - .rs_prompt
+.rs_sep: db "': "
+
 .escape_seq:
     ; Read next two bytes for arrow keys etc.
     mov rax, SYS_READ
@@ -899,7 +1135,7 @@ read_line:
 
 .cursor_right:
     cmp r12, [line_len]
-    jge .read_char
+    jge .accept_suggestion
     inc r12
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -908,6 +1144,35 @@ read_line:
     syscall
     jmp .read_char
 .right_seq: db 27, '[', 'C'
+
+.accept_suggestion:
+    ; Accept inline suggestion if available
+    mov rax, [suggestion_len]
+    test rax, rax
+    jz .read_char
+    mov rsi, [suggestion_ptr]
+    ; Append suggestion to line_buf
+    mov rcx, rax
+    mov rdi, r12             ; cursor (= line_len)
+.as_copy:
+    test rcx, rcx
+    jz .as_done
+    cmp rdi, 4094
+    jge .as_done
+    movzx eax, byte [rsi]
+    mov [line_buf + rdi], al
+    inc rsi
+    inc rdi
+    inc r12
+    dec rcx
+    jmp .as_copy
+.as_done:
+    mov [line_len], r12
+    mov byte [line_buf + r12], 0
+    mov qword [suggestion_len], 0
+    ; Clear suggestion and redraw line
+    call full_redraw
+    jmp .read_char
 
 .cursor_left:
     test r12, r12
@@ -6956,6 +7221,128 @@ add_dir_history:
     add [dir_hist_pos], r12  ; advance position past string + null
     inc qword [dir_hist_count]
 .adh_done:
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Find history entry matching search_buf (substring match, reverse order)
+; Skips rs_skip_count matches for Ctrl-R cycling
+; Returns: rax = pointer to matching history string, or 0
+; ══════════════════════════════════════════════════════════════════════
+find_reverse_match:
+    push rbx
+    push r12
+    push r13
+
+    mov rax, [search_len]
+    test rax, rax
+    jz .frm_none             ; empty search, no match
+
+    mov r12, [hist_count]
+    dec r12                  ; start from most recent
+    xor r13, r13             ; matches skipped so far
+
+.frm_loop:
+    test r12, r12
+    js .frm_none             ; exhausted history
+
+    mov rdi, [hist_lines + r12*8]
+    test rdi, rdi
+    jz .frm_next
+
+    ; Substring search: search_buf in hist_lines[r12]
+    lea rsi, [search_buf]
+    call strstr_simple
+    test rax, rax
+    jz .frm_next
+
+    ; Found a match, check if we should skip it
+    cmp r13, [rs_skip_count]
+    jge .frm_found
+    inc r13
+.frm_next:
+    dec r12
+    jmp .frm_loop
+
+.frm_found:
+    mov rax, [hist_lines + r12*8]
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.frm_none:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Find history suggestion for current line_buf (prefix match)
+; Returns: rax = pointer to remainder (past the prefix), rdx = length
+;          or rax = 0 if no match
+; ══════════════════════════════════════════════════════════════════════
+find_history_suggestion:
+    push rbx
+    push r12
+    push r13
+
+    mov r12, [line_len]
+    test r12, r12
+    jz .fhs_none             ; empty line, no suggestion
+
+    ; Search history from most recent backwards
+    mov r13, [hist_count]
+    dec r13
+
+.fhs_loop:
+    test r13, r13
+    js .fhs_none
+
+    mov rdi, [hist_lines + r13*8]
+    test rdi, rdi
+    jz .fhs_next
+
+    ; Check if this entry starts with line_buf content
+    lea rsi, [line_buf]
+    xor rcx, rcx
+.fhs_prefix_cmp:
+    cmp rcx, r12
+    jge .fhs_prefix_match
+    movzx eax, byte [rsi + rcx]
+    cmp al, [rdi + rcx]
+    jne .fhs_next
+    inc rcx
+    jmp .fhs_prefix_cmp
+
+.fhs_prefix_match:
+    ; Match found - check it's not identical to current input
+    cmp byte [rdi + r12], 0
+    je .fhs_next             ; same string, skip
+
+    ; Return pointer to remainder
+    lea rax, [rdi + r12]     ; start of suggestion (past prefix)
+    ; Calculate length of remainder
+    push rax
+    mov rdi, rax
+    call strlen
+    mov rdx, rax             ; length of suggestion
+    pop rax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fhs_next:
+    dec r13
+    jmp .fhs_loop
+
+.fhs_none:
+    xor eax, eax
+    xor edx, edx
+    pop r13
     pop r12
     pop rbx
     ret
