@@ -673,7 +673,10 @@ read_line:
     movzx eax, byte [tmp_buf]
 
     ; Clear any displayed suggestion (erase gray text)
+    ; But NOT on ESC (27) - right arrow (ESC[C) needs suggestion intact
     cmp qword [suggestion_len], 0
+    je .no_clear_suggest
+    cmp al, 27
     je .no_clear_suggest
     push rax
     mov qword [suggestion_len], 0
@@ -1151,6 +1154,14 @@ read_line:
     mov rax, [suggestion_len]
     test rax, rax
     jz .read_char
+    ; Clear the gray suggestion text first
+    push rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, clr_eol_len
+    syscall
+    pop rax
     mov rsi, [suggestion_ptr]
     ; Append suggestion to line_buf
     mov rcx, rax
