@@ -8718,8 +8718,7 @@ try_expand_abbrev:
 .tea_found_start:
     inc rax
 .tea_at_start:
-    test rax, rax
-    js .tea_no
+    xor eax, eax             ; word starts at position 0
     mov r13, rax             ; word start index
 
     ; Extract word
