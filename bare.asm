@@ -577,9 +577,25 @@ _start:
     ; Brace expansion {a,b,c}
     call expand_braces
 
+    ; Global alias (gnick) expansion
+    call expand_gnicks
+
+    ; Record start time
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    lea rsi, [cmd_start_time]
+    syscall
+
     ; Execute the line (handles chains, pipes, background)
     mov rdi, line_buf
     call execute_chained_line
+
+    ; Record end time and show duration if above threshold
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    lea rsi, [cmd_end_time]
+    syscall
+    call show_cmd_duration
 
     jmp .main_loop
 
@@ -729,6 +745,10 @@ read_line:
     cmp al, 18
     je .reverse_search
 
+    ; Ctrl-G = edit in $EDITOR
+    cmp al, 7
+    je .edit_in_editor
+
     ; Ctrl-A = home
     cmp al, 1
     je .home
@@ -744,6 +764,14 @@ read_line:
     ; Tab = completion
     cmp al, 9
     je .handle_tab
+
+    ; Space: check for abbreviation expansion
+    cmp al, ' '
+    jne .not_space
+    call try_expand_abbrev
+    test rax, rax
+    jnz .read_char           ; abbreviation was expanded, skip normal insert
+.not_space:
 
     ; Regular character: insert at cursor
     cmp r12, 4094
@@ -927,6 +955,157 @@ read_line:
     mov r12, [line_len]
     call reposition_cursor
     jmp .read_char
+
+.edit_in_editor:
+    ; Ctrl-G: write line_buf to temp file, open in $EDITOR, read back
+    call restore_termios
+    ; Build temp file path: /tmp/bare_edit_<pid>
+    lea rdi, [suggestion_buf]     ; reuse as temp path buffer
+    mov dword [rdi], '/tmp'
+    mov dword [rdi+4], '/bar'
+    mov dword [rdi+8], 'e_ed'
+    mov byte [rdi+12], 0
+    ; Create/open temp file
+    mov rax, SYS_OPEN
+    lea rdi, [suggestion_buf]
+    mov rsi, O_WRONLY | O_CREAT | O_TRUNC
+    mov rdx, 0o644
+    syscall
+    test rax, rax
+    js .eie_fail
+    mov rbx, rax             ; fd
+    ; Write line_buf contents
+    mov rax, SYS_WRITE
+    mov rdi, rbx
+    lea rsi, [line_buf]
+    mov rdx, [line_len]
+    syscall
+    ; Write newline
+    mov rax, SYS_WRITE
+    mov rdi, rbx
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+    ; Fork + exec $EDITOR
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    jz .eie_child
+    js .eie_fail
+    ; Parent: wait
+    mov rbx, rax
+    sub rsp, 16
+    mov rax, SYS_WAIT4
+    mov rdi, rbx
+    lea rsi, [rsp]
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    add rsp, 16
+    ; Read file back into line_buf
+    mov rax, SYS_OPEN
+    lea rdi, [suggestion_buf]
+    xor esi, esi             ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .eie_fail
+    mov rbx, rax
+    mov rax, SYS_READ
+    mov rdi, rbx
+    lea rsi, [line_buf]
+    mov rdx, 4094
+    syscall
+    push rax
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+    pop rax
+    test rax, rax
+    jle .eie_fail
+    ; Strip trailing newlines
+    mov rcx, rax
+.eie_strip:
+    dec rcx
+    js .eie_empty
+    cmp byte [line_buf + rcx], 10
+    je .eie_strip
+    inc rcx
+.eie_empty:
+    mov byte [line_buf + rcx], 0
+    mov [line_len], rcx
+    mov r12, rcx             ; cursor at end
+    ; Re-enable raw mode and redraw
+    call enable_raw_mode
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.eie_cr]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, clr_eol_len
+    syscall
+    call print_prompt
+    call full_redraw
+    jmp .read_char
+.eie_fail:
+    call enable_raw_mode
+    jmp .read_char
+.eie_child:
+    ; Look up EDITOR env var
+    mov rdi, [envp]
+    call .eie_find_editor
+    test rax, rax
+    jnz .eie_have_editor
+    lea rax, [.eie_vi]       ; fallback to vi
+.eie_have_editor:
+    ; execve(editor, [editor, tmpfile, NULL], envp)
+    sub rsp, 32
+    mov [rsp], rax            ; argv[0] = editor path
+    lea rcx, [suggestion_buf]
+    mov [rsp + 8], rcx        ; argv[1] = temp file
+    mov qword [rsp + 16], 0   ; argv[2] = NULL
+    mov rdi, rax
+    mov rsi, rsp
+    lea rdx, [env_array]
+    mov rax, SYS_EXECVE
+    syscall
+    mov rax, SYS_EXIT
+    mov edi, 127
+    syscall
+.eie_find_editor:
+    ; Search env_array for EDITOR=
+    push rbx
+    xor rcx, rcx
+.eie_fe_loop:
+    cmp rcx, [env_count]
+    jge .eie_fe_none
+    mov rsi, [env_array + rcx*8]
+    test rsi, rsi
+    jz .eie_fe_next
+    cmp dword [rsi], 'EDIT'
+    jne .eie_fe_next
+    cmp word [rsi+4], 'OR'
+    jne .eie_fe_next
+    cmp byte [rsi+6], '='
+    jne .eie_fe_next
+    lea rax, [rsi+7]
+    pop rbx
+    ret
+.eie_fe_next:
+    inc rcx
+    jmp .eie_fe_loop
+.eie_fe_none:
+    xor eax, eax
+    pop rbx
+    ret
+.eie_cr: db 13
+.eie_vi: db "/usr/bin/vi", 0
 
 .reverse_search:
     ; Ctrl-R: incremental reverse history search
@@ -5090,6 +5269,51 @@ build_hist_path:
     ret
 
 add_history:
+    ; History deduplication check
+    mov rax, [config_flags]
+
+    ; Smart dedup: skip if same as last command
+    test rax, (1 << CFG_HIST_DEDUP_SMART)
+    jz .ah_check_full_dedup
+    mov rcx, [hist_count]
+    test rcx, rcx
+    jz .ah_no_dedup
+    dec rcx
+    mov rdi, [hist_lines + rcx*8]
+    test rdi, rdi
+    jz .ah_no_dedup
+    lea rsi, [line_buf]
+    call strcmp
+    test rax, rax
+    jz .ah_skip_dup           ; same as last, skip
+    jmp .ah_no_dedup
+
+.ah_check_full_dedup:
+    ; Full dedup: skip if anywhere in history
+    test rax, (1 << CFG_HIST_DEDUP_FULL)
+    jz .ah_no_dedup
+    xor rcx, rcx
+.ah_full_scan:
+    cmp rcx, [hist_count]
+    jge .ah_no_dedup
+    push rcx
+    mov rdi, [hist_lines + rcx*8]
+    test rdi, rdi
+    jz .ah_full_next
+    lea rsi, [line_buf]
+    call strcmp
+    test rax, rax
+    jz .ah_skip_dup_pop       ; found duplicate
+.ah_full_next:
+    pop rcx
+    inc rcx
+    jmp .ah_full_scan
+.ah_skip_dup_pop:
+    pop rcx
+.ah_skip_dup:
+    ret
+
+.ah_no_dedup:
     mov rcx, [hist_count]
     cmp rcx, 510
     jge .ah_shift            ; history full, shift down
@@ -8317,3 +8541,344 @@ expand_braces:
     pop r12
     pop rbx
     ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Try to expand abbreviation at cursor position
+; Called when space is pressed. Checks if the word before cursor matches
+; an abbreviation, replaces it if so, adds space, redraws.
+; Returns: rax = 1 if expanded, 0 if not
+; ══════════════════════════════════════════════════════════════════════
+try_expand_abbrev:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    cmp qword [abbrev_count], 0
+    je .tea_no
+
+    ; Find start of current word
+    mov rax, r12
+    dec rax
+.tea_find_start:
+    test rax, rax
+    js .tea_at_start
+    cmp byte [line_buf + rax], ' '
+    je .tea_found_start
+    dec rax
+    jmp .tea_find_start
+.tea_found_start:
+    inc rax
+.tea_at_start:
+    test rax, rax
+    js .tea_no
+    mov r13, rax             ; word start index
+
+    ; Extract word
+    mov rcx, r12
+    sub rcx, r13
+    test rcx, rcx
+    jz .tea_no
+    cmp rcx, 250
+    jg .tea_no
+
+    ; Copy word to search_buf
+    lea rsi, [line_buf + r13]
+    lea rdi, [search_buf]
+    mov rdx, rcx
+    push rcx
+.tea_copy_word:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rdx
+    jnz .tea_copy_word
+    mov byte [rdi], 0
+    pop rcx
+
+    ; Search abbreviations
+    xor r14, r14
+.tea_search:
+    cmp r14, [abbrev_count]
+    jge .tea_no
+    push r14
+    lea rdi, [search_buf]
+    mov rsi, [abbrev_names + r14*8]
+    call strcmp
+    pop r14
+    test rax, rax
+    jz .tea_found
+    inc r14
+    jmp .tea_search
+
+.tea_found:
+    ; Get expansion length
+    mov rdi, [abbrev_values + r14*8]
+    call strlen
+    mov rcx, rax             ; expansion length
+
+    ; Rebuild line in suggestion_buf
+    lea rdi, [suggestion_buf]
+    lea rsi, [line_buf]
+    xor rax, rax
+    ; Copy prefix (before word)
+.tea_cp_pre:
+    cmp rax, r13
+    jge .tea_cp_exp
+    movzx edx, byte [rsi + rax]
+    mov [rdi + rax], dl
+    inc rax
+    jmp .tea_cp_pre
+.tea_cp_exp:
+    ; Copy expansion
+    push rax
+    mov rsi, [abbrev_values + r14*8]
+    xor rdx, rdx
+.tea_cp_exp_ch:
+    cmp rdx, rcx
+    jge .tea_cp_space
+    movzx ebx, byte [rsi + rdx]
+    mov [rdi + rax], bl
+    inc rax
+    inc rdx
+    jmp .tea_cp_exp_ch
+.tea_cp_space:
+    mov byte [rdi + rax], ' '
+    inc rax
+    mov r12, rax             ; cursor after expansion + space
+    ; Copy rest after original cursor
+    lea rsi, [line_buf]
+    mov rdx, [rsp]           ; saved rax (prefix end) from stack
+    ; Actually need original r12 (cursor before expansion)
+    pop rdx                  ; discard saved rax
+    ; Rest starts at the old cursor position in original line
+    push r12                 ; save new cursor
+    mov r12, [line_len]      ; use original line_len
+    mov rdx, rcx             ; expansion length (not needed here)
+    ; The original word went from r13 to old-cursor
+    ; old cursor = r13 + word_len. word_len is in search_buf
+    lea rsi, [search_buf]
+    push rax
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax             ; word length
+    pop rax
+    add rdx, r13             ; rdx = position after original word
+    lea rsi, [line_buf]
+.tea_cp_rest:
+    cmp rdx, [line_len]
+    jge .tea_cp_done
+    movzx ebx, byte [rsi + rdx]
+    mov [rdi + rax], bl
+    inc rax
+    inc rdx
+    jmp .tea_cp_rest
+.tea_cp_done:
+    mov byte [rdi + rax], 0
+    mov [line_len], rax
+    pop r12                  ; restore new cursor
+
+    ; Copy back to line_buf
+    lea rsi, [suggestion_buf]
+    lea rdi, [line_buf]
+    xor rcx, rcx
+.tea_cb:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .tea_cb_done
+    inc rcx
+    jmp .tea_cb
+.tea_cb_done:
+    call full_redraw
+    mov rax, 1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.tea_no:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Expand global nicks (gnicks) in line_buf
+; Scans all tokens for gnick matches and replaces them
+; ══════════════════════════════════════════════════════════════════════
+expand_gnicks:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    cmp qword [gnick_count], 0
+    je .eg_done
+
+    ; Up to 3 expansion passes
+    xor r14, r14
+.eg_pass:
+    cmp r14, 3
+    jge .eg_done
+    xor r13, r13             ; found-any flag
+
+    xor r12, r12
+.eg_nick_loop:
+    cmp r12, [gnick_count]
+    jge .eg_pass_done
+
+    lea rdi, [line_buf]
+    mov rsi, [gnick_names + r12*8]
+    call strstr_simple
+    test rax, rax
+    jz .eg_next_nick
+
+    ; Found match at rax
+    push rax
+    mov rdi, [gnick_names + r12*8]
+    call strlen
+    mov rbx, rax             ; name length
+    mov rdi, [gnick_values + r12*8]
+    call strlen
+    mov rcx, rax             ; value length
+    pop rax                  ; match position
+
+    ; Build new line in suggestion_buf
+    lea rdi, [suggestion_buf]
+    lea rsi, [line_buf]
+    mov rdx, rax
+    sub rdx, rsi             ; prefix length
+    push rdx
+    push rcx
+    xor rcx, rcx
+    test rdx, rdx
+    jz .eg_cp_val
+.eg_cp_pre:
+    cmp rcx, rdx
+    jge .eg_cp_val
+    movzx eax, byte [rsi + rcx]
+    mov [rdi + rcx], al
+    inc rcx
+    jmp .eg_cp_pre
+.eg_cp_val:
+    pop rax                  ; value length
+    pop rdx                  ; prefix length was in rcx, now rdx = output pos
+    mov rcx, rdx             ; output position
+    push rcx
+    mov rsi, [gnick_values + r12*8]
+    xor rdx, rdx
+.eg_cv:
+    cmp rdx, rax
+    jge .eg_cp_suf
+    movzx r8d, byte [rsi + rdx]
+    mov [rdi + rcx], r8b
+    inc rcx
+    inc rdx
+    jmp .eg_cv
+.eg_cp_suf:
+    pop rax                  ; original prefix length
+    lea rsi, [line_buf + rax]
+    add rsi, rbx             ; skip matched name
+.eg_cs:
+    movzx eax, byte [rsi]
+    mov [rdi + rcx], al
+    test al, al
+    jz .eg_replace_done
+    inc rsi
+    inc rcx
+    jmp .eg_cs
+.eg_replace_done:
+    lea rsi, [suggestion_buf]
+    lea rdi, [line_buf]
+    xor rcx, rcx
+.eg_rcb:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .eg_rcb_done
+    inc rcx
+    jmp .eg_rcb
+.eg_rcb_done:
+    mov [line_len], rcx
+    mov r13, 1
+
+.eg_next_nick:
+    inc r12
+    jmp .eg_nick_loop
+
+.eg_pass_done:
+    test r13, r13
+    jz .eg_done
+    inc r14
+    jmp .eg_pass
+
+.eg_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Show command duration if above threshold
+; Uses cmd_start_time and cmd_end_time (tv_sec, tv_nsec)
+; ══════════════════════════════════════════════════════════════════════
+show_cmd_duration:
+    push rbx
+    push r12
+
+    mov rax, [slow_cmd_threshold]
+    test rax, rax
+    jz .scd_done              ; threshold = 0, disabled
+
+    ; Calculate elapsed seconds
+    mov rbx, [cmd_end_time]        ; end tv_sec
+    sub rbx, [cmd_start_time]      ; start tv_sec
+    ; Adjust for nanoseconds
+    mov rcx, [cmd_end_time + 8]    ; end tv_nsec
+    cmp rcx, [cmd_start_time + 8]
+    jge .scd_no_borrow
+    dec rbx
+.scd_no_borrow:
+
+    ; Compare with threshold
+    cmp rbx, [slow_cmd_threshold]
+    jl .scd_done
+
+    ; Print "[bare] Command took Xs"
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.scd_prefix]
+    mov rdx, .scd_prefix_len
+    syscall
+
+    ; Convert seconds to string
+    mov rax, rbx
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.scd_suffix]
+    mov rdx, .scd_suffix_len
+    syscall
+
+.scd_done:
+    pop r12
+    pop rbx
+    ret
+
+.scd_prefix: db 27, "[38;5;245m[bare] Command took "
+.scd_prefix_len equ $ - .scd_prefix
+.scd_suffix: db "s", 27, "[0m", 10
+.scd_suffix_len equ $ - .scd_suffix
