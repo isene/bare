@@ -1,0 +1,46 @@
+#!/bin/bash
+# bare plugin: :suggest <description>
+# Ask AI to suggest a shell command for a task.
+#
+# Setup: same as :ask (see plugins/ask for details)
+#
+# Usage:
+#   :suggest find all .log files modified today
+#   :suggest compress this directory into a tar.gz
+#   :suggest show disk usage sorted by size
+
+set -e
+
+# Read API key
+if [ -n "$OPENAI_API_KEY" ]; then
+    API_KEY="$OPENAI_API_KEY"
+elif [ -f "$HOME/.config/bare/openai_key" ]; then
+    API_KEY=$(cat "$HOME/.config/bare/openai_key" | tr -d '\n')
+elif [ -f "/home/.safe/openai.txt" ]; then
+    API_KEY=$(cat "/home/.safe/openai.txt" | tr -d '\n')
+else
+    echo "No API key found. Set OPENAI_API_KEY or create ~/.config/bare/openai_key"
+    exit 1
+fi
+
+DESCRIPTION="$*"
+if [ -z "$DESCRIPTION" ]; then
+    echo "Usage: :suggest <what you want to do>"
+    exit 1
+fi
+
+ESCAPED=$(echo "$DESCRIPTION" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g')
+
+RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $API_KEY" \
+    -d "{
+        \"model\": \"gpt-4o-mini\",
+        \"temperature\": 0.3,
+        \"messages\": [
+            {\"role\": \"system\", \"content\": \"You are a shell command expert. Respond with ONLY the command, nothing else. No explanation, no markdown, no backticks. Just the exact command to run.\"},
+            {\"role\": \"user\", \"content\": \"$ESCAPED\"}
+        ]
+    }" 2>/dev/null)
+
+echo "$RESPONSE" | grep -o '"content":"[^"]*"' | head -1 | sed 's/"content":"//;s/"$//' | sed 's/\\n/\n/g; s/\\"/"/g; s/\\\\/\\/g'

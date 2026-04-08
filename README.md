@@ -2,9 +2,9 @@
 
 <img src="img/bare.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~92KB-orange) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.1.0-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~115KB-orange) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
-Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, roughly 92KB. Every feature is hand-coded with direct kernel interaction.
+Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, roughly 115KB. Every feature is hand-coded with direct kernel interaction.
 
 <br clear="left"/>
 
@@ -64,20 +64,44 @@ nasm -f elf64 bare.asm -o bare.o && ld bare.o -o bare
 - History: `~/.bare_history` with smart deduplication
 - Companion TUI config tool: [bareconf](https://github.com/isene/bareconf)
 
+### Plugins
+
+Plugins are executables in `~/.bare/plugins/`. Any unknown colon command runs the matching plugin. Write plugins in any language.
+
+```bash
+# Install included plugins
+cp plugins/* ~/.bare/plugins/
+chmod +x ~/.bare/plugins/*
+```
+
+Included plugins:
+- `:ask <question>` - ask AI a question (requires OpenAI API key)
+- `:suggest <task>` - get a shell command suggestion from AI
+
+See [plugins/README.md](plugins/README.md) for setup and writing your own.
+
 ### Other
 - Signal handling and TTY detection
-- Builtins: cd, pwd, exit, export, unset, history
+- Syntax highlighting (commands, switches, pipe segments)
+- Multi-line editing (continuation on `\`, `|`, `&&`, `||`)
+- Auto-pairing brackets and quotes
+- Auto-correct suggestions on command not found
+- Session save/load (`:save_session`, `:load_session`)
+- Calculator (`:calc`), command stats (`:stats`)
+- Validation rules (`:validate pattern = warn/confirm/block`)
+- Prefix history search (type text, press Up to filter)
+- Builtins: cd, pwd, exit, export, unset, history, pushd, popd
 
-## Part of the Fe2O3 Rust Terminal Suite
+## Related projects
 
-| Tool | Clones | Type |
-|------|--------|------|
-| [bare](https://github.com/isene/bare) / [rush](https://github.com/isene/rush) | [rsh](https://github.com/isene/rsh) | Shell |
-| [bareconf](https://github.com/isene/bareconf) | | Shell config TUI |
-| [crust](https://github.com/isene/crust) | [rcurses](https://github.com/isene/rcurses) | TUI library |
-| [glow](https://github.com/isene/glow) | [termpix](https://github.com/isene/termpix) | Image display |
-| [plot](https://github.com/isene/plot) | [termchart](https://github.com/isene/termchart) | Charts |
-| [pointer](https://github.com/isene/pointer) | [RTFM](https://github.com/isene/RTFM) | File manager |
+bare is a pure assembly clone of [rush](https://github.com/isene/rush) (Rust shell) and [rsh](https://github.com/isene/rsh) (Ruby shell).
+
+| Tool | Language | Type |
+|------|----------|------|
+| **[bare](https://github.com/isene/bare)** | **x86_64 Assembly** | **Shell** |
+| [bareconf](https://github.com/isene/bareconf) | Rust (crust) | Shell config TUI |
+| [rush](https://github.com/isene/rush) | Rust | Shell (Fe2O3 suite) |
+| [rsh](https://github.com/isene/rsh) | Ruby | Shell |
 
 ## License
 
