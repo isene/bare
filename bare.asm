@@ -225,7 +225,8 @@ clear_screen_seq: db 27, "[2J", 27, "[H"
 clear_screen_len equ $ - clear_screen_seq
 
 ; Clear to end of line (used for suggestion cleanup)
-clr_eol_global: db 27, "[0K"
+clr_eol_global: db 27, "[K"
+clr_eol_len equ $ - clr_eol_global
 
 ; Default PATH for searching executables
 default_path:   db "/usr/local/bin:/usr/bin:/bin", 0
@@ -680,7 +681,7 @@ read_line:
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [clr_eol_global]
-    mov rdx, 3
+    mov rdx, clr_eol_len
     syscall
     pop rax
 .no_clear_suggest:
@@ -941,7 +942,7 @@ read_line:
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [clr_eol_global]
-    mov rdx, 3
+    mov rdx, clr_eol_len
     syscall
     ; Print search prompt
     mov rax, SYS_WRITE
@@ -1069,7 +1070,7 @@ read_line:
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [clr_eol_global]
-    mov rdx, 3
+    mov rdx, clr_eol_len
     syscall
     call print_prompt
     call full_redraw
@@ -1086,7 +1087,7 @@ read_line:
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [clr_eol_global]
-    mov rdx, 3
+    mov rdx, clr_eol_len
     syscall
     call print_prompt
     call full_redraw
