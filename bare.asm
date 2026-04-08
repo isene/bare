@@ -256,6 +256,33 @@ theme_data:
 .td_nord:      db 110,110,111,173, 110, 110,111,  222, 110,  139,111, 173, 245,  7,   245,  240
 .td_monokai:   db 148,148,81, 208, 148, 81, 141,  228, 81,   197,141, 208, 245,  7,   245,  240
 
+; :info text
+info_text:
+    db "bare - Interactive shell in x86_64 Linux assembly", 10
+    db "No libc, no runtime, pure syscalls.", 10, 10
+    db "Features: dynamic prompt, git branch, multi-pipe, command", 10
+    db "substitution, brace/history expansion, nick/gnick/abbrev", 10
+    db "aliases, bookmarks, tab cycling, Ctrl-R search, inline", 10
+    db "suggestions, job control, 6 color themes, syntax", 10
+    db "highlighting, auto-pair, multi-line editing, calculator,", 10
+    db "validation rules, config persistence, and more.", 10, 10
+    db "Config: ~/.barerc    History: ~/.bare_history", 10
+    db "Companion: bareconf (TUI configurator)", 10
+info_text_len equ $ - info_text
+
+; Startup tips
+tip_count equ 8
+tip_table:
+    dq .tip0, .tip1, .tip2, .tip3, .tip4, .tip5, .tip6, .tip7
+.tip0: db "Tip: Use :nick to create command aliases", 10, 0
+.tip1: db "Tip: Ctrl-R searches history interactively", 10, 0
+.tip2: db "Tip: Type a directory name to auto-cd into it", 10, 0
+.tip3: db "Tip: :bm name saves a bookmark, type its name to jump", 10, 0
+.tip4: db "Tip: :theme dracula/gruvbox/nord/solarized/monokai", 10, 0
+.tip5: db "Tip: $(cmd) for command substitution, {a,b,c} for braces", 10, 0
+.tip6: db "Tip: :abbrev gs = git status (expands on space)", 10, 0
+.tip7: db "Tip: Ctrl-Z suspends, :jobs lists, :fg resumes", 10, 0
+
 ; Default PATH for searching executables
 default_path:   db "/usr/local/bin:/usr/bin:/bin", 0
 
@@ -663,6 +690,32 @@ _start:
 .etc_profile: db "/etc/profile", 0
 .past_login_data:
 
+    ; Show random tip on startup (~30% chance)
+    cmp qword [is_tty], 0
+    je .no_tip
+    test qword [config_flags], (1 << CFG_SHOW_TIPS)
+    jz .no_tip
+    ; Use PID as pseudo-random source
+    mov rax, [my_pid]
+    xor rdx, rdx
+    mov rcx, 10
+    div rcx                  ; rdx = pid % 10
+    cmp rdx, 3               ; show if remainder < 3 (~30%)
+    jge .no_tip
+    ; Pick tip: pid % tip_count
+    mov rax, [my_pid]
+    xor rdx, rdx
+    mov rcx, tip_count
+    div rcx
+    mov rsi, [tip_table + rdx*8]
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    syscall
+.no_tip:
+
 ; ── Main loop ────────────────────────────────────────────────────────
 .main_loop:
     ; Print prompt (tty only)
@@ -713,12 +766,16 @@ _start:
     mov rdi, line_buf
     call execute_chained_line
 
-    ; Record end time and show duration if above threshold
+    ; Record end time and show duration
     mov rax, SYS_CLOCK_GETTIME
     mov rdi, CLOCK_MONOTONIC
     lea rsi, [cmd_end_time]
     syscall
     call show_cmd_duration
+    cmp qword [is_tty], 0
+    je .skip_rprompt
+    call show_rprompt
+.skip_rprompt:
 
     jmp .main_loop
 
@@ -3875,6 +3932,12 @@ parse_and_exec_child_argv:
     lea rsi, [newline]
     mov rdx, 1
     syscall
+    ; Suggest similar commands (TTY only)
+    cmp qword [is_tty], 0
+    je .exec_nf_skip
+    mov rdi, [rbx]
+    call suggest_correction
+.exec_nf_skip:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
@@ -4134,7 +4197,25 @@ check_builtin:
 .cd_check_dash:
     ; Check for "cd -" (go to previous directory)
     cmp byte [rdi], '-'
-    jne .cd_dir
+    jne .cd_check_num
+    jmp .cd_is_dash
+.cd_check_num:
+    ; Check for "cd N" (jump to Nth entry from :dirs)
+    movzx eax, byte [rdi]
+    sub al, '0'
+    cmp al, 9
+    ja .cd_dir
+    ; It's a number, parse and look up in dir_history
+    push rdi
+    call parse_int
+    pop rdi
+    cmp rax, [dir_hist_count]
+    jge .cd_dir              ; out of range, treat as path
+    mov rdi, [dir_history + rax*8]
+    test rdi, rdi
+    jz .cd_done
+    jmp .cd_dir
+.cd_is_dash:
     cmp byte [rdi + 1], 0
     jne .cd_dir
     ; cd -: swap cwd and prev_dir
@@ -4536,6 +4617,19 @@ check_builtin:
     call handle_validate
     jmp .cc_done
 .cc_not_validate:
+    mov rdi, [r12]
+    lea rsi, [str_info]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_info
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [info_text]
+    mov rdx, info_text_len
+    syscall
+    mov qword [last_status], 0
+    jmp .cc_done
+.cc_not_info:
     ; Unknown colon command
     mov rax, SYS_WRITE
     mov rdi, 2
@@ -6230,7 +6324,7 @@ init_default_colors:
     mov byte [rdi + C_TABOPT], 245    ; gray
     mov byte [rdi + C_SUGGEST], 240   ; dark gray
     ; Default config flags: rprompt on, hist_dedup smart
-    mov qword [config_flags], (1 << CFG_RPROMPT) | (1 << CFG_HIST_DEDUP_SMART) | (1 << CFG_AUTO_PAIR)
+    mov qword [config_flags], (1 << CFG_RPROMPT) | (1 << CFG_HIST_DEDUP_SMART) | (1 << CFG_AUTO_PAIR) | (1 << CFG_SHOW_TIPS)
     mov qword [completion_limit], 10
     mov qword [slow_cmd_threshold], 0
     ret
@@ -11798,3 +11892,299 @@ source_file:
     pop r12
     pop rbx
     ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Right prompt: show command duration on the right side of the terminal
+; Called after command execution if rprompt is enabled
+; ══════════════════════════════════════════════════════════════════════
+show_rprompt:
+    push rbx
+    push r12
+
+    cmp qword [is_tty], 0
+    je .rp_done
+    test qword [config_flags], (1 << CFG_RPROMPT)
+    jz .rp_done
+    cmp qword [term_width], 0
+    je .rp_done
+
+    ; Calculate duration
+    mov rax, [cmd_end_time]
+    sub rax, [cmd_start_time]
+    test rax, rax
+    jz .rp_done              ; zero seconds, skip
+    cmp rax, 1
+    jl .rp_done              ; less than 1 second, skip
+
+    mov r12, rax             ; duration in seconds
+
+    ; Build duration string
+    lea rdi, [num_buf]
+    cmp r12, 60
+    jl .rp_seconds
+    ; Minutes + seconds
+    mov rax, r12
+    xor edx, edx
+    mov rcx, 60
+    div rcx                  ; rax = minutes, rdx = seconds
+    push rdx
+    call itoa
+    mov rbx, rax             ; digits written
+    mov byte [num_buf + rbx], 'm'
+    inc rbx
+    pop rax                  ; seconds
+    lea rdi, [num_buf + rbx]
+    call itoa
+    add rbx, rax
+    mov byte [num_buf + rbx], 's'
+    inc rbx
+    jmp .rp_display
+.rp_seconds:
+    mov rax, r12
+    call itoa
+    mov rbx, rax
+    mov byte [num_buf + rbx], 's'
+    inc rbx
+
+.rp_display:
+    ; Position cursor at right side: ESC[<row>;<col>H
+    ; Save cursor, move to right
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.rp_save]
+    mov rdx, 3
+    syscall
+    ; Move to column (term_width - rbx - 1)
+    mov rax, [term_width]
+    sub rax, rbx
+    sub rax, 1
+    push rbx
+    lea rdi, [rprompt_buf]
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    push rdi
+    lea rdi, [rprompt_buf + 2]
+    call itoa
+    pop rdi
+    add rdi, rax
+    add rdi, 2
+    mov byte [rdi], 'G'
+    inc rdi
+    ; Write gray color
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '3'
+    mov byte [rdi+3], '8'
+    mov byte [rdi+4], ';'
+    mov byte [rdi+5], '5'
+    mov byte [rdi+6], ';'
+    mov byte [rdi+7], '2'
+    mov byte [rdi+8], '4'
+    mov byte [rdi+9], '5'
+    mov byte [rdi+10], 'm'
+    add rdi, 11
+    ; Copy duration
+    pop rbx
+    lea rsi, [num_buf]
+    xor rcx, rcx
+.rp_copy_dur:
+    cmp rcx, rbx
+    jge .rp_reset
+    movzx eax, byte [rsi + rcx]
+    mov [rdi], al
+    inc rdi
+    inc rcx
+    jmp .rp_copy_dur
+.rp_reset:
+    ; Reset + restore cursor
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '0'
+    mov byte [rdi+3], 'm'
+    add rdi, 4
+    mov byte [rdi], 27
+    mov byte [rdi+1], '8'
+    add rdi, 2
+    ; Write it all
+    mov rdx, rdi
+    sub rdx, rprompt_buf
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [rprompt_buf]
+    syscall
+
+.rp_done:
+    pop r12
+    pop rbx
+    ret
+
+.rp_save: db 27, '7', 0     ; ESC 7 = save cursor
+
+; ══════════════════════════════════════════════════════════════════════
+; Auto-correct: suggest similar commands on "command not found"
+; Uses simple Levenshtein-like comparison (first char match + length)
+; rdi = command that was not found
+; ══════════════════════════════════════════════════════════════════════
+suggest_correction:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    test qword [config_flags], (1 << CFG_AUTO_CORRECT)
+    jz .sugc_done
+
+    mov r12, rdi             ; failed command
+    mov rdi, r12
+    call strlen
+    mov r13, rax             ; failed cmd length
+    cmp r13, 1
+    jle .sugc_done           ; too short to suggest
+
+    ; Search PATH for similar commands
+    ; Simple heuristic: same first char, length within 2
+    mov rdi, [envp]
+    call find_env_path
+    test rax, rax
+    jnz .sugc_have_path
+    lea rax, [default_path]
+.sugc_have_path:
+    mov r14, rax             ; PATH
+    xor r15, r15             ; found count
+
+    ; Print "bare: command not found, did you mean:"
+    ; (caller already printed the error)
+
+.sugc_next_dir:
+    cmp byte [r14], 0
+    je .sugc_end
+    ; Extract dir from PATH
+    lea rdi, [path_buf]
+    mov rsi, r14
+.sugc_cp_dir:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .sugc_dir_end
+    cmp al, ':'
+    je .sugc_dir_end
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .sugc_cp_dir
+.sugc_dir_end:
+    mov byte [rdi], 0
+    mov r14, rsi
+    cmp byte [r14], ':'
+    jne .sugc_scan_dir
+    inc r14
+
+.sugc_scan_dir:
+    mov rax, SYS_OPEN
+    lea rdi, [path_buf]
+    mov rsi, O_RDONLY | O_DIRECTORY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .sugc_next_dir
+    push rax                 ; fd
+
+.sugc_read:
+    mov rax, SYS_GETDENTS64
+    mov rdi, [rsp]
+    lea rsi, [tab_dir_buf]
+    mov rdx, 4096
+    syscall
+    test rax, rax
+    jle .sugc_close
+
+    xor rcx, rcx
+.sugc_entry:
+    cmp rcx, rax
+    jge .sugc_read
+    lea rsi, [tab_dir_buf + rcx]
+    movzx edx, word [rsi + DIRENT64_D_RECLEN]
+    lea rdi, [rsi + DIRENT64_D_NAME]
+    push rax
+    push rcx
+    push rdx
+    ; Check: first char matches and length within 2
+    movzx eax, byte [rdi]
+    movzx ebx, byte [r12]
+    cmp al, bl
+    jne .sugc_skip
+    ; Check length
+    push rdi
+    call strlen
+    pop rdi
+    mov rbx, rax
+    sub rbx, r13             ; length diff
+    ; abs(diff)
+    test rbx, rbx
+    jns .sugc_pos
+    neg rbx
+.sugc_pos:
+    cmp rbx, 2
+    jg .sugc_skip
+    ; Potential match, print it
+    cmp r15, 3
+    jge .sugc_skip           ; max 3 suggestions
+    test r15, r15
+    jnz .sugc_not_first
+    ; Print header
+    push rdi
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [.sugc_header]
+    mov rdx, .sugc_header_len
+    syscall
+    pop rdi
+.sugc_not_first:
+    push rdi
+    mov rdi, rdi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    pop rsi
+    push rsi
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [.sugc_sep]
+    mov rdx, 2
+    syscall
+    pop rdi
+    inc r15
+.sugc_skip:
+    pop rdx
+    pop rcx
+    pop rax
+    add rcx, rdx
+    jmp .sugc_entry
+
+.sugc_close:
+    mov rax, SYS_CLOSE
+    pop rdi
+    syscall
+    jmp .sugc_next_dir
+
+.sugc_end:
+    test r15, r15
+    jz .sugc_done
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+.sugc_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.sugc_header: db "  Did you mean: "
+.sugc_header_len equ $ - .sugc_header
+.sugc_sep: db "  "
