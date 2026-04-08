@@ -3287,7 +3287,8 @@ parse_and_exec_simple:
     ; Parent: wait for child, handling Ctrl-Z from raw stdin
     mov [child_pid], rax
     mov r13, rax             ; save child pid
-    ; Stay in raw mode - we'll handle Ctrl-Z ourselves
+    ; Re-enable raw mode (read_line restores termios before returning)
+    call enable_raw_mode
     sub rsp, 16
 .paes_wait:
     ; Non-blocking check if child has exited/stopped
