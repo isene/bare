@@ -66,6 +66,8 @@ DEFAULT REL
 %define SIGQUIT 3
 %define SIGCONT 18
 %define SIGTSTP 20
+%define SIGTTIN 21
+%define SIGTTOU 22
 %define SIGCHLD 17
 %define SIG_IGN 1
 %define SIG_DFL 0
@@ -5386,6 +5388,20 @@ setup_signals:
     ; Ignore SIGQUIT
     mov rax, SYS_RT_SIGACTION
     mov edi, SIGQUIT
+    mov rsi, rsp
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ; Ignore SIGTTOU (so shell can do terminal I/O as background group)
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGTTOU
+    mov rsi, rsp
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ; Ignore SIGTTIN
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGTTIN
     mov rsi, rsp
     xor edx, edx
     mov r10, 8
