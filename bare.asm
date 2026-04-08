@@ -1460,11 +1460,17 @@ read_line:
     ret
 
 .cancel_line:
-    ; Print ^C and newline, clear line, redraw prompt
+    ; Clear current line and redraw prompt
+    ; Move to start of line, clear it
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [.ctrlc_str]
-    mov rdx, 3
+    lea rsi, [.ctrlc_cr]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, clr_eol_len
     syscall
     xor r12, r12
     mov qword [line_len], 0
@@ -1473,7 +1479,7 @@ read_line:
     ; Print fresh prompt and continue reading
     call print_prompt
     jmp .read_char
-.ctrlc_str: db '^', 'C', 10
+.ctrlc_cr: db 13
 
 .read_done:
     ; Strip trailing \r if present, then null-terminate
@@ -3276,9 +3282,23 @@ parse_and_exec_simple:
     jz .child_exec
     js .fork_error
 
-    ; Parent: re-enable ISIG so Ctrl-Z reaches child via terminal
+    ; Parent: set child's process group and give it terminal control
     mov [child_pid], rax
     mov r13, rax             ; save child pid
+    ; Set child's pgid = child's pid (from parent side too, for race safety)
+    mov rdi, r13
+    mov rsi, r13
+    mov rax, SYS_SETPGID
+    syscall
+    ; Give child terminal control
+    sub rsp, 8
+    mov [rsp], r13d
+    mov rax, SYS_IOCTL
+    xor edi, edi
+    mov esi, TIOCSPGRP
+    mov rdx, rsp
+    syscall
+    add rsp, 8
     call restore_termios     ; restore original terminal (has ISIG)
     sub rsp, 16
 .paes_wait:
@@ -3299,12 +3319,14 @@ parse_and_exec_simple:
     and eax, 0xFF
     mov [last_status], rax
     add rsp, 16
+    call .paes_reclaim_tty
     call enable_raw_mode
     jmp .paes_done
 
 .paes_stopped:
     ; Child was stopped by Ctrl-Z, add to job table
     add rsp, 16
+    call .paes_reclaim_tty
     call enable_raw_mode
     mov rdi, r13             ; pid
     lea rsi, [line_buf]      ; command string
@@ -3323,10 +3345,44 @@ parse_and_exec_simple:
     mov qword [last_status], 148  ; 128 + SIGTSTP(20)
     jmp .paes_done
 
-.stopped_msg: db "[stopped]", 10
+.stopped_msg: db 10, "[stopped]", 10
 .stopped_msg_len equ $ - .stopped_msg
 
+; Reclaim terminal control for shell's process group
+.paes_reclaim_tty:
+    sub rsp, 8
+    mov rax, SYS_GETPID
+    syscall
+    mov [rsp], eax
+    mov rax, SYS_IOCTL
+    xor edi, edi
+    mov esi, TIOCSPGRP
+    mov rdx, rsp
+    syscall
+    add rsp, 8
+    ret
+
 .child_exec:
+    ; Put child in its own process group
+    xor edi, edi             ; pid=0 means self
+    xor esi, esi             ; pgid=0 means use own pid
+    mov rax, SYS_SETPGID
+    syscall
+    ; Give child's process group terminal control
+    mov rax, SYS_IOCTL
+    xor edi, edi             ; stdin fd
+    mov esi, TIOCSPGRP
+    mov rdx, rsp             ; need pointer to pgid
+    sub rsp, 8
+    mov rax, SYS_GETPID
+    syscall
+    mov [rsp], eax            ; store our pid as pgid
+    mov rax, SYS_IOCTL
+    xor edi, edi
+    mov esi, TIOCSPGRP
+    mov rdx, rsp
+    syscall
+    add rsp, 8
     ; Restore default signals in child
     call restore_child_signals
     call parse_and_exec_child_argv
