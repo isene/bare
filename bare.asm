@@ -4630,6 +4630,32 @@ check_builtin:
     mov qword [last_status], 0
     jmp .cc_done
 .cc_not_info:
+    mov rdi, [r12]
+    lea rsi, [str_save_sess]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_save_sess
+    mov rdi, r12
+    call handle_save_session
+    jmp .cc_done
+.cc_not_save_sess:
+    mov rdi, [r12]
+    lea rsi, [str_load_sess]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_load_sess
+    mov rdi, r12
+    call handle_load_session
+    jmp .cc_done
+.cc_not_load_sess:
+    mov rdi, [r12]
+    lea rsi, [str_list_sess]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_list_sess
+    call handle_list_sessions
+    jmp .cc_done
+.cc_not_list_sess:
     ; Unknown colon command
     mov rax, SYS_WRITE
     mov rdi, 2
@@ -12188,3 +12214,414 @@ suggest_correction:
 .sugc_header: db "  Did you mean: "
 .sugc_header_len equ $ - .sugc_header
 .sugc_sep: db "  "
+
+; ══════════════════════════════════════════════════════════════════════
+; Fuzzy match: check if all chars of query appear in order in candidate
+; rdi = candidate string, rsi = query string
+; Returns rax = 1 if fuzzy match, 0 if not
+; ══════════════════════════════════════════════════════════════════════
+fuzzy_match:
+    push rbx
+.fm_loop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .fm_yes               ; all query chars matched
+    movzx ebx, byte [rdi]
+    test bl, bl
+    jz .fm_no                ; candidate ended before query
+    cmp al, bl
+    jne .fm_skip
+    inc rsi                  ; matched, advance query
+.fm_skip:
+    inc rdi                  ; always advance candidate
+    jmp .fm_loop
+.fm_yes:
+    mov rax, 1
+    pop rbx
+    ret
+.fm_no:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Session management: :save_session, :load_session, :list_sessions, :delete_session
+; Sessions stored as ~/.bare/sessions/<name>.bare
+; ══════════════════════════════════════════════════════════════════════
+
+; :save_session name - save current state
+handle_save_session:
+    push rbx
+    push r12
+    mov r12, rdi             ; argv array
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jz .hss_usage
+
+    ; Build path: ~/.bare/sessions/<name>.bare
+    call build_session_path
+    ; rax = path in suggestion_buf
+
+    ; Create directories (~/.bare/sessions/)
+    push rax
+    call ensure_dir
+    pop rax
+
+    ; Open file for writing
+    mov rdi, rax
+    mov rax, SYS_OPEN
+    mov rsi, O_WRONLY | O_CREAT | O_TRUNC
+    mov rdx, 0o644
+    syscall
+    test rax, rax
+    js .hss_err
+    mov rbx, rax             ; fd
+
+    ; Write current directory
+    mov rax, SYS_WRITE
+    mov rdi, rbx
+    lea rsi, [.hss_cwd_tag]
+    mov rdx, 4
+    syscall
+    lea rdi, [cwd_buf]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, rbx
+    lea rsi, [cwd_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, rbx
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+
+    ; Write last 50 history entries
+    mov rax, [hist_count]
+    mov rcx, rax
+    sub rcx, 50
+    test rcx, rcx
+    jns .hss_hist_start
+    xor rcx, rcx
+.hss_hist_start:
+.hss_hist_loop:
+    cmp rcx, [hist_count]
+    jge .hss_close
+    push rcx
+    mov rax, SYS_WRITE
+    mov rdi, rbx
+    lea rsi, [.hss_hist_tag]
+    mov rdx, 5
+    syscall
+    pop rcx
+    push rcx
+    mov rsi, [hist_lines + rcx*8]
+    test rsi, rsi
+    jz .hss_hist_next
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, rbx
+    pop rcx
+    push rcx
+    mov rsi, [hist_lines + rcx*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, rbx
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+.hss_hist_next:
+    pop rcx
+    inc rcx
+    jmp .hss_hist_loop
+
+.hss_close:
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hss_saved_msg]
+    mov rdx, .hss_saved_len
+    syscall
+    jmp .hss_done
+
+.hss_usage:
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [.hss_usage_msg]
+    mov rdx, .hss_usage_len
+    syscall
+    jmp .hss_done
+.hss_err:
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [.hss_err_msg]
+    mov rdx, .hss_err_len
+    syscall
+.hss_done:
+    mov qword [last_status], 0
+    pop r12
+    pop rbx
+    ret
+
+.hss_cwd_tag: db "cwd="
+.hss_hist_tag: db "hist="
+.hss_saved_msg: db "Session saved", 10
+.hss_saved_len equ $ - .hss_saved_msg
+.hss_usage_msg: db "usage: :save_session <name>", 10
+.hss_usage_len equ $ - .hss_usage_msg
+.hss_err_msg: db "bare: failed to save session", 10
+.hss_err_len equ $ - .hss_err_msg
+
+; Build session file path: ~/.bare/sessions/<name>.bare -> suggestion_buf
+; rdi = session name
+; Returns rax = pointer to path in suggestion_buf
+build_session_path:
+    push rbx
+    push r12
+    mov r12, rdi             ; name
+    ; Get HOME
+    mov rdi, [envp]
+    call find_env_home
+    test rax, rax
+    jz .bsp_fail
+    ; Build path
+    lea rdi, [suggestion_buf]
+    mov rsi, rax
+.bsp_cp_home:
+    mov cl, [rsi]
+    mov [rdi], cl
+    test cl, cl
+    jz .bsp_append
+    inc rsi
+    inc rdi
+    jmp .bsp_cp_home
+.bsp_append:
+    ; /.bare/sessions/
+    ; Write char by char to avoid NASM string size issues
+    mov byte [rdi], '/'
+    mov byte [rdi+1], '.'
+    mov byte [rdi+2], 'b'
+    mov byte [rdi+3], 'a'
+    mov byte [rdi+4], 'r'
+    mov byte [rdi+5], 'e'
+    mov byte [rdi+6], '/'
+    mov byte [rdi+7], 's'
+    mov byte [rdi+8], 'e'
+    mov byte [rdi+9], 's'
+    mov byte [rdi+10], 's'
+    mov byte [rdi+11], 'i'
+    mov byte [rdi+12], 'o'
+    mov byte [rdi+13], 'n'
+    mov byte [rdi+14], 's'
+    mov byte [rdi+15], '/'
+    add rdi, 16
+    ; Copy name
+    mov rsi, r12
+.bsp_cp_name:
+    mov cl, [rsi]
+    test cl, cl
+    jz .bsp_suffix
+    mov [rdi], cl
+    inc rsi
+    inc rdi
+    jmp .bsp_cp_name
+.bsp_suffix:
+    ; .bare extension
+    mov dword [rdi], '.bar'
+    mov byte [rdi+4], 'e'
+    mov byte [rdi+5], 0
+    lea rax, [suggestion_buf]
+    pop r12
+    pop rbx
+    ret
+.bsp_fail:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
+; Ensure directory exists (mkdir -p simple)
+; rdi = path (must be absolute)
+ensure_dir:
+    push rbx
+    mov rdi, [envp]
+    call find_env_home
+    test rax, rax
+    jz .ed_done
+    ; Build ~/.bare
+    lea rdi, [path_buf]
+    mov rsi, rax
+.ed_cp:
+    mov cl, [rsi]
+    mov [rdi], cl
+    test cl, cl
+    jz .ed_mk1
+    inc rsi
+    inc rdi
+    jmp .ed_cp
+.ed_mk1:
+    mov dword [rdi], '/.ba'
+    mov word [rdi+4], 're'
+    mov byte [rdi+6], 0
+    mov rax, 83              ; SYS_MKDIR
+    lea rdi, [path_buf]
+    mov rsi, 0o755
+    syscall
+    ; ~/.bare/sessions
+    lea rdi, [path_buf]
+    call strlen
+    lea rdi, [path_buf + rax]
+    mov rax, '/sess'
+    mov [rdi], rax
+    mov dword [rdi+5], 'ions'
+    mov byte [rdi+9], 0
+    mov rax, 83
+    lea rdi, [path_buf]
+    mov rsi, 0o755
+    syscall
+.ed_done:
+    pop rbx
+    ret
+
+; :load_session name
+handle_load_session:
+    push rbx
+    push r12
+    mov r12, rdi
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jz .hls_usage
+    call build_session_path
+    test rax, rax
+    jz .hls_err
+    ; Source the session file
+    mov rdi, rax
+    call source_file
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hls_loaded]
+    mov rdx, .hls_loaded_len
+    syscall
+    jmp .hls_done
+.hls_usage:
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [.hls_usage_msg]
+    mov rdx, .hls_usage_len
+    syscall
+    jmp .hls_done
+.hls_err:
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [.hls_err_msg]
+    mov rdx, .hls_err_len
+    syscall
+.hls_done:
+    mov qword [last_status], 0
+    pop r12
+    pop rbx
+    ret
+.hls_loaded: db "Session loaded", 10
+.hls_loaded_len equ $ - .hls_loaded
+.hls_usage_msg: db "usage: :load_session <name>", 10
+.hls_usage_len equ $ - .hls_usage_msg
+.hls_err_msg: db "bare: session not found", 10
+.hls_err_len equ $ - .hls_err_msg
+
+; :list_sessions - list saved sessions by scanning ~/.bare/sessions/
+handle_list_sessions:
+    push rbx
+    push r12
+    ; Build path
+    mov rdi, [envp]
+    call find_env_home
+    test rax, rax
+    jz .hlss_done
+    lea rdi, [path_buf]
+    mov rsi, rax
+.hlss_cp:
+    mov cl, [rsi]
+    mov [rdi], cl
+    test cl, cl
+    jz .hlss_append
+    inc rsi
+    inc rdi
+    jmp .hlss_cp
+.hlss_append:
+    lea rsi, [.hlss_suffix]
+.hlss_cps:
+    mov cl, [rsi]
+    mov [rdi], cl
+    test cl, cl
+    jz .hlss_open
+    inc rsi
+    inc rdi
+    jmp .hlss_cps
+.hlss_open:
+    mov rax, SYS_OPEN
+    lea rdi, [path_buf]
+    mov rsi, O_RDONLY | O_DIRECTORY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .hlss_done
+    mov rbx, rax             ; fd
+.hlss_read:
+    mov rax, SYS_GETDENTS64
+    mov rdi, rbx
+    lea rsi, [tab_dir_buf]
+    mov rdx, 4096
+    syscall
+    test rax, rax
+    jle .hlss_close
+    mov r12, rax             ; bytes read
+    xor rcx, rcx
+.hlss_entry:
+    cmp rcx, r12
+    jge .hlss_read
+    lea rsi, [tab_dir_buf + rcx]
+    movzx edx, word [rsi + DIRENT64_D_RECLEN]
+    push rcx
+    push rdx
+    lea rdi, [rsi + DIRENT64_D_NAME]
+    ; Skip . and ..
+    cmp byte [rdi], '.'
+    je .hlss_skip
+    ; Print name (strip .bare extension if present)
+    call strlen
+    mov rdx, rax
+    cmp rdx, 5
+    jl .hlss_print
+    ; Check if ends with .bare
+    sub rdx, 5
+.hlss_print:
+    mov rax, SYS_WRITE
+    push rdi
+    mov rsi, rdi
+    mov rdi, 1
+    syscall
+    pop rdi
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+.hlss_skip:
+    pop rdx
+    pop rcx
+    add rcx, rdx
+    jmp .hlss_entry
+.hlss_close:
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+.hlss_done:
+    mov qword [last_status], 0
+    pop r12
+    pop rbx
+    ret
+.hlss_suffix: db "/.bare/sessions", 0
