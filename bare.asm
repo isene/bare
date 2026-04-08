@@ -1018,19 +1018,13 @@ read_line:
     inc qword [line_len]
 
 .no_auto_pair:
-    ; Echo the typed character
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [tmp_buf]
-    mov rdx, 1
-    syscall
+    ; Redraw full line with syntax highlighting after each edit
+    call full_redraw
 
-    ; If cursor is not at end, redraw the rest and reposition
+    ; If cursor is at end, show inline suggestion
     mov rcx, [line_len]
     cmp r12, rcx
-    jge .show_suggestion
-    call redraw_from_cursor
-    jmp .read_char
+    jl .read_char
 
 .show_suggestion:
     ; Show inline history suggestion (gray text after cursor)
@@ -1878,10 +1872,16 @@ read_line:
     lea rsi, [line_buf + rcx]
     mov rdx, r12
     sub rdx, rcx
-    test rdx, rdx
-    jz .tab_no_word
     cmp rdx, 250
     jg .tab_no_word
+    ; Allow zero-length word (for subcommand completion like "git <TAB>")
+    test rdx, rdx
+    jnz .tab_has_word
+    mov byte [tab_word_buf], 0
+    mov rcx, 0
+    push rcx
+    jmp .tab_word_ready
+.tab_has_word:
     mov rcx, rdx
     push rcx                ; save word length
 .tab_copy_word:
@@ -1893,6 +1893,7 @@ read_line:
     jnz .tab_copy_word
     mov byte [rdi], 0
     pop rcx                 ; rcx = word length
+.tab_word_ready:
 
     ; Determine if this is a command (first word) or file completion
     ; Check if r14 == 0 and no previous non-space characters
@@ -6211,7 +6212,7 @@ init_default_colors:
     mov byte [rdi + C_TABOPT], 245    ; gray
     mov byte [rdi + C_SUGGEST], 240   ; dark gray
     ; Default config flags: rprompt on, hist_dedup smart
-    mov qword [config_flags], (1 << CFG_RPROMPT) | (1 << CFG_HIST_DEDUP_SMART)
+    mov qword [config_flags], (1 << CFG_RPROMPT) | (1 << CFG_HIST_DEDUP_SMART) | (1 << CFG_AUTO_PAIR)
     mov qword [completion_limit], 10
     mov qword [slow_cmd_threshold], 0
     ret
