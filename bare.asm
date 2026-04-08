@@ -309,6 +309,9 @@ tip_table:
 .tip6: db "Tip: :abbrev gs = git status (expands on space)", 10, 0
 .tip7: db "Tip: Ctrl-Z suspends, :jobs lists, :fg resumes", 10, 0
 
+; Plugin path suffix
+plugin_suffix:  db "/.bare/plugins/", 0
+
 ; Default PATH for searching executables
 default_path:   db "/usr/local/bin:/usr/bin:/bin", 0
 
@@ -4475,13 +4478,19 @@ check_builtin:
     add rbx, 16              ; next table entry
     jmp .cc_loop
 .cc_not_found:
+    ; Try plugin: check ~/.bare/plugins/<cmd_without_colon>
+    mov rdi, [r12]           ; ":something"
+    inc rdi                  ; skip ':'
+    call try_run_plugin
+    test rax, rax
+    jnz .cc_done             ; plugin handled it
+
     ; Unknown colon command
     mov rax, SYS_WRITE
     mov rdi, 2
     lea rsi, [.cc_unknown]
     mov rdx, .cc_unknown_len
     syscall
-    ; Print the command name
     mov rdi, [r12]
     call strlen
     mov rdx, rax
@@ -4489,11 +4498,7 @@ check_builtin:
     mov rdi, 2
     mov rsi, [r12]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     mov qword [last_status], 1
 
 .cc_done:
@@ -12360,3 +12365,142 @@ handle_list_sessions:
     pop rbx
     ret
 .hlss_suffix: db "/.bare/sessions", 0
+
+; ══════════════════════════════════════════════════════════════════════
+; Plugin system: try to run ~/.bare/plugins/<name>
+; rdi = command name (without leading ':')
+; r12 = argv array (from check_builtin)
+; Returns rax = 1 if plugin was found and executed, 0 if not
+; ══════════════════════════════════════════════════════════════════════
+try_run_plugin:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r13, rdi             ; command name
+    mov r14, r12             ; argv array
+
+    ; Build path: $HOME/.bare/plugins/<name>
+    mov rdi, [envp]
+    call find_env_home
+    test rax, rax
+    jz .trp_no
+
+    ; Copy HOME to path_buf
+    lea rdi, [path_buf]
+    mov rsi, rax
+    call strcpy_rsi_rdi
+
+    ; Append /.bare/plugins/
+    lea rdi, [path_buf]
+    call strlen
+    lea rdi, [path_buf + rax]
+    lea rsi, [plugin_suffix]
+    call strcpy_rsi_rdi
+
+    ; Append command name
+    lea rdi, [path_buf]
+    call strlen
+    lea rdi, [path_buf + rax]
+    mov rsi, r13
+    call strcpy_rsi_rdi
+
+    ; Check if file exists (stat)
+    sub rsp, 144
+    mov rax, SYS_STAT
+    lea rdi, [path_buf]
+    mov rsi, rsp
+    syscall
+    add rsp, 144
+    test rax, rax
+    js .trp_no                ; file doesn't exist
+
+    ; File exists. Fork and exec it.
+    ; Build argv: [path, arg1, arg2, ..., NULL]
+    ; argv[0] = path_buf, argv[1..] = r14[8..] (skip the :cmd)
+    call enable_cooked_mode
+
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    jz .trp_child
+    js .trp_no
+
+    ; Parent: wait for child
+    mov rbx, rax
+    sub rsp, 16
+    mov rdi, rbx
+    lea rsi, [rsp]
+    mov edx, WUNTRACED
+    xor r10d, r10d
+    mov rax, SYS_WAIT4
+    syscall
+    ; Extract exit status
+    mov eax, [rsp]
+    shr eax, 8
+    and eax, 0xFF
+    mov [last_status], rax
+    add rsp, 16
+    call enable_raw_mode
+    mov rax, 1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.trp_child:
+    ; Restore signals
+    call restore_child_signals
+    ; Build argv on stack: [path, original_args..., NULL]
+    ; Count args from r14 (skip argv[0] which is the :cmd)
+    xor rcx, rcx
+    mov rsi, r14
+.trp_count:
+    mov rax, [rsi + rcx*8]
+    test rax, rax
+    jz .trp_counted
+    inc rcx
+    jmp .trp_count
+.trp_counted:
+    ; rcx = total original args (including :cmd)
+    ; New argv: path + args[1..] + NULL = rcx entries
+    ; Allocate on stack
+    lea rax, [rcx + 1]       ; +1 for NULL
+    shl rax, 3
+    sub rsp, rax
+    ; argv[0] = path
+    lea rax, [path_buf]
+    mov [rsp], rax
+    ; Copy remaining args (skip :cmd which is argv[0])
+    mov rdx, 1               ; source index (skip :cmd)
+    mov rbx, 1               ; dest index
+.trp_copy_args:
+    cmp rdx, rcx
+    jge .trp_args_done
+    mov rax, [r14 + rdx*8]
+    mov [rsp + rbx*8], rax
+    inc rdx
+    inc rbx
+    jmp .trp_copy_args
+.trp_args_done:
+    mov qword [rsp + rbx*8], 0  ; NULL terminator
+
+    ; execve(path, argv, env)
+    mov rax, SYS_EXECVE
+    lea rdi, [path_buf]
+    mov rsi, rsp
+    lea rdx, [env_array]
+    syscall
+    ; exec failed
+    mov rax, SYS_EXIT
+    mov edi, 127
+    syscall
+
+.trp_no:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
