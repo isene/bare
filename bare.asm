@@ -6578,69 +6578,32 @@ config_add_bookmark:
     ret
 
 ; config_set_color: rdi = color name (after "c_"), rsi = value string
+; config_set_color: rdi = color name (after "c_"), rsi = value string
+; Table-driven: searches color_name_table for match
 config_set_color:
     push rbx
     push r12
     push r13
     mov r12, rsi            ; value string
-    mov r13, rdi            ; save color name
+    mov r13, rdi            ; color name
 
-    lea rsi, [.cs_user]
-    call strcmp
-    test rax, rax
-    jz .cs_found_user
-
+    ; Search color_name_table for matching name
+    xor rbx, rbx
+.cs_search:
+    cmp rbx, NUM_COLORS
+    jge .cs_done
+    push rbx
     mov rdi, r13
-    lea rsi, [.cs_host]
+    mov rsi, [color_name_table + rbx*8]
     call strcmp
+    pop rbx
     test rax, rax
-    jz .cs_found_host
+    jz .cs_found
+    inc rbx
+    jmp .cs_search
 
-    mov rdi, r13
-    lea rsi, [.cs_cwd]
-    call strcmp
-    test rax, rax
-    jz .cs_found_cwd
-
-    mov rdi, r13
-    lea rsi, [.cs_prompt_name]
-    call strcmp
-    test rax, rax
-    jz .cs_found_prompt
-
-    mov rdi, r13
-    lea rsi, [.cs_cmd]
-    call strcmp
-    test rax, rax
-    jz .cs_found_cmd
-
-    mov rdi, r13
-    lea rsi, [.cs_git]
-    call strcmp
-    test rax, rax
-    jz .cs_found_git
-
-    jmp .cs_done
-
-.cs_found_user:
-    mov rbx, C_USER
-    jmp .cs_set
-.cs_found_host:
-    mov rbx, C_HOST
-    jmp .cs_set
-.cs_found_cwd:
-    mov rbx, C_CWD
-    jmp .cs_set
-.cs_found_prompt:
-    mov rbx, C_PROMPT
-    jmp .cs_set
-.cs_found_cmd:
-    mov rbx, C_CMD
-    jmp .cs_set
-.cs_found_git:
-    mov rbx, C_GIT
-
-.cs_set:
+.cs_found:
+    ; rbx = color index, r12 = value string
     mov rdi, r12
     call parse_int
     mov byte [color_settings + rbx], al
@@ -6649,13 +6612,6 @@ config_set_color:
     pop r12
     pop rbx
     ret
-
-.cs_user: db "user", 0
-.cs_host: db "host", 0
-.cs_cwd: db "cwd", 0
-.cs_prompt_name: db "prompt", 0
-.cs_cmd: db "cmd", 0
-.cs_git: db "git", 0
 
 ; config_set_bool: rdi = value string ("true"/"false"), rsi = bit index
 config_set_bool:
@@ -9871,7 +9827,7 @@ handle_config:
     ; Set key = value (delegate to config parser logic)
     ; For now, handle known keys
     mov rdi, [r12 + 8]
-    lea rsi, [.hcfg_slow]
+    lea rsi, [hcfg_slow]
     call strcmp
     test rax, rax
     jnz .hcfg_check_dedup
@@ -9882,7 +9838,7 @@ handle_config:
 
 .hcfg_check_dedup:
     mov rdi, [r12 + 8]
-    lea rsi, [.hcfg_dedup]
+    lea rsi, [hcfg_dedup]
     call strcmp
     test rax, rax
     jnz .hcfg_check_limit
@@ -9904,13 +9860,24 @@ handle_config:
 
 .hcfg_check_limit:
     mov rdi, [r12 + 8]
-    lea rsi, [.hcfg_climit]
+    lea rsi, [hcfg_climit]
     call strcmp
     test rax, rax
-    jnz .hcfg_done
+    jnz .hcfg_check_color
     mov rdi, [r12 + 16]
     call parse_int
     mov [completion_limit], rax
+    jmp .hcfg_done
+
+.hcfg_check_color:
+    ; Check for c_* color keys
+    mov rdi, [r12 + 8]
+    cmp word [rdi], 'c_'
+    jne .hcfg_done
+    ; It's a color key, use config_set_color
+    lea rdi, [rdi + 2]       ; skip "c_"
+    mov rsi, [r12 + 16]      ; value
+    call config_set_color
 
 .hcfg_done:
     mov qword [last_status], 0
@@ -9926,14 +9893,14 @@ handle_config:
     ; Print current config
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [.hcfg_header]
-    mov rdx, .hcfg_header_len
+    lea rsi, [hcfg_header]
+    mov rdx, hcfg_header_len
     syscall
     ; slow_command_threshold
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [.hcfg_slow_label]
-    mov rdx, .hcfg_slow_label_len
+    lea rsi, [hcfg_slow_label]
+    mov rdx, hcfg_slow_label_len
     syscall
     mov rax, [slow_cmd_threshold]
     lea rdi, [num_buf]
@@ -9951,8 +9918,8 @@ handle_config:
     ; completion_limit
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [.hcfg_climit_label]
-    mov rdx, .hcfg_climit_label_len
+    lea rsi, [hcfg_climit_label]
+    mov rdx, hcfg_climit_label_len
     syscall
     mov rax, [completion_limit]
     lea rdi, [num_buf]
@@ -9967,17 +9934,121 @@ handle_config:
     lea rsi, [newline]
     mov rdx, 1
     syscall
+    ; Print all colors with preview
+    push rbx
+    lea rbx, [.hcfg_color_names]
+    xor rcx, rcx
+.hcfg_color_loop:
+    cmp rcx, NUM_COLORS
+    jge .hcfg_colors_done
+    push rcx
+    ; Print "  c_<name> = "
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hcfg_c_prefix]
+    mov rdx, 4
+    syscall
+    pop rcx
+    push rcx
+    ; Get color name string
+    mov rsi, [rbx + rcx*8]
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    pop rcx
+    push rcx
+    mov rsi, [rbx + rcx*8]
+    syscall
+    ; " = "
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [nick_arrow]
+    mov rdx, 3
+    syscall
+    ; Print color value
+    pop rcx
+    push rcx
+    movzx eax, byte [color_settings + rcx]
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+    ; Print color preview: colored block
+    pop rcx
+    push rcx
+    movzx eax, byte [color_settings + rcx]
+    lea rdi, [tmp_buf]
+    call write_fg_color
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [tmp_buf]
+    syscall
+    ; Print colored sample text
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hcfg_sample]
+    mov rdx, .hcfg_sample_len
+    syscall
+    ; Reset
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hcfg_reset]
+    mov rdx, 4
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    pop rcx
+    inc rcx
+    jmp .hcfg_color_loop
+.hcfg_colors_done:
+    pop rbx
     jmp .hcfg_done
 
-.hcfg_header: db "Configuration:", 10
-.hcfg_header_len equ $ - .hcfg_header
-.hcfg_slow: db "slow_command_threshold", 0
-.hcfg_slow_label: db "  slow_command_threshold = "
-.hcfg_slow_label_len equ $ - .hcfg_slow_label
-.hcfg_dedup: db "history_dedup", 0
-.hcfg_climit: db "completion_limit", 0
-.hcfg_climit_label: db "  completion_limit = "
-.hcfg_climit_label_len equ $ - .hcfg_climit_label
+.hcfg_c_prefix: db "  c_"
+.hcfg_sample: db " sample"
+.hcfg_sample_len equ $ - .hcfg_sample
+.hcfg_reset: db 27, "[0m"
+.hcfg_color_names:  ; alias for global color_name_table
+color_name_table:
+    dq cn_user, cn_host, cn_cwd, cn_prompt
+    dq cn_cmd, cn_nick, cn_gnick, cn_path
+    dq cn_switch, cn_bookmark, cn_colon, cn_git
+    dq cn_stamp, cn_tabsel, cn_tabopt, cn_suggest
+cn_user: db "user", 0
+cn_host: db "host", 0
+cn_cwd: db "cwd", 0
+cn_prompt: db "prompt", 0
+cn_cmd: db "cmd", 0
+cn_nick: db "nick", 0
+cn_gnick: db "gnick", 0
+cn_path: db "path", 0
+cn_switch: db "switch", 0
+cn_bookmark: db "bookmark", 0
+cn_colon: db "colon", 0
+cn_git: db "git", 0
+cn_stamp: db "stamp", 0
+cn_tabsel: db "tabsel", 0
+cn_tabopt: db "tabopt", 0
+cn_suggest: db "suggest", 0
+
+hcfg_header: db "Configuration:", 10
+hcfg_header_len equ $ - hcfg_header
+hcfg_slow: db "slow_command_threshold", 0
+hcfg_slow_label: db "  slow_command_threshold = "
+hcfg_slow_label_len equ $ - hcfg_slow_label
+hcfg_dedup: db "history_dedup", 0
+hcfg_climit: db "completion_limit", 0
+hcfg_climit_label: db "  completion_limit = "
+hcfg_climit_label_len equ $ - hcfg_climit_label
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Save config to ~/.barerc
@@ -10113,7 +10184,7 @@ save_config:
     xor r13, r13
 .sc_bm_loop:
     cmp r13, [bm_count]
-    jge .sc_close
+    jge .sc_colors
     mov rax, SYS_WRITE
     mov rdi, r12
     lea rsi, [.sc_bm_pre]
@@ -10145,6 +10216,59 @@ save_config:
     syscall
     inc r13
     jmp .sc_bm_loop
+
+.sc_colors:
+    ; Write color settings
+    xor r13, r13
+    lea rbx, [color_name_table]
+.sc_color_loop:
+    cmp r13, NUM_COLORS
+    jge .sc_close
+    ; "c_<name> = <value>\n"
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [.sc_c_pre]
+    mov rdx, 2
+    syscall
+    ; Write color name
+    push r13
+    mov rsi, [rbx + r13*8]
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    pop r13
+    push r13
+    mov rsi, [rbx + r13*8]
+    syscall
+    ; " = "
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [nick_arrow]
+    mov rdx, 3
+    syscall
+    ; Write value
+    pop r13
+    push r13
+    movzx eax, byte [color_settings + r13]
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [num_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    pop r13
+    inc r13
+    jmp .sc_color_loop
+
+.sc_c_pre: db "c_"
 
 .sc_close:
     mov rax, SYS_CLOSE
