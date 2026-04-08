@@ -10148,11 +10148,52 @@ handle_config:
     ; Check for c_* color keys
     mov rdi, [r12 + 8]
     cmp word [rdi], 'c_'
-    jne .hcfg_done
-    ; It's a color key, use config_set_color
-    lea rdi, [rdi + 2]       ; skip "c_"
-    mov rsi, [r12 + 16]      ; value
+    jne .hcfg_check_bool
+    lea rdi, [rdi + 2]
+    mov rsi, [r12 + 16]
     call config_set_color
+    jmp .hcfg_done
+
+.hcfg_check_bool:
+    ; Boolean toggles: show_tips, auto_correct, auto_pair, rprompt
+    mov rdi, [r12 + 8]
+    lea rsi, [hcfg_show_tips]
+    call strcmp
+    test rax, rax
+    jnz .hcfg_cb2
+    mov rdi, [r12 + 16]
+    mov rsi, CFG_SHOW_TIPS
+    call config_set_bool
+    jmp .hcfg_done
+.hcfg_cb2:
+    mov rdi, [r12 + 8]
+    lea rsi, [hcfg_auto_correct]
+    call strcmp
+    test rax, rax
+    jnz .hcfg_cb3
+    mov rdi, [r12 + 16]
+    mov rsi, CFG_AUTO_CORRECT
+    call config_set_bool
+    jmp .hcfg_done
+.hcfg_cb3:
+    mov rdi, [r12 + 8]
+    lea rsi, [hcfg_auto_pair_str]
+    call strcmp
+    test rax, rax
+    jnz .hcfg_cb4
+    mov rdi, [r12 + 16]
+    mov rsi, CFG_AUTO_PAIR
+    call config_set_bool
+    jmp .hcfg_done
+.hcfg_cb4:
+    mov rdi, [r12 + 8]
+    lea rsi, [hcfg_rprompt_str]
+    call strcmp
+    test rax, rax
+    jnz .hcfg_done
+    mov rdi, [r12 + 16]
+    mov rsi, CFG_RPROMPT
+    call config_set_bool
 
 .hcfg_done:
     mov qword [last_status], 0
@@ -10312,6 +10353,10 @@ hcfg_dedup: db "history_dedup", 0
 hcfg_climit: db "completion_limit", 0
 hcfg_climit_label: db "  completion_limit = "
 hcfg_climit_label_len equ $ - hcfg_climit_label
+hcfg_show_tips: db "show_tips", 0
+hcfg_auto_correct: db "auto_correct", 0
+hcfg_auto_pair_str: db "auto_pair", 0
+hcfg_rprompt_str: db "rprompt", 0
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Save config to ~/.barerc
