@@ -1912,6 +1912,9 @@ read_line:
     jmp .tab_check_prev
 
 .tab_command_completion:
+    ; Check for $VAR even in command position
+    cmp byte [tab_word_buf], 0x24
+    je .tab_var_completion
     ; Search PATH directories for matches
     lea rdi, [tab_word_buf]
     call tab_complete_command
