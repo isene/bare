@@ -10955,80 +10955,89 @@ syntax_highlight_line:
 ; Tab complete $VAR from environment
 ; rdi = word starting with $
 ; ══════════════════════════════════════════════════════════════════════
+; Tab complete $VAR: search env_array for vars matching prefix
+; rdi = tab_word_buf containing "$PREFIX"
 tab_complete_var:
     push rbx
     push r12
     push r13
-    mov r12, rdi
-    inc r12                  ; skip $
-    mov rdi, r12
+    push r14
+
+    ; Extract prefix after $
+    mov r12, rdi             ; r12 = tab_word_buf ("$HO")
+    lea r13, [rdi + 1]       ; r13 = prefix ("HO")
+    mov rdi, r13
     call strlen
-    mov r13, rax             ; prefix length after $
+    mov r14, rax             ; r14 = prefix length (2 for "HO")
 
     mov qword [tab_count], 0
     mov qword [tab_buf_pos], 0
-    xor rcx, rcx
+
+    xor r12, r12             ; loop counter
 .tcv_loop:
-    cmp rcx, [env_count]
+    cmp r12, [env_count]
     jge .tcv_done
-    mov rsi, [env_array + rcx*8]
+    mov rsi, [env_array + r12*8]
     test rsi, rsi
     jz .tcv_next
-    push rcx
-    push rsi
-    xor rbx, rbx
+
+    ; Compare prefix against env var name
+    xor rcx, rcx
 .tcv_cmp:
-    cmp rbx, r13
-    jge .tcv_match
-    movzx eax, byte [r12 + rbx]
-    movzx edx, byte [rsi + rbx]
-    cmp dl, '='
-    je .tcv_no_match
+    cmp rcx, r14
+    jge .tcv_prefix_match    ; all prefix chars matched
+    movzx eax, byte [r13 + rcx]  ; prefix char
+    movzx edx, byte [rsi + rcx]  ; env var char
+    cmp dl, '='              ; hit = before prefix ended = no match
+    je .tcv_next
+    test dl, dl              ; hit null before prefix ended = no match
+    jz .tcv_next
     cmp al, dl
-    jne .tcv_no_match
-    inc rbx
+    jne .tcv_next
+    inc rcx
     jmp .tcv_cmp
-.tcv_match:
-    pop rsi
-    pop rcx
-    push rcx
+
+.tcv_prefix_match:
+    ; env var at rsi starts with our prefix
+    ; Extract var name (up to '=') and store as "$VARNAME"
     cmp qword [tab_count], MAX_TAB_RESULTS - 1
-    jge .tcv_skip
+    jge .tcv_next
+
+    ; Write "$" + varname to tab_buf at current position
     mov rax, [tab_buf_pos]
     lea rdi, [tab_buf + rax]
-    mov byte [rdi], '$'
+    ; Store pointer in tab_results
+    mov rbx, [tab_count]
+    mov [tab_results + rbx*8], rdi
+
+    ; Write $
+    mov byte [rdi], 0x24     ; '$'
     inc rdi
-    push rsi
-    xor rbx, rbx
-.tcv_copy_name:
-    movzx eax, byte [rsi + rbx]
+
+    ; Copy var name from env entry until '='
+    xor rcx, rcx
+.tcv_copy:
+    movzx eax, byte [rsi + rcx]
     test al, al
-    jz .tcv_name_done
+    jz .tcv_copied
     cmp al, '='
-    je .tcv_name_done
-    mov [rdi + rbx], al
-    inc rbx
-    jmp .tcv_copy_name
-.tcv_name_done:
-    mov byte [rdi + rbx], 0
-    pop rsi
-    mov rax, [tab_count]
-    mov rdx, [tab_buf_pos]
-    lea rdi, [tab_buf + rdx]
-    mov [tab_results + rax*8], rdi
-    inc qword [tab_count]
-    lea rdx, [rbx + 2]
-    add [tab_buf_pos], rdx
-.tcv_skip:
-    pop rcx
-.tcv_next:
+    je .tcv_copied
+    mov [rdi + rcx], al
     inc rcx
+    jmp .tcv_copy
+.tcv_copied:
+    mov byte [rdi + rcx], 0  ; null terminate
+    ; Update tab_buf_pos: $ + name + null = rcx + 2
+    lea rax, [rcx + 2]
+    add [tab_buf_pos], rax
+    inc qword [tab_count]
+
+.tcv_next:
+    inc r12
     jmp .tcv_loop
-.tcv_no_match:
-    pop rsi
-    pop rcx
-    jmp .tcv_next
+
 .tcv_done:
+    pop r14
     pop r13
     pop r12
     pop rbx
