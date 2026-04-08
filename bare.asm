@@ -511,6 +511,10 @@ search_buf:     resb 256
 search_len:     resq 1
 rs_skip_count:  resq 1              ; how many matches to skip (Ctrl-R again)
 
+; Prefix history search (Up/Down with typed prefix)
+hist_prefix_buf: resb 256           ; saved prefix for Up/Down search
+hist_prefix_len: resq 1             ; length of prefix (0 = no prefix search)
+
 ; Inline suggestion
 suggestion_buf: resb 4096
 suggestion_ptr: resq 1              ; pointer to suggestion remainder
@@ -965,6 +969,9 @@ read_line:
     test rax, rax
     jnz .read_char           ; abbreviation was expanded, skip normal insert
 .not_space:
+
+    ; Clear prefix history search on any typed character
+    mov qword [hist_prefix_len], 0
 
     ; Regular character: insert at cursor
     cmp r12, 4094
@@ -1776,6 +1783,56 @@ read_line:
 .space_clr: db ' '
 
 .hist_prev:
+    ; If line has content and prefix not yet saved, save it for prefix search
+    cmp qword [hist_prefix_len], 0
+    jne .hp_have_prefix
+    mov rax, [line_len]
+    test rax, rax
+    jz .hp_no_prefix
+    ; Save current line as prefix
+    cmp rax, 255
+    jg .hp_no_prefix
+    mov [hist_prefix_len], rax
+    lea rsi, [line_buf]
+    lea rdi, [hist_prefix_buf]
+    mov rcx, rax
+.hp_save_prefix:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .hp_save_prefix
+    mov byte [rdi], 0
+.hp_have_prefix:
+    ; Search backward for entry matching prefix
+    mov rax, [hist_pos]
+.hp_search_back:
+    test rax, rax
+    jz .read_char            ; no more history
+    dec rax
+    mov rsi, [hist_lines + rax*8]
+    test rsi, rsi
+    jz .hp_search_back
+    ; Compare prefix
+    lea rdi, [hist_prefix_buf]
+    xor rcx, rcx
+    mov rdx, [hist_prefix_len]
+.hp_cmp:
+    cmp rcx, rdx
+    jge .hp_match             ; all prefix chars matched
+    movzx ebx, byte [rdi + rcx]
+    cmp bl, [rsi + rcx]
+    jne .hp_search_back       ; mismatch, try older
+    inc rcx
+    jmp .hp_cmp
+.hp_match:
+    mov [hist_pos], rax
+    call load_hist_line
+    jmp .read_char
+
+.hp_no_prefix:
+    ; No prefix: plain history navigation
     cmp qword [hist_pos], 0
     je .read_char
     dec qword [hist_pos]
@@ -1783,20 +1840,74 @@ read_line:
     jmp .read_char
 
 .hist_next:
+    ; Check if we're doing prefix search
+    cmp qword [hist_prefix_len], 0
+    je .hn_no_prefix
+
+    ; Search forward for entry matching prefix
+    mov rax, [hist_pos]
+.hn_search_fwd:
+    inc rax
+    cmp rax, [hist_count]
+    jge .hn_restore_prefix    ; past end, restore original prefix
+    mov rsi, [hist_lines + rax*8]
+    test rsi, rsi
+    jz .hn_search_fwd
+    ; Compare prefix
+    lea rdi, [hist_prefix_buf]
+    xor rcx, rcx
+    mov rdx, [hist_prefix_len]
+.hn_cmp:
+    cmp rcx, rdx
+    jge .hn_match
+    movzx ebx, byte [rdi + rcx]
+    cmp bl, [rsi + rcx]
+    jne .hn_search_fwd
+    inc rcx
+    jmp .hn_cmp
+.hn_match:
+    mov [hist_pos], rax
+    call load_hist_line
+    jmp .read_char
+
+.hn_restore_prefix:
+    ; Past end of history: restore the original typed prefix
+    mov [hist_pos], rax
+    lea rsi, [hist_prefix_buf]
+    lea rdi, [line_buf]
+    mov rcx, [hist_prefix_len]
+    xor rax, rax
+.hn_restore:
+    cmp rax, rcx
+    jge .hn_restored
+    movzx edx, byte [rsi + rax]
+    mov [rdi + rax], dl
+    inc rax
+    jmp .hn_restore
+.hn_restored:
+    mov byte [rdi + rax], 0
+    mov [line_len], rax
+    mov r12, rax
+    mov qword [hist_prefix_len], 0  ; clear prefix search
+    call full_redraw
+    jmp .read_char
+
+.hn_no_prefix:
+    ; No prefix: plain history navigation
     mov rax, [hist_pos]
     cmp rax, [hist_count]
     jge .read_char
     inc qword [hist_pos]
     mov rax, [hist_pos]
     cmp rax, [hist_count]
-    jl .load_next_hist
+    jl .hn_load
     ; At end: clear line
     xor r12, r12
     mov qword [line_len], 0
     mov byte [line_buf], 0
     call full_redraw
     jmp .read_char
-.load_next_hist:
+.hn_load:
     call load_hist_line
     jmp .read_char
 
