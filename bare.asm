@@ -782,6 +782,14 @@ read_line:
     cmp al, 7
     je .edit_in_editor
 
+    ; Ctrl-Y = copy line to clipboard
+    cmp al, 25
+    je .copy_clipboard
+
+    ; Ctrl-_ = undo
+    cmp al, 31
+    je .undo_action
+
     ; Ctrl-A = home
     cmp al, 1
     je .home
@@ -834,6 +842,90 @@ read_line:
     inc r12
     inc qword [line_len]
 
+    ; Save undo state on significant edits
+    call save_undo_state
+
+    ; Auto-pair: insert closing bracket/quote after cursor
+    test qword [config_flags], (1 << CFG_AUTO_PAIR)
+    jz .no_auto_pair
+    movzx eax, byte [tmp_buf]
+    cmp al, '('
+    je .auto_pair_close
+    cmp al, '['
+    je .auto_pair_close
+    cmp al, '{'
+    je .auto_pair_close
+    cmp al, 0x27             ; single quote
+    je .auto_pair_quote
+    cmp al, '"'
+    je .auto_pair_quote
+    jmp .no_auto_pair
+
+.auto_pair_close:
+    ; Map ( -> ), [ -> ], { -> }
+    movzx eax, byte [tmp_buf]
+    cmp al, '('
+    jne .apc_not_paren
+    mov byte [tmp_buf + 1], ')'
+    jmp .apc_insert
+.apc_not_paren:
+    cmp al, '['
+    jne .apc_not_bracket
+    mov byte [tmp_buf + 1], ']'
+    jmp .apc_insert
+.apc_not_bracket:
+    mov byte [tmp_buf + 1], '}'
+.apc_insert:
+    ; Insert closing char at cursor (which is now after opening char)
+    movzx eax, byte [tmp_buf + 1]
+    ; Shift chars right if not at end
+    mov rcx, [line_len]
+    cmp r12, rcx
+    jge .apc_at_end
+    push rcx
+    lea rdi, [line_buf + rcx]
+    lea rsi, [line_buf + rcx - 1]
+    mov rcx, [line_len]
+    sub rcx, r12
+.apc_shift:
+    mov al, [rsi]
+    mov [rdi], al
+    dec rsi
+    dec rdi
+    dec rcx
+    jnz .apc_shift
+    pop rcx
+.apc_at_end:
+    movzx eax, byte [tmp_buf + 1]
+    mov [line_buf + r12], al
+    inc qword [line_len]
+    ; Don't advance cursor - leave it between the pair
+    jmp .no_auto_pair
+
+.auto_pair_quote:
+    ; Insert same char as closing
+    mov rcx, [line_len]
+    cmp r12, rcx
+    jge .apq_at_end
+    push rcx
+    lea rdi, [line_buf + rcx]
+    lea rsi, [line_buf + rcx - 1]
+    mov rcx, [line_len]
+    sub rcx, r12
+.apq_shift:
+    mov al, [rsi]
+    mov [rdi], al
+    dec rsi
+    dec rdi
+    dec rcx
+    jnz .apq_shift
+    pop rcx
+.apq_at_end:
+    movzx eax, byte [tmp_buf]
+    mov [line_buf + r12], al
+    inc qword [line_len]
+
+.no_auto_pair:
     ; Echo the typed character
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -987,6 +1079,95 @@ read_line:
 .end_of_line:
     mov r12, [line_len]
     call reposition_cursor
+    jmp .read_char
+
+.copy_clipboard:
+    ; Ctrl-Y: copy line to clipboard via xclip
+    cmp qword [line_len], 0
+    je .read_char
+    ; Fork xclip -selection clipboard, write line to its stdin
+    mov rax, SYS_PIPE
+    lea rdi, [pipe_fds]
+    syscall
+    test rax, rax
+    jnz .read_char
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    jz .cc_child
+    js .read_char
+    ; Parent: write line to pipe, close
+    push rax
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]      ; close read end
+    syscall
+    mov rax, SYS_WRITE
+    mov edi, [pipe_fds + 4]  ; write end
+    lea rsi, [line_buf]
+    mov rdx, [line_len]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+    ; Don't wait (fire and forget)
+    pop rax
+    jmp .read_char
+.cc_child:
+    ; stdin = pipe read end
+    mov rax, SYS_DUP2
+    mov edi, [pipe_fds]
+    xor esi, esi
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+    ; exec xclip
+    sub rsp, 32
+    lea rax, [.cc_xclip]
+    mov [rsp], rax
+    lea rax, [.cc_sel_flag]
+    mov [rsp + 8], rax
+    lea rax, [.cc_sel_clip]
+    mov [rsp + 16], rax
+    mov qword [rsp + 24], 0
+    mov rax, SYS_EXECVE
+    lea rdi, [.cc_xclip]
+    mov rsi, rsp
+    lea rdx, [env_array]
+    syscall
+    mov rax, SYS_EXIT
+    xor edi, edi
+    syscall
+.cc_xclip: db "/usr/bin/xclip", 0
+.cc_sel_flag: db "-selection", 0
+.cc_sel_clip: db "clipboard", 0
+
+.undo_action:
+    ; Ctrl-_: restore previous undo state
+    mov rax, [undo_count]
+    test rax, rax
+    jz .read_char
+    dec rax
+    mov [undo_count], rax
+    ; Restore line_buf from undo_stack[undo_count]
+    imul rcx, rax, 4096
+    lea rsi, [undo_stack + rcx]
+    lea rdi, [line_buf]
+    xor rcx, rcx
+.ua_copy:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .ua_done
+    inc rcx
+    jmp .ua_copy
+.ua_done:
+    mov [line_len], rcx
+    mov r12, [undo_positions + rax*8]
+    call full_redraw
     jmp .read_char
 
 .edit_in_editor:
@@ -1516,6 +1697,45 @@ read_line:
     mov [line_len], rcx
 .rd_nullterm:
     mov byte [line_buf + rcx], 0
+
+    ; Multi-line continuation: check if line ends with \ | && || or has unclosed quotes
+    call check_continuation
+    test rax, rax
+    jz .rd_finish
+
+    ; Continuation needed: print newline, show "> " prompt, keep reading
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    ; Print continuation prompt
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.cont_prompt]
+    mov rdx, 2
+    syscall
+    ; Append a space to line_buf (replace the trailing \ with space if backslash continuation)
+    mov rcx, [line_len]
+    cmp byte [line_buf + rcx - 1], '\'
+    jne .rd_no_strip_bs
+    dec rcx                  ; remove trailing backslash
+    mov byte [line_buf + rcx], ' '
+    inc rcx
+    mov [line_len], rcx
+    jmp .rd_cont_read
+.rd_no_strip_bs:
+    ; For | && || continuation, add a space
+    mov byte [line_buf + rcx], ' '
+    inc rcx
+    mov [line_len], rcx
+.rd_cont_read:
+    mov r12, rcx             ; cursor at end
+    jmp .read_char
+
+.cont_prompt: db "> "
+
+.rd_finish:
     ; Print newline
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -2139,14 +2359,19 @@ full_redraw:
     syscall
     ; Print prompt
     call print_prompt
-    ; Print line content
+    ; Print line content with syntax highlighting
     mov rcx, [line_len]
     test rcx, rcx
     jz .fd_repos
+    cmp qword [is_tty], 0
+    je .fd_plain
+    call syntax_highlight_line
+    jmp .fd_repos
+.fd_plain:
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [line_buf]
-    mov rdx, rcx
+    mov rdx, [line_len]
     syscall
 .fd_repos:
     call reposition_cursor
@@ -10285,3 +10510,310 @@ save_config:
 .sc_gnick_pre: db "gnick."
 .sc_abbrev_pre: db "abbrev."
 .sc_bm_pre: db "bm."
+
+; ══════════════════════════════════════════════════════════════════════
+; Save undo state (snapshot of line_buf)
+; Stores up to 4 snapshots in a circular buffer
+; ══════════════════════════════════════════════════════════════════════
+save_undo_state:
+    push rbx
+    push r12
+    mov rax, [undo_count]
+    cmp rax, 4
+    jl .sus_ok
+    ; Shift snapshots down (drop oldest)
+    lea rdi, [undo_stack]
+    lea rsi, [undo_stack + 4096]
+    mov rcx, 4096 * 3
+    rep movsb
+    ; Shift positions
+    mov rax, [undo_positions + 8]
+    mov [undo_positions], rax
+    mov rax, [undo_positions + 16]
+    mov [undo_positions + 8], rax
+    mov rax, [undo_positions + 24]
+    mov [undo_positions + 16], rax
+    mov qword [undo_count], 3
+    mov rax, 3
+.sus_ok:
+    ; Copy line_buf to undo_stack[undo_count]
+    imul rcx, rax, 4096
+    lea rdi, [undo_stack + rcx]
+    lea rsi, [line_buf]
+    xor rcx, rcx
+.sus_copy:
+    mov bl, [rsi + rcx]
+    mov [rdi + rcx], bl
+    test bl, bl
+    jz .sus_done
+    inc rcx
+    cmp rcx, 4095
+    jge .sus_done
+    jmp .sus_copy
+.sus_done:
+    mov byte [rdi + rcx], 0
+    mov [undo_positions + rax*8], r12
+    inc qword [undo_count]
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Check if line needs continuation (multi-line editing)
+; Returns: rax = 1 if continuation needed, 0 if not
+; Checks for: trailing \, trailing |, trailing &&, trailing ||,
+; unclosed single/double quotes
+; ══════════════════════════════════════════════════════════════════════
+check_continuation:
+    push rbx
+    mov rcx, [line_len]
+    test rcx, rcx
+    jz .cc_no
+
+    ; Check for trailing backslash
+    dec rcx
+    cmp byte [line_buf + rcx], '\'
+    je .cc_yes
+
+    ; Skip trailing spaces
+.cc_skip_trail:
+    test rcx, rcx
+    jz .cc_check_quotes
+    cmp byte [line_buf + rcx], ' '
+    jne .cc_check_trail
+    dec rcx
+    jmp .cc_skip_trail
+
+.cc_check_trail:
+    ; Check for trailing |
+    cmp byte [line_buf + rcx], '|'
+    je .cc_yes
+    ; Check for trailing && (need at least 2 chars)
+    test rcx, rcx
+    jz .cc_check_quotes
+    cmp byte [line_buf + rcx], '&'
+    jne .cc_check_quotes
+    cmp byte [line_buf + rcx - 1], '&'
+    je .cc_yes
+
+.cc_check_quotes:
+    ; Count unmatched quotes
+    xor rcx, rcx             ; position
+    xor edx, edx             ; single quote count
+    xor r8d, r8d             ; double quote count
+.cc_quote_loop:
+    cmp rcx, [line_len]
+    jge .cc_quote_done
+    cmp byte [line_buf + rcx], 0x27
+    jne .cc_not_sq
+    inc edx
+    jmp .cc_quote_next
+.cc_not_sq:
+    cmp byte [line_buf + rcx], '"'
+    jne .cc_quote_next
+    inc r8d
+.cc_quote_next:
+    inc rcx
+    jmp .cc_quote_loop
+.cc_quote_done:
+    ; Odd number of either quote type means unclosed
+    test edx, 1
+    jnz .cc_yes
+    test r8d, 1
+    jnz .cc_yes
+
+.cc_no:
+    xor eax, eax
+    pop rbx
+    ret
+.cc_yes:
+    mov eax, 1
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Syntax highlighting: write line_buf with colors to stdout
+; Colors the first word as command (check nick/builtin), switches as
+; cyan, paths as yellow, and the rest as default command color.
+; ══════════════════════════════════════════════════════════════════════
+syntax_highlight_line:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    lea rsi, [line_buf]
+    mov r13, [line_len]
+    test r13, r13
+    jz .shl_done
+
+    ; Find end of first word
+    xor rcx, rcx
+.shl_find_cmd_end:
+    cmp rcx, r13
+    jge .shl_cmd_end_found
+    cmp byte [rsi + rcx], ' '
+    je .shl_cmd_end_found
+    inc rcx
+    jmp .shl_find_cmd_end
+.shl_cmd_end_found:
+    mov r14, rcx             ; r14 = first word length
+
+    ; Determine command color
+    ; Check if first word starts with ':' (colon command)
+    movzx eax, byte [color_settings + C_CMD]
+    cmp byte [line_buf], ':'
+    jne .shl_not_colon
+    movzx eax, byte [color_settings + C_COLON]
+    jmp .shl_got_cmd_color
+.shl_not_colon:
+    ; Check if first word is a nick
+    push rax
+    xor rcx, rcx
+.shl_check_nick:
+    cmp rcx, [nick_count]
+    jge .shl_not_nick
+    push rcx
+    ; Compare first word with nick name
+    mov rdi, [nick_names + rcx*8]
+    call strlen
+    pop rcx
+    cmp rax, r14
+    jne .shl_nick_next
+    ; Length matches, compare bytes
+    push rcx
+    mov rdi, [nick_names + rcx*8]
+    lea rsi, [line_buf]
+    xor rbx, rbx
+.shl_nick_cmp:
+    cmp rbx, r14
+    jge .shl_is_nick
+    movzx eax, byte [rdi + rbx]
+    cmp al, [rsi + rbx]
+    jne .shl_nick_no
+    inc rbx
+    jmp .shl_nick_cmp
+.shl_is_nick:
+    pop rcx
+    pop rax                  ; discard saved default color
+    movzx eax, byte [color_settings + C_NICK]
+    jmp .shl_got_cmd_color
+.shl_nick_no:
+    pop rcx
+.shl_nick_next:
+    inc rcx
+    lea rsi, [line_buf]     ; restore rsi
+    jmp .shl_check_nick
+.shl_not_nick:
+    pop rax                  ; restore default cmd color
+
+.shl_got_cmd_color:
+    ; Write command word with color
+    push rax                 ; save cmd color
+    lea rdi, [suggestion_buf] ; reuse as output buffer
+    call write_fg_color
+    mov rbx, rax             ; output position
+    ; Copy command word
+    xor rcx, rcx
+.shl_copy_cmd:
+    cmp rcx, r14
+    jge .shl_cmd_copied
+    movzx eax, byte [line_buf + rcx]
+    mov [suggestion_buf + rbx], al
+    inc rbx
+    inc rcx
+    jmp .shl_copy_cmd
+.shl_cmd_copied:
+    pop rax                  ; discard saved cmd color
+
+    ; Reset color
+    mov byte [suggestion_buf + rbx], 27
+    mov byte [suggestion_buf + rbx + 1], '['
+    mov byte [suggestion_buf + rbx + 2], '0'
+    mov byte [suggestion_buf + rbx + 3], 'm'
+    add rbx, 4
+
+    ; Now process remaining characters with context coloring
+    mov rcx, r14             ; start from after command
+.shl_rest:
+    cmp rcx, r13
+    jge .shl_write_output
+    movzx eax, byte [line_buf + rcx]
+
+    ; Check for switch (-x or --x)
+    cmp al, '-'
+    jne .shl_not_switch
+    ; Check if preceded by space (or at start of args)
+    test rcx, rcx
+    jz .shl_not_switch
+    cmp byte [line_buf + rcx - 1], ' '
+    jne .shl_not_switch
+    ; Write switch color
+    push rcx
+    movzx eax, byte [color_settings + C_SWITCH]
+    lea rdi, [suggestion_buf + rbx]
+    call write_fg_color
+    add rbx, rax
+    pop rcx
+    ; Copy switch chars until space
+.shl_switch_chars:
+    cmp rcx, r13
+    jge .shl_reset_after
+    cmp byte [line_buf + rcx], ' '
+    je .shl_reset_after
+    movzx eax, byte [line_buf + rcx]
+    mov [suggestion_buf + rbx], al
+    inc rbx
+    inc rcx
+    jmp .shl_switch_chars
+.shl_reset_after:
+    ; Reset
+    mov byte [suggestion_buf + rbx], 27
+    mov byte [suggestion_buf + rbx + 1], '['
+    mov byte [suggestion_buf + rbx + 2], '0'
+    mov byte [suggestion_buf + rbx + 3], 'm'
+    add rbx, 4
+    jmp .shl_rest
+
+.shl_not_switch:
+    ; Check for path (contains /)
+    cmp al, '/'
+    jne .shl_not_path
+    cmp byte [line_buf + rcx - 1], ' '
+    jne .shl_not_path_start
+    ; Color as path
+    push rcx
+    movzx eax, byte [color_settings + C_PATH]
+    lea rdi, [suggestion_buf + rbx]
+    call write_fg_color
+    add rbx, rax
+    pop rcx
+.shl_not_path_start:
+.shl_not_path:
+    ; Default: copy character
+    mov [suggestion_buf + rbx], al
+    inc rbx
+    inc rcx
+    jmp .shl_rest
+
+.shl_write_output:
+    ; Final reset
+    mov byte [suggestion_buf + rbx], 27
+    mov byte [suggestion_buf + rbx + 1], '['
+    mov byte [suggestion_buf + rbx + 2], '0'
+    mov byte [suggestion_buf + rbx + 3], 'm'
+    add rbx, 4
+
+    ; Write the highlighted output
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [suggestion_buf]
+    mov rdx, rbx
+    syscall
+
+.shl_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
