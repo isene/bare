@@ -92,16 +92,17 @@ See [plugins/README.md](plugins/README.md) for setup and writing your own.
 - Prefix history search (type text, press Up to filter)
 - Builtins: cd, pwd, exit, export, unset, history, pushd, popd
 
-## Related projects
+## Part of CHasm (CHange to ASM)
 
-bare is a pure assembly clone of [rush](https://github.com/isene/rush) (Rust shell) and [rsh](https://github.com/isene/rsh) (Ruby shell).
+The same shell, three languages:
 
-| Tool | Language | Type |
-|------|----------|------|
-| **[bare](https://github.com/isene/bare)** | **x86_64 Assembly** | **Shell** |
-| [bareconf](https://github.com/isene/bareconf) | Rust (crust) | Shell config TUI |
-| [rush](https://github.com/isene/rush) | Rust | Shell (Fe2O3 suite) |
-| [rsh](https://github.com/isene/rsh) | Ruby | Shell |
+| Shell | Language | Suite |
+|-------|----------|-------|
+| **[bare](https://github.com/isene/bare)** | **x86_64 Assembly** | **CHasm** |
+| [rush](https://github.com/isene/rush) | Rust | Fe2O3 |
+| [rsh](https://github.com/isene/rsh) | Ruby | |
+
+Companion: [bareconf](https://github.com/isene/bareconf) (TUI configurator, built on [crust](https://github.com/isene/crust))
 
 ## License
 
