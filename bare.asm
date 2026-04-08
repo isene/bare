@@ -3301,36 +3301,64 @@ parse_and_exec_simple:
     cmp rax, 0
     jg .paes_child_changed
     ; rax == 0: child still running, check stdin for Ctrl-Z/Ctrl-C
-    ; Use a short read with timeout (set VMIN=0, VTIME=1 = 100ms)
+    ; Only poll stdin in interactive (TTY) mode
+    cmp qword [is_tty], 0
+    je .paes_no_input_notty
     push r13
-    mov byte [raw_termios + 17 + VMIN], 0
-    mov byte [raw_termios + 17 + VTIME], 1
+    sub rsp, 8
     mov rax, SYS_IOCTL
-    xor edi, edi
-    mov esi, TCSETSW
-    lea rdx, [raw_termios]
+    xor edi, edi             ; stdin
+    mov esi, 0x541B          ; FIONREAD
+    mov rdx, rsp
     syscall
-    ; Try to read one byte
+    mov eax, [rsp]           ; bytes available
+    add rsp, 8
+    test eax, eax
+    jz .paes_no_input
+    ; Data available, read one byte
     mov rax, SYS_READ
     xor edi, edi
     lea rsi, [tmp_buf]
     mov rdx, 1
     syscall
-    ; Restore VMIN=1, VTIME=0
-    mov byte [raw_termios + 17 + VMIN], 1
-    mov byte [raw_termios + 17 + VTIME], 0
-    mov rax, SYS_IOCTL
-    xor edi, edi
-    mov esi, TCSETSW
-    lea rdx, [raw_termios]
-    syscall
-    pop r13
+    cmp rax, 1
+    jne .paes_no_input
     ; Check what we got
-    cmp byte [tmp_buf], 26   ; Ctrl-Z
-    je .paes_send_tstp
-    cmp byte [tmp_buf], 3    ; Ctrl-C
-    je .paes_send_int
+    movzx eax, byte [tmp_buf]
+    cmp al, 26               ; Ctrl-Z
+    je .paes_send_tstp_pop
+    cmp al, 3                ; Ctrl-C
+    je .paes_send_int_pop
+.paes_no_input_notty:
+    ; Non-TTY: blocking wait
+    mov rdi, r13
+    lea rsi, [rsp]
+    mov edx, WUNTRACED
+    xor r10d, r10d
+    mov rax, SYS_WAIT4
+    syscall
+    jmp .paes_child_changed
+
+.paes_no_input:
+    pop r13
+    ; Small sleep to avoid busy-waiting (1ms via nanosleep)
+    sub rsp, 16
+    mov qword [rsp], 0       ; tv_sec = 0
+    mov qword [rsp+8], 1000000  ; tv_nsec = 1ms
+    mov rax, 35              ; SYS_NANOSLEEP
+    mov rdi, rsp
+    xor esi, esi
+    syscall
+    add rsp, 16
     jmp .paes_wait
+
+.paes_send_tstp_pop:
+    pop r13
+    jmp .paes_send_tstp
+
+.paes_send_int_pop:
+    pop r13
+    jmp .paes_send_int
 
 .paes_send_tstp:
     ; Send SIGTSTP to child
