@@ -4514,6 +4514,28 @@ tab_complete_command:
     cmp qword [tab_count], MAX_TAB_RESULTS - 1
     jge .tcc_skip
 
+    ; Dedup: check if this name already exists in tab_results
+    push rdi
+    xor rcx, rcx
+.tcc_dedup:
+    cmp rcx, [tab_count]
+    jge .tcc_dedup_ok
+    push rcx
+    push rdi
+    mov rsi, [tab_results + rcx*8]
+    call strcmp
+    pop rdi
+    pop rcx
+    test rax, rax
+    jz .tcc_dedup_skip        ; duplicate found, skip
+    inc rcx
+    jmp .tcc_dedup
+.tcc_dedup_skip:
+    pop rdi
+    jmp .tcc_skip
+.tcc_dedup_ok:
+    pop rdi
+
     ; Copy name to tab_buf
     mov rcx, [tab_buf_pos]
     lea rbx, [tab_buf + rcx]
