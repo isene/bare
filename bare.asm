@@ -746,6 +746,10 @@ read_line:
     cmp al, 11
     je .kill_to_end
 
+    ; Ctrl-Z = ignore at prompt (job control only during child exec)
+    cmp al, 26
+    je .read_char
+
     ; Ctrl-R = reverse history search
     cmp al, 18
     je .reverse_search
@@ -3272,14 +3276,15 @@ parse_and_exec_simple:
     jz .child_exec
     js .fork_error
 
-    ; Parent: wait for child (with WUNTRACED to detect Ctrl-Z)
+    ; Parent: re-enable ISIG so Ctrl-Z reaches child via terminal
     mov [child_pid], rax
     mov r13, rax             ; save child pid
+    call restore_termios     ; restore original terminal (has ISIG)
     sub rsp, 16
 .paes_wait:
     mov rdi, r13
     lea rsi, [rsp]
-    mov edx, 2               ; WUNTRACED
+    mov edx, WUNTRACED
     xor r10d, r10d
     mov rax, SYS_WAIT4
     syscall
@@ -3294,11 +3299,13 @@ parse_and_exec_simple:
     and eax, 0xFF
     mov [last_status], rax
     add rsp, 16
+    call enable_raw_mode
     jmp .paes_done
 
 .paes_stopped:
     ; Child was stopped by Ctrl-Z, add to job table
     add rsp, 16
+    call enable_raw_mode
     mov rdi, r13             ; pid
     lea rsi, [line_buf]      ; command string
     call add_job
@@ -5279,8 +5286,7 @@ enable_raw_mode:
     rep movsb
     ; Clear ICANON and ECHO in c_lflag (offset 12 in termios)
     mov eax, [raw_termios + 12]
-    and eax, ~(ICANON | ECHO)
-    or eax, ISIG             ; keep signal handling
+    and eax, ~(ICANON | ECHO | ISIG)  ; raw: no canon, no echo, no signals
     mov [raw_termios + 12], eax
     ; Set VMIN=1, VTIME=0
     mov byte [raw_termios + 17 + VMIN], 1
