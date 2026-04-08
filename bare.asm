@@ -1471,16 +1471,42 @@ read_line:
     jmp .tab_done
 
 .tab_multiple:
-    ; Print all matches below prompt, then redraw
+    ; ── Interactive tab cycling ──
+    ; Display matches below prompt line, highlight current selection
+    ; TAB = next, Shift-TAB = prev, Enter/Space = accept, Esc = cancel
+    xor r15, r15             ; r15 = current selection index
+
+.tab_cycle_redraw:
+    ; Print newline + matches with selection highlighting
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [newline]
     mov rdx, 1
     syscall
     xor rcx, rcx
-.tab_print_loop:
+.tab_cycle_print:
     cmp rcx, [tab_count]
-    jge .tab_print_done
+    jge .tab_cycle_printed
+    push rcx
+    ; Check if this is the selected item
+    cmp rcx, r15
+    jne .tab_cycle_normal
+    ; Highlight: reverse video
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_hl_on]
+    mov rdx, .tab_hl_on_len
+    syscall
+    jmp .tab_cycle_name
+.tab_cycle_normal:
+    ; Dim color for non-selected
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_hl_dim]
+    mov rdx, .tab_hl_dim_len
+    syscall
+.tab_cycle_name:
+    pop rcx
     push rcx
     mov rsi, [tab_results + rcx*8]
     mov rdi, rsi
@@ -1492,7 +1518,13 @@ read_line:
     push rcx
     mov rsi, [tab_results + rcx*8]
     syscall
-    ; Print two spaces between entries
+    ; Reset color
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_hl_off]
+    mov rdx, 4
+    syscall
+    ; Space separator
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_sep]
@@ -1500,46 +1532,193 @@ read_line:
     syscall
     pop rcx
     inc rcx
-    jmp .tab_print_loop
+    jmp .tab_cycle_print
+.tab_hl_on: db 27, "[7m"            ; reverse video
+.tab_hl_on_len equ $ - .tab_hl_on
+.tab_hl_dim: db 27, "[38;5;245m"    ; gray
+.tab_hl_dim_len equ $ - .tab_hl_dim
+.tab_hl_off: db 27, "[0m"
 .tab_sep: db "  "
-.tab_print_done:
+
+.tab_cycle_printed:
+    ; Redraw prompt + current line above (cursor up, carriage return)
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_up_cr]
+    mov rdx, 4
+    syscall
+    ; Clear the prompt line
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, clr_eol_len
+    syscall
+    ; Show current selection in the command line
+    ; Replace word at r14..r12 with selected match
+    ; First rebuild line with selected match
+    call .tab_preview_selection
+    ; Redraw prompt + previewed line
+    call print_prompt
+    mov rcx, [line_len]
+    test rcx, rcx
+    jz .tab_cycle_key
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [line_buf]
+    mov rdx, rcx
+    syscall
+    call reposition_cursor
+
+.tab_cycle_key:
+    ; Read next key
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    test rax, rax
+    jle .tab_cycle_cancel
+
+    movzx eax, byte [tmp_buf]
+
+    ; Tab = next match
+    cmp al, 9
+    je .tab_cycle_next
+
+    ; Enter or Space = accept current selection
+    cmp al, 10
+    je .tab_cycle_accept
+    cmp al, 13
+    je .tab_cycle_accept
+    cmp al, ' '
+    je .tab_cycle_accept_space
+
+    ; Escape = might be Shift-TAB (ESC[Z) or cancel
+    cmp al, 27
+    je .tab_cycle_esc
+
+    ; Any other key = cancel and process that key
+    jmp .tab_cycle_cancel_reprocess
+
+.tab_cycle_next:
+    inc r15
+    cmp r15, [tab_count]
+    jl .tab_cycle_erase
+    xor r15, r15             ; wrap around
+    jmp .tab_cycle_erase
+
+.tab_cycle_prev:
+    dec r15
+    test r15, r15
+    jns .tab_cycle_erase
+    mov r15, [tab_count]
+    dec r15                  ; wrap to last
+
+.tab_cycle_erase:
+    ; Move to matches line (down) and clear it
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [newline]
     mov rdx, 1
     syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_cr]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, clr_eol_len
+    syscall
+    ; Move back up
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_up_cr]
+    mov rdx, 4
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, clr_eol_len
+    syscall
+    jmp .tab_cycle_redraw
 
-    ; Find longest common prefix among all matches and complete to that
-    call tab_find_common_prefix
-    ; rax = common prefix length
-    lea rdi, [tab_word_buf]
-    push rax
-    call strlen
-    mov rdx, rax            ; current word length
-    pop rax
-    sub rax, rdx            ; additional chars to insert
+.tab_cycle_esc:
+    ; Read next byte to check for Shift-TAB (ESC[Z)
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
     test rax, rax
-    jle .tab_redraw_only
-    ; Insert the common prefix extension
-    mov rcx, rax
-    mov rsi, [tab_results]
-    add rsi, rdx            ; skip past existing word
-.tab_common_insert:
-    test rcx, rcx
-    jz .tab_redraw_only
-    movzx eax, byte [rsi]
-    mov [line_buf + r12], al
+    jle .tab_cycle_cancel
+    cmp byte [tmp_buf], '['
+    jne .tab_cycle_cancel
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    test rax, rax
+    jle .tab_cycle_cancel
+    cmp byte [tmp_buf], 'Z'  ; Shift-TAB
+    je .tab_cycle_prev
+    jmp .tab_cycle_cancel
+
+.tab_cycle_accept:
+    ; Accept: apply the selected match permanently
+    call .tab_apply_selection
+    jmp .tab_cycle_cleanup
+
+.tab_cycle_accept_space:
+    ; Accept and add trailing space
+    call .tab_apply_selection
+    mov byte [line_buf + r12], ' '
     inc r12
     inc qword [line_len]
-    inc rsi
-    dec rcx
-    jmp .tab_common_insert
+    jmp .tab_cycle_cleanup
 
-.tab_redraw_only:
-    ; Null-terminate
-    mov rcx, [line_len]
-    mov byte [line_buf + rcx], 0
-    ; Redraw prompt and line
+.tab_cycle_cancel:
+    ; Restore original line
+    call .tab_restore_original
+    jmp .tab_cycle_cleanup
+
+.tab_cycle_cancel_reprocess:
+    ; Restore original line, then re-inject the typed key
+    call .tab_restore_original
+    jmp .tab_cycle_cleanup_noread
+
+.tab_cycle_cleanup:
+.tab_cycle_cleanup_noread:
+    ; Clear the matches line below
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_cr]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, clr_eol_len
+    syscall
+    ; Move back up
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_up_cr]
+    mov rdx, 4
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [clr_eol_global]
+    mov rdx, clr_eol_len
+    syscall
+    ; Redraw prompt + final line
     call print_prompt
     mov rcx, [line_len]
     test rcx, rcx
@@ -1549,8 +1728,91 @@ read_line:
     lea rsi, [line_buf]
     mov rdx, rcx
     syscall
-    ; Reposition cursor
     call reposition_cursor
+    jmp .tab_done
+
+.tab_up_cr: db 27, "[A", 13        ; cursor up + carriage return
+.tab_cr: db 13
+
+; Preview selection: save original line, replace word with selected match
+.tab_preview_selection:
+    ; Save original word bounds for restore
+    ; (r14 = word start in line_buf, tab_word_buf = original word)
+    ; Replace from r14 to current word end with selected match
+    mov rsi, [tab_results + r15*8]
+    mov rdi, rsi
+    call strlen
+    mov rcx, rax             ; match length
+
+    ; Rebuild: line_buf[0..r14] + match + rest after original cursor
+    ; Copy line prefix (before word) to suggestion_buf as temp
+    lea rdi, [suggestion_buf]
+    lea rsi, [line_buf]
+    xor rax, rax
+.tps_copy_pre:
+    cmp rax, r14
+    jge .tps_copy_match
+    movzx edx, byte [rsi + rax]
+    mov [rdi + rax], dl
+    inc rax
+    jmp .tps_copy_pre
+.tps_copy_match:
+    ; Copy match
+    push rax                 ; save output position
+    mov rsi, [tab_results + r15*8]
+    xor rcx, rcx
+.tps_cm:
+    movzx edx, byte [rsi + rcx]
+    test dl, dl
+    jz .tps_match_done
+    mov [rdi + rax], dl
+    inc rax
+    inc rcx
+    jmp .tps_cm
+.tps_match_done:
+    mov byte [rdi + rax], 0
+    mov r12, rax             ; cursor at end of replacement
+    mov [line_len], rax
+    ; Copy back to line_buf
+    lea rsi, [suggestion_buf]
+    lea rdi, [line_buf]
+    xor rcx, rcx
+.tps_cb:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .tps_done
+    inc rcx
+    jmp .tps_cb
+.tps_done:
+    pop rax                  ; discard
+    ret
+
+; Apply selection permanently (same as preview, already in line_buf)
+.tab_apply_selection:
+    call .tab_preview_selection
+    ret
+
+; Restore original line from tab_word_buf
+.tab_restore_original:
+    ; Rebuild: line_buf[0..r14] + tab_word_buf
+    lea rdi, [line_buf]
+    ; prefix is already there (line_buf[0..r14] unchanged structurally)
+    lea rsi, [tab_word_buf]
+    mov rax, r14
+.tro_copy:
+    movzx edx, byte [rsi]
+    test dl, dl
+    jz .tro_done
+    mov [rdi + rax], dl
+    inc rax
+    inc rsi
+    jmp .tro_copy
+.tro_done:
+    mov byte [rdi + rax], 0
+    mov r12, rax
+    mov [line_len], rax
+    ret
 
 .tab_done:
     pop r15
