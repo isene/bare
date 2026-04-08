@@ -196,6 +196,32 @@ str_help:       db ":help", 0
 str_pushd:      db "pushd", 0
 str_popd:       db "popd", 0
 
+; Colon command dispatch table: pairs of (string_ptr, handler_ptr), sentinel (0,0)
+colon_dispatch_table:
+    dq str_nick, handle_nick
+    dq str_gnick, handle_gnick
+    dq str_abbrev, handle_abbrev
+    dq str_bm, handle_bm
+    dq str_dirs, handle_dirs
+    dq str_rmhistory, handle_rmhistory
+    dq str_reload, handle_reload
+    dq str_version, handle_version
+    dq str_help, handle_help
+    dq str_jobs, handle_jobs
+    dq str_fg, handle_fg
+    dq str_bg, handle_bg
+    dq str_theme, handle_theme
+    dq str_env, handle_env
+    dq str_config, handle_config
+    dq str_calc, handle_calc
+    dq str_stats, handle_stats
+    dq str_validate, handle_validate
+    dq str_info, handle_info
+    dq str_save_sess, handle_save_session
+    dq str_load_sess, handle_load_session
+    dq str_list_sess, handle_list_sessions
+    dq 0, 0
+
 ; Version string
 version_str:    db "bare 0.2.0", 10, 0
 version_str_len equ $ - version_str - 1
@@ -532,12 +558,8 @@ valid_actions:  resb 32                 ; 0=warn, 1=confirm, 2=block
 valid_count:    resq 1
 valid_storage:  resb 4096
 
-; Session/recording
+; Session buffer
 session_buf:    resb 16384
-recording_buf:  resb 16384
-recording_name: resb 64
-recording_active: resq 1
-recording_pos:  resq 1
 
 section .text
 global _start
@@ -790,11 +812,7 @@ _start:
     ; Restore terminal
     call restore_termios
     ; Print newline and exit
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     xor edi, edi
     mov rax, SYS_EXIT
     syscall
@@ -1961,11 +1979,7 @@ read_line:
     jz .rd_finish
 
     ; Continuation needed: print newline, show "> " prompt, keep reading
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     ; Print continuation prompt
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -1994,11 +2008,7 @@ read_line:
 
 .rd_finish:
     ; Print newline
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     call restore_termios
     mov rax, [line_len]
     pop r13
@@ -2173,11 +2183,7 @@ read_line:
 
 .tab_cycle_redraw:
     ; Print newline + matches with selection highlighting
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     xor rcx, rcx
 .tab_cycle_print:
     cmp rcx, [tab_count]
@@ -2302,11 +2308,7 @@ read_line:
 
 .tab_cycle_erase:
     ; Move to matches line (down) and clear it
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_cr]
@@ -2378,11 +2380,7 @@ read_line:
 .tab_cycle_cleanup:
 .tab_cycle_cleanup_noread:
     ; Clear the matches line below
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_cr]
@@ -3807,11 +3805,7 @@ parse_and_exec_simple:
     lea rsi, [line_buf]      ; command string
     call add_job
     ; Print job notification
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.stopped_msg]
@@ -4268,15 +4262,7 @@ check_builtin:
     ; Save current cwd to prev_dir
     lea rsi, [cwd_buf]
     lea rdi, [prev_dir]
-.cd_dash_save:
-    mov al, [rsi]
-    mov [rdi], al
-    test al, al
-    jz .cd_dash_go
-    inc rsi
-    inc rdi
-    jmp .cd_dash_save
-.cd_dash_go:
+    call strcpy_rsi_rdi
     lea rdi, [path_buf]     ; target dir
     jmp .cd_do_chdir
 
@@ -4285,15 +4271,7 @@ check_builtin:
     push rdi
     lea rdi, [prev_dir]
     lea rsi, [cwd_buf]
-.cd_save_prev:
-    mov al, [rsi]
-    mov [rdi], al
-    test al, al
-    jz .cd_saved
-    inc rsi
-    inc rdi
-    jmp .cd_save_prev
-.cd_saved:
+    call strcpy_rsi_rdi
     pop rdi
 .cd_do_chdir:
     mov rax, SYS_CHDIR
@@ -4335,11 +4313,7 @@ check_builtin:
     mov rdi, 1
     lea rsi, [cwd_buf]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     mov qword [last_status], 0
     mov rax, 1
     pop r12
@@ -4384,11 +4358,7 @@ check_builtin:
     push rcx
     mov rsi, [env_array + rcx*8]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
 .export_print_next:
     pop rcx
     inc rcx
@@ -4459,11 +4429,7 @@ check_builtin:
     syscall
 .hist_skip_entry:
     ; Print newline
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     pop rcx
     inc rcx
     jmp .hist_print_loop
@@ -4491,203 +4457,24 @@ check_builtin:
     ret
 
 .bi_colon:
-    ; Dispatch colon commands
-    mov rdi, [r12]
-
-    ; :nick
-    lea rsi, [str_nick]
+    ; Table-driven colon command dispatch
+    lea rbx, [colon_dispatch_table]
+.cc_loop:
+    mov rsi, [rbx]           ; string pointer
+    test rsi, rsi
+    jz .cc_not_found          ; sentinel reached
+    mov rdi, [r12]            ; command name
     call strcmp
     test rax, rax
-    jnz .cc_not_nick
+    jnz .cc_next
+    ; Match found: call handler with rdi = argv array
     mov rdi, r12
-    call handle_nick
+    call [rbx + 8]
     jmp .cc_done
-.cc_not_nick:
-    mov rdi, [r12]
-    lea rsi, [str_gnick]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_gnick
-    mov rdi, r12
-    call handle_gnick
-    jmp .cc_done
-.cc_not_gnick:
-    mov rdi, [r12]
-    lea rsi, [str_abbrev]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_abbrev
-    mov rdi, r12
-    call handle_abbrev
-    jmp .cc_done
-.cc_not_abbrev:
-    mov rdi, [r12]
-    lea rsi, [str_bm]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_bm
-    mov rdi, r12
-    call handle_bm
-    jmp .cc_done
-.cc_not_bm:
-    mov rdi, [r12]
-    lea rsi, [str_dirs]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_dirs
-    call handle_dirs
-    jmp .cc_done
-.cc_not_dirs:
-    mov rdi, [r12]
-    lea rsi, [str_rmhistory]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_rmhist
-    call handle_rmhistory
-    jmp .cc_done
-.cc_not_rmhist:
-    mov rdi, [r12]
-    lea rsi, [str_reload]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_reload
-    call handle_reload
-    jmp .cc_done
-.cc_not_reload:
-    mov rdi, [r12]
-    lea rsi, [str_version]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_version
-    call handle_version
-    jmp .cc_done
-.cc_not_version:
-    mov rdi, [r12]
-    lea rsi, [str_help]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_help
-    call handle_help
-    jmp .cc_done
-.cc_not_help:
-    mov rdi, [r12]
-    lea rsi, [str_jobs]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_jobs
-    call handle_jobs
-    jmp .cc_done
-.cc_not_jobs:
-    mov rdi, [r12]
-    lea rsi, [str_fg]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_fg
-    mov rdi, r12
-    call handle_fg
-    jmp .cc_done
-.cc_not_fg:
-    mov rdi, [r12]
-    lea rsi, [str_bg]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_bg
-    mov rdi, r12
-    call handle_bg
-    jmp .cc_done
-.cc_not_bg:
-    mov rdi, [r12]
-    lea rsi, [str_theme]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_theme
-    mov rdi, r12
-    call handle_theme
-    jmp .cc_done
-.cc_not_theme:
-    mov rdi, [r12]
-    lea rsi, [str_env]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_env
-    mov rdi, r12
-    call handle_env
-    jmp .cc_done
-.cc_not_env:
-    mov rdi, [r12]
-    lea rsi, [str_config]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_config
-    mov rdi, r12
-    call handle_config
-    jmp .cc_done
-.cc_not_config:
-    mov rdi, [r12]
-    lea rsi, [str_calc]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_calc
-    mov rdi, r12
-    call handle_calc
-    jmp .cc_done
-.cc_not_calc:
-    mov rdi, [r12]
-    lea rsi, [str_stats]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_stats
-    call handle_stats
-    jmp .cc_done
-.cc_not_stats:
-    mov rdi, [r12]
-    lea rsi, [str_validate]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_validate
-    mov rdi, r12
-    call handle_validate
-    jmp .cc_done
-.cc_not_validate:
-    mov rdi, [r12]
-    lea rsi, [str_info]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_info
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [info_text]
-    mov rdx, info_text_len
-    syscall
-    mov qword [last_status], 0
-    jmp .cc_done
-.cc_not_info:
-    mov rdi, [r12]
-    lea rsi, [str_save_sess]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_save_sess
-    mov rdi, r12
-    call handle_save_session
-    jmp .cc_done
-.cc_not_save_sess:
-    mov rdi, [r12]
-    lea rsi, [str_load_sess]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_load_sess
-    mov rdi, r12
-    call handle_load_session
-    jmp .cc_done
-.cc_not_load_sess:
-    mov rdi, [r12]
-    lea rsi, [str_list_sess]
-    call strcmp
-    test rax, rax
-    jnz .cc_not_list_sess
-    call handle_list_sessions
-    jmp .cc_done
-.cc_not_list_sess:
+.cc_next:
+    add rbx, 16              ; next table entry
+    jmp .cc_loop
+.cc_not_found:
     ; Unknown colon command
     mov rax, SYS_WRITE
     mov rdi, 2
@@ -6051,24 +5838,10 @@ build_hist_path:
     ; Copy home to hist_path
     lea rdi, [hist_path]
     mov rsi, rax
-.bhp_copy:
-    mov al, [rsi]
-    test al, al
-    jz .bhp_suffix
-    mov [rdi], al
-    inc rsi
-    inc rdi
-    jmp .bhp_copy
+    call strcpy_rsi_rdi
 .bhp_suffix:
     lea rsi, [hist_suffix]
-.bhp_suf:
-    mov al, [rsi]
-    mov [rdi], al
-    test al, al
-    jz .bhp_done
-    inc rsi
-    inc rdi
-    jmp .bhp_suf
+    call strcpy_rsi_rdi
 .bhp_done:
     ret
 
@@ -6157,15 +5930,7 @@ add_history:
     mov [hist_lines + rcx*8], rdi
     ; Copy line_buf to hist_buf at rdi
     lea rsi, [line_buf]
-.ah_copy:
-    mov al, [rsi]
-    mov [rdi], al
-    test al, al
-    jz .ah_copied
-    inc rsi
-    inc rdi
-    jmp .ah_copy
-.ah_copied:
+    call strcpy_rsi_rdi
     inc qword [hist_count]
     ret
 
@@ -6320,6 +6085,64 @@ strcmp:
     mov eax, 1
     ret
 
+; write_stdout: rsi = buffer, rdx = length. Writes to stdout.
+; Preserves: rdi, rsi, rdx, rbx, r12-r15. Clobbers: rax, rcx, r11.
+write_stdout:
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    syscall
+    ret
+
+; write_stderr: rsi = buffer, rdx = length. Writes to stderr.
+; Preserves: rdi, rsi, rdx, rbx, r12-r15. Clobbers: rax, rcx, r11.
+write_stderr:
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    syscall
+    ret
+
+; write_nl: writes newline to stdout. No arguments.
+; Preserves: rdi, rbx, r12-r15. Clobbers: rax, rcx, r11, rsi, rdx.
+write_nl:
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    ret
+
+; write_str_stdout: writes null-terminated string from rsi to stdout.
+; Preserves: rdi, rsi, rbx, r12-r15. Clobbers: rax, rcx, rdx, r11.
+write_str_stdout:
+    push rdi
+    push rsi
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    pop rsi
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    syscall
+    pop rdi
+    ret
+
+; strcpy_rsi_rdi: copies null-terminated string from rsi to rdi.
+; Returns bytes copied (excluding null) in rax. Null terminator IS copied.
+; Advances rdi and rsi past the copied content (pointing at the null).
+strcpy_rsi_rdi:
+    xor eax, eax
+.scrd_loop:
+    mov cl, [rsi]
+    mov [rdi], cl
+    test cl, cl
+    jz .scrd_done
+    inc rsi
+    inc rdi
+    inc eax
+    jmp .scrd_loop
+.scrd_done:
+    ret
+
 ; skip_spaces: rsi = string, advances past spaces
 skip_spaces:
 .ss_loop:
@@ -6399,25 +6222,11 @@ build_config_path:
     mov rsi, rax
     lea rdi, [config_path]
     ; Copy HOME
-.bcp_copy_home:
-    mov al, [rsi]
-    test al, al
-    jz .bcp_append
-    mov [rdi], al
-    inc rsi
-    inc rdi
-    jmp .bcp_copy_home
+    call strcpy_rsi_rdi
 .bcp_append:
     ; Append /.barerc
     lea rsi, [config_suffix]
-.bcp_copy_suffix:
-    mov al, [rsi]
-    mov [rdi], al
-    test al, al
-    jz .bcp_done
-    inc rsi
-    inc rdi
-    jmp .bcp_copy_suffix
+    call strcpy_rsi_rdi
 .bcp_default:
 .bcp_done:
     pop rbx
@@ -7491,24 +7300,10 @@ detect_git_branch:
     ; Build path: cwd + /.git/HEAD
     lea rdi, [git_head_buf]
     mov rsi, r12
-.dgb_copy_dir:
-    mov al, [rsi]
-    test al, al
-    jz .dgb_append_git
-    mov [rdi], al
-    inc rsi
-    inc rdi
-    jmp .dgb_copy_dir
+    call strcpy_rsi_rdi
 .dgb_append_git:
     lea rsi, [git_head_file]
-.dgb_copy_ghf:
-    mov al, [rsi]
-    mov [rdi], al
-    test al, al
-    jz .dgb_try_open
-    inc rsi
-    inc rdi
-    jmp .dgb_copy_ghf
+    call strcpy_rsi_rdi
 
 .dgb_try_open:
     mov rax, SYS_OPEN
@@ -7655,15 +7450,7 @@ expand_nicks:
     lea rdi, [nick_expand_buf]
     mov rsi, [nick_values + rcx*8]
     ; Copy nick expansion
-.en_copy_exp:
-    mov al, [rsi]
-    test al, al
-    jz .en_exp_done
-    mov [rdi], al
-    inc rsi
-    inc rdi
-    jmp .en_copy_exp
-.en_exp_done:
+    call strcpy_rsi_rdi
     ; Append remaining args from argv[1..]
     mov rcx, 1
 .en_append_args:
@@ -7689,16 +7476,8 @@ expand_nicks:
     ; Copy expanded line back to line_buf
     lea rsi, [nick_expand_buf]
     lea rdi, [line_buf]
-    xor rcx, rcx
-.en_copy_back:
-    mov al, [rsi + rcx]
-    mov [rdi + rcx], al
-    test al, al
-    jz .en_copy_done
-    inc rcx
-    jmp .en_copy_back
-.en_copy_done:
-    mov [line_len], rcx
+    call strcpy_rsi_rdi
+    mov [line_len], rax
     mov rax, 1
     pop r13
     pop r12
@@ -7845,11 +7624,7 @@ handle_nick:
     mov rsi, [nick_values + rcx*8]
     syscall
     ; Newline
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     pop rcx
     inc rcx
     jmp .hn_list_loop
@@ -7982,11 +7757,7 @@ handle_gnick:
     push rcx
     mov rsi, [gnick_values + rcx*8]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     pop rcx
     inc rcx
     jmp .hg_list_loop
@@ -8114,11 +7885,7 @@ handle_abbrev:
     push rcx
     mov rsi, [abbrev_values + rcx*8]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     pop rcx
     inc rcx
     jmp .hab_list_loop
@@ -8137,6 +7904,15 @@ handle_abbrev:
 .hab_usage: db "usage: :abbrev [name = value | -name]", 10
 .hab_usage_len equ $ - .hab_usage
 
+handle_info:
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [info_text]
+    mov rdx, info_text_len
+    syscall
+    mov qword [last_status], 0
+    ret
+
 handle_version:
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -8148,14 +7924,12 @@ handle_version:
 
 ; :help
 handle_help:
-    push rbx
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.help_text]
     mov rdx, .help_text_len
     syscall
     mov qword [last_status], 0
-    pop rbx
     ret
 .help_text:
     db "bare shell commands:", 10
@@ -8344,11 +8118,7 @@ handle_bm:
     pop rcx
     push rcx
 .hbm_no_tags:
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     pop rcx
     inc rcx
     jmp .hbm_list_loop
@@ -8398,7 +8168,6 @@ strstr_simple:
 
 ; :dirs handler
 handle_dirs:
-    push rbx
     xor rcx, rcx
 .hd_loop:
     cmp rcx, [dir_hist_count]
@@ -8431,17 +8200,12 @@ handle_dirs:
     push rcx
     mov rsi, [dir_history + rcx*8]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     pop rcx
     inc rcx
     jmp .hd_loop
 .hd_done:
     mov qword [last_status], 0
-    pop rbx
     ret
 
 ; :rmhistory handler
@@ -8460,7 +8224,6 @@ handle_rmhistory:
 
 ; pushd handler
 handle_pushd:
-    push rbx
     push r12
     mov r12, rdi            ; argv array
 
@@ -8521,11 +8284,7 @@ handle_pushd:
     mov rdi, 1
     lea rsi, [cwd_buf]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     mov qword [last_status], 0
     jmp .hpd_done
 .hpd_err:
@@ -8546,12 +8305,10 @@ handle_pushd:
     call update_cwd
 .hpd_done:
     pop r12
-    pop rbx
     ret
 
 ; popd handler
 handle_popd:
-    push rbx
     mov rax, [dir_stack_count]
     test rax, rax
     jz .hpopd_empty
@@ -8571,13 +8328,8 @@ handle_popd:
     mov rdi, 1
     lea rsi, [cwd_buf]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     mov qword [last_status], 0
-    pop rbx
     ret
 .hpopd_empty:
     mov rax, SYS_WRITE
@@ -8586,7 +8338,6 @@ handle_popd:
     mov rdx, .popd_empty_len
     syscall
     mov qword [last_status], 1
-    pop rbx
     ret
 .popd_empty_msg: db "bare: popd: directory stack empty", 10
 .popd_empty_len equ $ - .popd_empty_msg
@@ -8597,7 +8348,6 @@ handle_popd:
     mov rdx, err_cd_len
     syscall
     mov qword [last_status], 1
-    pop rbx
     ret
 
 ; Add to directory history (called on cd)
@@ -9919,11 +9669,7 @@ handle_jobs:
     push r12
     mov rsi, [job_cmds + r12*8]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     pop r12
 .hj_next:
     inc r12
@@ -10184,11 +9930,7 @@ handle_theme:
     inc rcx
     jmp .ht_list_loop
 .ht_list_done:
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     mov qword [last_status], 0
 
 .ht_done:
@@ -10240,11 +9982,7 @@ handle_env:
     mov rax, SYS_WRITE
     mov rdi, 1
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     jmp .henv_done
 
 .henv_set:
@@ -10321,11 +10059,7 @@ handle_env:
     push rcx
     mov rsi, [env_array + rcx*8]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
 .henv_list_next:
     pop rcx
     inc rcx
@@ -10446,11 +10180,7 @@ handle_config:
     mov rdi, 1
     lea rsi, [num_buf]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     ; completion_limit
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -10465,11 +10195,7 @@ handle_config:
     mov rdi, 1
     lea rsi, [num_buf]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     ; Print all colors with preview
     push rbx
     lea rbx, [.hcfg_color_names]
@@ -10537,11 +10263,7 @@ handle_config:
     lea rsi, [.hcfg_reset]
     mov rdx, 4
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     pop rcx
     inc rcx
     jmp .hcfg_color_loop
@@ -10876,7 +10598,6 @@ save_undo_state:
 ; unclosed single/double quotes
 ; ══════════════════════════════════════════════════════════════════════
 check_continuation:
-    push rbx
     mov rcx, [line_len]
     test rcx, rcx
     jz .cc_no
@@ -10935,11 +10656,9 @@ check_continuation:
 
 .cc_no:
     xor eax, eax
-    pop rbx
     ret
 .cc_yes:
     mov eax, 1
-    pop rbx
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
@@ -11412,11 +11131,7 @@ handle_calc:
     mov rdi, 1
     lea rsi, [num_buf]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
 .hcalc_done:
     mov qword [last_status], 0
     pop r12
@@ -11576,15 +11291,7 @@ handle_stats:
 .hs_store:
     mov [cmd_freq_names + r13*8], rdi
     lea rsi, [search_buf]
-.hs_cp:
-    mov al, [rsi]
-    mov [rdi], al
-    test al, al
-    jz .hs_stored
-    inc rsi
-    inc rdi
-    jmp .hs_cp
-.hs_stored:
+    call strcpy_rsi_rdi
     mov qword [cmd_freq_counts + r13*8], 1
     inc qword [cmd_freq_count]
 .hs_next:
@@ -11643,11 +11350,7 @@ handle_stats:
     push rbx
     mov rsi, [cmd_freq_names + rbx*8]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     pop rbx
     mov qword [cmd_freq_counts + rbx*8], 0
     inc r12
@@ -11831,11 +11534,7 @@ handle_validate:
     pop rcx
     push rcx
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
     pop rcx
     inc rcx
     jmp .hv_ll
@@ -12645,11 +12344,7 @@ handle_list_sessions:
     mov rdi, 1
     syscall
     pop rdi
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
+    call write_nl
 .hlss_skip:
     pop rdx
     pop rcx
