@@ -3885,6 +3885,15 @@ check_builtin:
     jmp .cc_done
 .cc_not_gnick:
     mov rdi, [r12]
+    lea rsi, [str_abbrev]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_abbrev
+    mov rdi, r12
+    call handle_abbrev
+    jmp .cc_done
+.cc_not_abbrev:
+    mov rdi, [r12]
     lea rsi, [str_bm]
     call strcmp
     test rax, rax
@@ -7231,6 +7240,145 @@ handle_gnick:
     ret
 
 ; :version
+; :abbrev handler (same structure as :nick but uses abbrev arrays)
+handle_abbrev:
+    push rbx
+    push r12
+    mov r12, rdi
+
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jz .hab_list
+
+    cmp byte [rdi], '-'
+    je .hab_delete
+
+    ; name = value
+    mov rdi, [r12 + 8]
+    mov rsi, [r12 + 16]
+    test rsi, rsi
+    jz .hab_error
+    cmp byte [rsi], '='
+    jne .hab_error
+    mov rsi, [r12 + 24]
+    test rsi, rsi
+    jz .hab_error
+    push rdi
+    lea rbx, [nick_expand_buf]
+    mov rcx, 3
+.hab_build_val:
+    mov rsi, [r12 + rcx*8]
+    test rsi, rsi
+    jz .hab_val_built
+    cmp rcx, 3
+    je .hab_no_space
+    mov byte [rbx], ' '
+    inc rbx
+.hab_no_space:
+.hab_copy_varg:
+    mov al, [rsi]
+    test al, al
+    jz .hab_varg_done
+    mov [rbx], al
+    inc rsi
+    inc rbx
+    jmp .hab_copy_varg
+.hab_varg_done:
+    inc rcx
+    jmp .hab_build_val
+.hab_val_built:
+    mov byte [rbx], 0
+    pop rdi
+    lea rsi, [nick_expand_buf]
+    call config_add_abbrev
+    jmp .hab_done
+
+.hab_delete:
+    lea rdi, [rdi + 1]
+    xor rcx, rcx
+.hab_del_search:
+    cmp rcx, [abbrev_count]
+    jge .hab_done
+    push rcx
+    mov rsi, [abbrev_names + rcx*8]
+    call strcmp
+    pop rcx
+    test rax, rax
+    jz .hab_del_found
+    mov rdi, [r12 + 8]
+    inc rdi
+    inc rcx
+    jmp .hab_del_search
+.hab_del_found:
+    mov rdx, [abbrev_count]
+    dec rdx
+    mov [abbrev_count], rdx
+.hab_del_shift:
+    cmp rcx, rdx
+    jge .hab_done
+    mov rax, [abbrev_names + rcx*8 + 8]
+    mov [abbrev_names + rcx*8], rax
+    mov rax, [abbrev_values + rcx*8 + 8]
+    mov [abbrev_values + rcx*8], rax
+    inc rcx
+    jmp .hab_del_shift
+
+.hab_list:
+    xor rcx, rcx
+.hab_list_loop:
+    cmp rcx, [abbrev_count]
+    jge .hab_done
+    push rcx
+    mov rsi, [abbrev_names + rcx*8]
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    pop rcx
+    push rcx
+    mov rsi, [abbrev_names + rcx*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [nick_arrow]
+    mov rdx, 3
+    syscall
+    pop rcx
+    push rcx
+    mov rsi, [abbrev_values + rcx*8]
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    pop rcx
+    push rcx
+    mov rsi, [abbrev_values + rcx*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    pop rcx
+    inc rcx
+    jmp .hab_list_loop
+
+.hab_error:
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [.hab_usage]
+    mov rdx, .hab_usage_len
+    syscall
+.hab_done:
+    mov qword [last_status], 0
+    pop r12
+    pop rbx
+    ret
+.hab_usage: db "usage: :abbrev [name = value | -name]", 10
+.hab_usage_len equ $ - .hab_usage
+
 handle_version:
     mov rax, SYS_WRITE
     mov rdi, 1
