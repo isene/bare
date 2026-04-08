@@ -235,6 +235,27 @@ clear_screen_len equ $ - clear_screen_seq
 clr_eol_global: db 27, "[K"
 clr_eol_len equ $ - clr_eol_global
 
+; Color themes: each is NUM_COLORS bytes in order of C_* constants
+; Indices: user, host, cwd, prompt, cmd, nick, gnick, path, switch, bookmark, colon, git, stamp, tabsel, tabopt, suggest
+theme_names:
+    dq .tn_default, .tn_solarized, .tn_dracula, .tn_gruvbox, .tn_nord, .tn_monokai
+    dq 0
+.tn_default:   db "default", 0
+.tn_solarized: db "solarized", 0
+.tn_dracula:   db "dracula", 0
+.tn_gruvbox:   db "gruvbox", 0
+.tn_nord:      db "nord", 0
+.tn_monokai:   db "monokai", 0
+
+theme_data:
+; default:    user host cwd  prompt cmd nick gnick path switch bm  colon git stamp tabsel tabopt suggest
+.td_default:   db 2,  2,  81, 208, 48,  6,  33,   3,   6,    5,  4,   208, 245,  7,   245,  240
+.td_solarized: db 64, 64, 37, 136, 33,  37, 33,   136, 37,   125,33,  166, 245,  7,   245,  240
+.td_dracula:   db 84, 84, 141,212, 84,  117,189,  228, 117,  212,189, 215, 245,  7,   245,  240
+.td_gruvbox:   db 142,142,214,208, 142, 108,109,  223, 108,  175,109, 208, 245,  7,   245,  240
+.td_nord:      db 110,110,111,173, 110, 110,111,  222, 110,  139,111, 173, 245,  7,   245,  240
+.td_monokai:   db 148,148,81, 208, 148, 81, 141,  228, 81,   197,141, 208, 245,  7,   245,  240
+
 ; Default PATH for searching executables
 default_path:   db "/usr/local/bin:/usr/bin:/bin", 0
 
@@ -607,7 +628,8 @@ _start:
     jmp .main_loop
 
 .eof:
-    ; Save history
+    ; Save config and history
+    call save_config
     call save_history
     ; Restore terminal
     call restore_termios
@@ -3834,6 +3856,7 @@ check_builtin:
     ret
 
 .bi_exit:
+    call save_config
     call save_history
     call restore_termios
     mov rdi, [last_status]
@@ -4110,6 +4133,33 @@ check_builtin:
     call handle_bg
     jmp .cc_done
 .cc_not_bg:
+    mov rdi, [r12]
+    lea rsi, [str_theme]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_theme
+    mov rdi, r12
+    call handle_theme
+    jmp .cc_done
+.cc_not_theme:
+    mov rdi, [r12]
+    lea rsi, [str_env]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_env
+    mov rdi, r12
+    call handle_env
+    jmp .cc_done
+.cc_not_env:
+    mov rdi, [r12]
+    lea rsi, [str_config]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_config
+    mov rdi, r12
+    call handle_config
+    jmp .cc_done
+.cc_not_config:
     ; Unknown colon command
     mov rax, SYS_WRITE
     mov rdi, 2
@@ -6052,6 +6102,8 @@ load_config:
     inc r15
     jmp .lc_find_val_end
 .lc_val_end:
+    ; Save original end-of-line char and its position for later advance
+    movzx ebx, byte [r15]    ; save \n or \0
     ; Trim trailing spaces from value
     mov rsi, r15
     dec rsi
@@ -6230,15 +6282,12 @@ load_config:
     call config_set_bool
 
 .lc_advance:
-    pop rax                  ; discard newline flag
-    ; Advance past the line
-    ; r15 points to newline or null in original buffer
-    ; But we may have null-terminated things, so scan from r15 in config_buf
-    mov r12, r15
-    cmp byte [r12], 0
-    je .lc_done
-    inc r12                  ; skip newline
-    jmp .lc_next_line
+    pop rax                  ; discard old newline flag
+    ; r15 = original end position, bl = saved original char (\n or \0)
+    lea r12, [r15 + 1]       ; skip past original end char
+    cmp bl, 10               ; was it a newline?
+    je .lc_next_line
+    jmp .lc_done             ; was \0, end of file
 
 .str_auto_pair: db "auto_pair", 0
 
@@ -9561,3 +9610,554 @@ reap_jobs:
     pop r12
     pop rbx
     ret
+
+; ══════════════════════════════════════════════════════════════════════
+; :theme [name] - list or apply color theme
+; ══════════════════════════════════════════════════════════════════════
+handle_theme:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi             ; argv array
+
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jz .ht_list
+
+    ; Find theme by name
+    lea r13, [theme_names]
+    xor rcx, rcx
+.ht_search:
+    mov rsi, [r13 + rcx*8]
+    test rsi, rsi
+    jz .ht_not_found
+    push rcx
+    push rdi
+    call strcmp
+    pop rdi
+    pop rcx
+    test rax, rax
+    jz .ht_found
+    inc rcx
+    jmp .ht_search
+
+.ht_found:
+    ; Copy theme_data[rcx*16] to color_settings
+    imul rax, rcx, NUM_COLORS
+    lea rsi, [theme_data + rax]
+    lea rdi, [color_settings]
+    mov rcx, NUM_COLORS
+    rep movsb
+    mov qword [last_status], 0
+    jmp .ht_done
+
+.ht_not_found:
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [.ht_err]
+    mov rdx, .ht_err_len
+    syscall
+    mov qword [last_status], 1
+    jmp .ht_done
+
+.ht_list:
+    ; Print available themes
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.ht_avail]
+    mov rdx, .ht_avail_len
+    syscall
+    lea r13, [theme_names]
+    xor rcx, rcx
+.ht_list_loop:
+    mov rsi, [r13 + rcx*8]
+    test rsi, rsi
+    jz .ht_list_done
+    push rcx
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    pop rcx
+    push rcx
+    mov rsi, [r13 + rcx*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.ht_sep]
+    mov rdx, 2
+    syscall
+    pop rcx
+    inc rcx
+    jmp .ht_list_loop
+.ht_list_done:
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    mov qword [last_status], 0
+
+.ht_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.ht_err: db "bare: unknown theme", 10
+.ht_err_len equ $ - .ht_err
+.ht_avail: db "Themes: "
+.ht_avail_len equ $ - .ht_avail
+.ht_sep: db "  "
+
+; ══════════════════════════════════════════════════════════════════════
+; :env [VAR | set VAR val | unset VAR] - environment management
+; ══════════════════════════════════════════════════════════════════════
+handle_env:
+    push rbx
+    push r12
+    mov r12, rdi             ; argv array
+
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jz .henv_list
+
+    ; Check for "set"
+    lea rsi, [.henv_set_str]
+    call strcmp
+    test rax, rax
+    jz .henv_set
+
+    ; Check for "unset"
+    mov rdi, [r12 + 8]
+    lea rsi, [.henv_unset_str]
+    call strcmp
+    test rax, rax
+    jz .henv_unset
+
+    ; Single arg: show specific variable
+    mov rdi, [r12 + 8]
+    call lookup_env_var
+    test rax, rax
+    jz .henv_not_found
+    mov rsi, rax
+    mov rdi, rax
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    jmp .henv_done
+
+.henv_set:
+    ; :env set VAR value
+    mov rdi, [r12 + 16]     ; VAR
+    test rdi, rdi
+    jz .henv_done
+    mov rsi, [r12 + 24]     ; value
+    test rsi, rsi
+    jz .henv_done
+    ; Build "VAR=value" string in nick_expand_buf
+    lea rbx, [nick_expand_buf]
+    ; Copy VAR
+.henv_set_var:
+    mov al, [rdi]
+    test al, al
+    jz .henv_set_eq
+    mov [rbx], al
+    inc rdi
+    inc rbx
+    jmp .henv_set_var
+.henv_set_eq:
+    mov byte [rbx], '='
+    inc rbx
+    ; Copy value
+.henv_set_val:
+    mov al, [rsi]
+    test al, al
+    jz .henv_set_apply
+    mov [rbx], al
+    inc rsi
+    inc rbx
+    jmp .henv_set_val
+.henv_set_apply:
+    mov byte [rbx], 0
+    lea rdi, [nick_expand_buf]
+    call env_set_entry
+    jmp .henv_done
+
+.henv_unset:
+    mov rdi, [r12 + 16]
+    test rdi, rdi
+    jz .henv_done
+    call env_remove_entry
+    jmp .henv_done
+
+.henv_not_found:
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [.henv_nf_msg]
+    mov rdx, .henv_nf_len
+    syscall
+    mov qword [last_status], 1
+    jmp .henv_ret
+
+.henv_list:
+    ; Print first 30 env vars
+    xor rcx, rcx
+.henv_list_loop:
+    cmp rcx, [env_count]
+    jge .henv_done
+    cmp rcx, 30
+    jge .henv_done
+    push rcx
+    mov rsi, [env_array + rcx*8]
+    test rsi, rsi
+    jz .henv_list_next
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    pop rcx
+    push rcx
+    mov rsi, [env_array + rcx*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+.henv_list_next:
+    pop rcx
+    inc rcx
+    jmp .henv_list_loop
+
+.henv_done:
+    mov qword [last_status], 0
+.henv_ret:
+    pop r12
+    pop rbx
+    ret
+
+.henv_set_str: db "set", 0
+.henv_unset_str: db "unset", 0
+.henv_nf_msg: db "bare: variable not found", 10
+.henv_nf_len equ $ - .henv_nf_msg
+
+; ══════════════════════════════════════════════════════════════════════
+; :config [key [value]] - view/change settings
+; ══════════════════════════════════════════════════════════════════════
+handle_config:
+    push rbx
+    push r12
+    mov r12, rdi
+
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jz .hcfg_list
+
+    ; key provided, check for value
+    mov rsi, [r12 + 16]
+    test rsi, rsi
+    jz .hcfg_show_key
+
+    ; Set key = value (delegate to config parser logic)
+    ; For now, handle known keys
+    mov rdi, [r12 + 8]
+    lea rsi, [.hcfg_slow]
+    call strcmp
+    test rax, rax
+    jnz .hcfg_check_dedup
+    mov rdi, [r12 + 16]
+    call parse_int
+    mov [slow_cmd_threshold], rax
+    jmp .hcfg_done
+
+.hcfg_check_dedup:
+    mov rdi, [r12 + 8]
+    lea rsi, [.hcfg_dedup]
+    call strcmp
+    test rax, rax
+    jnz .hcfg_check_limit
+    mov rdi, [r12 + 16]
+    cmp byte [rdi], 'f'
+    jne .hcfg_ded_smart
+    and qword [config_flags], ~(1 << CFG_HIST_DEDUP_SMART)
+    or qword [config_flags], (1 << CFG_HIST_DEDUP_FULL)
+    jmp .hcfg_done
+.hcfg_ded_smart:
+    cmp byte [rdi], 's'
+    jne .hcfg_ded_off
+    and qword [config_flags], ~(1 << CFG_HIST_DEDUP_FULL)
+    or qword [config_flags], (1 << CFG_HIST_DEDUP_SMART)
+    jmp .hcfg_done
+.hcfg_ded_off:
+    and qword [config_flags], ~((1 << CFG_HIST_DEDUP_FULL) | (1 << CFG_HIST_DEDUP_SMART))
+    jmp .hcfg_done
+
+.hcfg_check_limit:
+    mov rdi, [r12 + 8]
+    lea rsi, [.hcfg_climit]
+    call strcmp
+    test rax, rax
+    jnz .hcfg_done
+    mov rdi, [r12 + 16]
+    call parse_int
+    mov [completion_limit], rax
+
+.hcfg_done:
+    mov qword [last_status], 0
+    pop r12
+    pop rbx
+    ret
+
+.hcfg_show_key:
+    ; Show value of a specific key
+    jmp .hcfg_done
+
+.hcfg_list:
+    ; Print current config
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hcfg_header]
+    mov rdx, .hcfg_header_len
+    syscall
+    ; slow_command_threshold
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hcfg_slow_label]
+    mov rdx, .hcfg_slow_label_len
+    syscall
+    mov rax, [slow_cmd_threshold]
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    ; completion_limit
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hcfg_climit_label]
+    mov rdx, .hcfg_climit_label_len
+    syscall
+    mov rax, [completion_limit]
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    jmp .hcfg_done
+
+.hcfg_header: db "Configuration:", 10
+.hcfg_header_len equ $ - .hcfg_header
+.hcfg_slow: db "slow_command_threshold", 0
+.hcfg_slow_label: db "  slow_command_threshold = "
+.hcfg_slow_label_len equ $ - .hcfg_slow_label
+.hcfg_dedup: db "history_dedup", 0
+.hcfg_climit: db "completion_limit", 0
+.hcfg_climit_label: db "  completion_limit = "
+.hcfg_climit_label_len equ $ - .hcfg_climit_label
+
+; ══════════════════════════════════════════════════════════════════════
+; Save config to ~/.barerc
+; ══════════════════════════════════════════════════════════════════════
+save_config:
+    push rbx
+    push r12
+    push r13
+
+    ; Open config file for writing
+    mov rax, SYS_OPEN
+    lea rdi, [config_path]
+    mov rsi, O_WRONLY | O_CREAT | O_TRUNC
+    mov rdx, 0o644
+    syscall
+    test rax, rax
+    js .sc_done
+    mov r12, rax             ; fd
+
+    ; Write nicks
+    xor r13, r13
+.sc_nick_loop:
+    cmp r13, [nick_count]
+    jge .sc_gnicks
+    ; Write "nick.<name> = <value>\n"
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [.sc_nick_pre]
+    mov rdx, 5
+    syscall
+    mov rdi, [nick_names + r13*8]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    mov rsi, [nick_names + r13*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [nick_arrow]
+    mov rdx, 3
+    syscall
+    mov rdi, [nick_values + r13*8]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    mov rsi, [nick_values + r13*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    inc r13
+    jmp .sc_nick_loop
+
+.sc_gnicks:
+    xor r13, r13
+.sc_gnick_loop:
+    cmp r13, [gnick_count]
+    jge .sc_abbrevs
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [.sc_gnick_pre]
+    mov rdx, 6
+    syscall
+    mov rdi, [gnick_names + r13*8]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    mov rsi, [gnick_names + r13*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [nick_arrow]
+    mov rdx, 3
+    syscall
+    mov rdi, [gnick_values + r13*8]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    mov rsi, [gnick_values + r13*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    inc r13
+    jmp .sc_gnick_loop
+
+.sc_abbrevs:
+    xor r13, r13
+.sc_abbrev_loop:
+    cmp r13, [abbrev_count]
+    jge .sc_bookmarks
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [.sc_abbrev_pre]
+    mov rdx, 7
+    syscall
+    mov rdi, [abbrev_names + r13*8]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    mov rsi, [abbrev_names + r13*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [nick_arrow]
+    mov rdx, 3
+    syscall
+    mov rdi, [abbrev_values + r13*8]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    mov rsi, [abbrev_values + r13*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    inc r13
+    jmp .sc_abbrev_loop
+
+.sc_bookmarks:
+    xor r13, r13
+.sc_bm_loop:
+    cmp r13, [bm_count]
+    jge .sc_close
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [.sc_bm_pre]
+    mov rdx, 3
+    syscall
+    mov rdi, [bm_names + r13*8]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    mov rsi, [bm_names + r13*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [nick_arrow]
+    mov rdx, 3
+    syscall
+    mov rdi, [bm_paths + r13*8]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    mov rsi, [bm_paths + r13*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    inc r13
+    jmp .sc_bm_loop
+
+.sc_close:
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+
+.sc_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.sc_nick_pre: db "nick."
+.sc_gnick_pre: db "gnick."
+.sc_abbrev_pre: db "abbrev."
+.sc_bm_pre: db "bm."
