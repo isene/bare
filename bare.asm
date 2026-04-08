@@ -3361,10 +3361,10 @@ parse_and_exec_simple:
     jmp .paes_send_int
 
 .paes_send_tstp:
-    ; Send SIGTSTP to child
-    mov rax, SYS_KILL
+    ; Send SIGSTOP to child (cannot be caught/ignored, unlike SIGTSTP)
     mov rdi, r13
-    mov rsi, SIGTSTP
+    mov rsi, 19              ; SIGSTOP = 19
+    mov rax, SYS_KILL
     syscall
     jmp .paes_wait
 
