@@ -463,6 +463,9 @@ config_path:    resb 256
 login_flag:     resq 1              ; 1 if -l/--login
 cmd_flag:       resq 1              ; pointer to -c command string
 
+; Previous directory for cd -
+prev_dir:       resb 4096
+
 ; Prompt visible width (characters, excluding ANSI escapes)
 prompt_visible_width: resq 1
 
@@ -4120,14 +4123,66 @@ check_builtin:
 .bi_cd:
     mov rdi, [r12 + 8]       ; arg1
     test rdi, rdi
-    jnz .cd_dir
+    jnz .cd_check_dash
     ; No arg: go to HOME
     mov rdi, [envp]
     call find_env_home
     test rax, rax
     jz .cd_done
     mov rdi, rax
+    jmp .cd_dir
+.cd_check_dash:
+    ; Check for "cd -" (go to previous directory)
+    cmp byte [rdi], '-'
+    jne .cd_dir
+    cmp byte [rdi + 1], 0
+    jne .cd_dir
+    ; cd -: swap cwd and prev_dir
+    cmp byte [prev_dir], 0
+    je .cd_done              ; no previous dir
+    ; Copy prev_dir to tmp_buf (target)
+    lea rsi, [prev_dir]
+    lea rdi, [path_buf]
+    xor rcx, rcx
+.cd_dash_cp:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .cd_dash_ready
+    inc rcx
+    jmp .cd_dash_cp
+.cd_dash_ready:
+    ; Save current cwd to prev_dir
+    lea rsi, [cwd_buf]
+    lea rdi, [prev_dir]
+.cd_dash_save:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .cd_dash_go
+    inc rsi
+    inc rdi
+    jmp .cd_dash_save
+.cd_dash_go:
+    lea rdi, [path_buf]     ; target dir
+    jmp .cd_do_chdir
+
 .cd_dir:
+    ; Save current dir before changing
+    push rdi
+    lea rdi, [prev_dir]
+    lea rsi, [cwd_buf]
+.cd_save_prev:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .cd_saved
+    inc rsi
+    inc rdi
+    jmp .cd_save_prev
+.cd_saved:
+    pop rdi
+.cd_do_chdir:
     mov rax, SYS_CHDIR
     syscall
     test rax, rax
