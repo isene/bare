@@ -64,10 +64,15 @@ DEFAULT REL
 ; signal constants
 %define SIGINT  2
 %define SIGQUIT 3
+%define SIGCONT 18
 %define SIGTSTP 20
 %define SIGCHLD 17
 %define SIG_IGN 1
 %define SIG_DFL 0
+
+; wait flags
+%define WUNTRACED 2
+%define WNOHANG   1
 
 ; dirent64 structure offsets
 %define DIRENT64_D_INO     0
@@ -1451,21 +1456,19 @@ read_line:
     ret
 
 .cancel_line:
-    ; Print ^C and start fresh
+    ; Print ^C and newline, clear line, redraw prompt
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.ctrlc_str]
     mov rdx, 3
     syscall
-    call restore_termios
     xor r12, r12
     mov qword [line_len], 0
     mov byte [line_buf], 0
-    mov rax, 0              ; return 0 length (empty line)
-    pop r13
-    pop r12
-    pop rbx
-    ret
+    mov qword [suggestion_len], 0
+    ; Print fresh prompt and continue reading
+    call print_prompt
+    jmp .read_char
 .ctrlc_str: db '^', 'C', 10
 
 .read_done:
@@ -2841,8 +2844,23 @@ restore_child_signals:
     mov rcx, 160
     rep stosb
     mov qword [rsp], SIG_DFL
+    ; Restore SIGINT to default
     mov rax, SYS_RT_SIGACTION
     mov edi, SIGINT
+    mov rsi, rsp
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ; Restore SIGTSTP to default
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGTSTP
+    mov rsi, rsp
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ; Restore SIGQUIT to default
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGQUIT
     mov rsi, rsp
     xor edx, edx
     mov r10, 8
@@ -3254,23 +3272,52 @@ parse_and_exec_simple:
     jz .child_exec
     js .fork_error
 
-    ; Parent: wait for child
+    ; Parent: wait for child (with WUNTRACED to detect Ctrl-Z)
     mov [child_pid], rax
+    mov r13, rax             ; save child pid
     sub rsp, 16
-    mov rdi, rax
+.paes_wait:
+    mov rdi, r13
     lea rsi, [rsp]
-    xor edx, edx
+    mov edx, 2               ; WUNTRACED
     xor r10d, r10d
     mov rax, SYS_WAIT4
     syscall
-    ; Extract exit status
+    ; Check if child was stopped (WIFSTOPPED: status & 0xFF == 0x7F)
     mov eax, [rsp]
+    mov ecx, eax
+    and ecx, 0xFF
+    cmp ecx, 0x7F
+    je .paes_stopped
+    ; Normal exit: extract status
     shr eax, 8
     and eax, 0xFF
     mov [last_status], rax
     add rsp, 16
-
     jmp .paes_done
+
+.paes_stopped:
+    ; Child was stopped by Ctrl-Z, add to job table
+    add rsp, 16
+    mov rdi, r13             ; pid
+    lea rsi, [line_buf]      ; command string
+    call add_job
+    ; Print job notification
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.stopped_msg]
+    mov rdx, .stopped_msg_len
+    syscall
+    mov qword [last_status], 148  ; 128 + SIGTSTP(20)
+    jmp .paes_done
+
+.stopped_msg: db "[stopped]", 10
+.stopped_msg_len equ $ - .stopped_msg
 
 .child_exec:
     ; Restore default signals in child
@@ -3942,6 +3989,32 @@ check_builtin:
     call handle_help
     jmp .cc_done
 .cc_not_help:
+    mov rdi, [r12]
+    lea rsi, [str_jobs]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_jobs
+    call handle_jobs
+    jmp .cc_done
+.cc_not_jobs:
+    mov rdi, [r12]
+    lea rsi, [str_fg]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_fg
+    mov rdi, r12
+    call handle_fg
+    jmp .cc_done
+.cc_not_fg:
+    mov rdi, [r12]
+    lea rsi, [str_bg]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_bg
+    mov rdi, r12
+    call handle_bg
+    jmp .cc_done
+.cc_not_bg:
     ; Unknown colon command
     mov rax, SYS_WRITE
     mov rdi, 2
@@ -5234,13 +5307,26 @@ setup_signals:
     rep stosb
     ; sa_handler = SIG_IGN (1)
     mov qword [rsp], SIG_IGN
-    ; sa_flags = 0
-    ; rt_sigaction(SIGINT, &act, NULL, 8)
+    ; Ignore SIGINT
     mov rax, SYS_RT_SIGACTION
     mov edi, SIGINT
     mov rsi, rsp
     xor edx, edx
-    mov r10, 8               ; sigsetsize
+    mov r10, 8
+    syscall
+    ; Ignore SIGTSTP (Ctrl-Z) in shell
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGTSTP
+    mov rsi, rsp
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ; Ignore SIGQUIT
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGQUIT
+    mov rsi, rsp
+    xor edx, edx
+    mov r10, 8
     syscall
     add rsp, 160
     ret
@@ -9027,3 +9113,320 @@ show_cmd_duration:
 .scd_prefix_len equ $ - .scd_prefix
 .scd_suffix: db "s", 27, "[0m", 10
 .scd_suffix_len equ $ - .scd_suffix
+
+; ══════════════════════════════════════════════════════════════════════
+; Job control
+; ══════════════════════════════════════════════════════════════════════
+
+; Add a stopped/background job to the job table
+; rdi = pid, rsi = command string
+add_job:
+    push rbx
+    push r12
+    mov r12, rdi             ; pid
+    mov rax, [job_count]
+    cmp rax, MAX_JOBS
+    jge .aj_done
+
+    mov [job_pids + rax*8], r12
+    mov qword [job_status + rax*8], 1  ; 1 = stopped
+
+    ; Copy command to job_cmd_storage
+    lea rdi, [job_cmd_storage]
+    ; Find end of storage
+    test rax, rax
+    jz .aj_store
+    mov rdi, [job_cmds + rax*8 - 8]
+    push rax
+    call strlen
+    pop rax
+    add rdi, rax
+    inc rdi
+.aj_store:
+    mov [job_cmds + rax*8], rdi
+    ; Copy command string
+.aj_copy:
+    mov cl, [rsi]
+    mov [rdi], cl
+    test cl, cl
+    jz .aj_copied
+    inc rsi
+    inc rdi
+    jmp .aj_copy
+.aj_copied:
+    inc qword [job_count]
+.aj_done:
+    pop r12
+    pop rbx
+    ret
+
+; :jobs - list all jobs
+handle_jobs:
+    push rbx
+    push r12
+
+    ; First, reap any finished background jobs
+    call reap_jobs
+
+    xor r12, r12
+.hj_loop:
+    cmp r12, [job_count]
+    jge .hj_done
+    ; Skip done jobs
+    cmp qword [job_status + r12*8], 2
+    je .hj_next
+
+    ; Print [N] Status PID : cmd
+    push r12
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hj_bracket_open]
+    mov rdx, 1
+    syscall
+    pop r12
+    push r12
+    mov rax, r12
+    inc rax
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hj_bracket_close]
+    mov rdx, 2
+    syscall
+    ; Status
+    pop r12
+    push r12
+    cmp qword [job_status + r12*8], 1
+    je .hj_stopped
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hj_running]
+    mov rdx, .hj_running_len
+    syscall
+    jmp .hj_pid
+.hj_stopped:
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hj_stopped_str]
+    mov rdx, .hj_stopped_len
+    syscall
+.hj_pid:
+    ; Print PID
+    pop r12
+    push r12
+    mov rax, [job_pids + r12*8]
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+    ; Print " : "
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hj_colon]
+    mov rdx, 3
+    syscall
+    ; Print command
+    pop r12
+    push r12
+    mov rsi, [job_cmds + r12*8]
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    pop r12
+    push r12
+    mov rsi, [job_cmds + r12*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    pop r12
+.hj_next:
+    inc r12
+    jmp .hj_loop
+.hj_done:
+    mov qword [last_status], 0
+    pop r12
+    pop rbx
+    ret
+
+.hj_bracket_open: db "["
+.hj_bracket_close: db "] "
+.hj_stopped_str: db "Stopped  "
+.hj_stopped_len equ $ - .hj_stopped_str
+.hj_running: db "Running  "
+.hj_running_len equ $ - .hj_running
+.hj_colon: db " : "
+
+; :fg N - bring job to foreground
+handle_fg:
+    push rbx
+    push r12
+    mov r12, rdi             ; argv array
+
+    mov rdi, [r12 + 8]       ; job number argument
+    test rdi, rdi
+    jz .hfg_last             ; no arg: use last job
+
+    ; Parse job number
+    call parse_int
+    dec rax                   ; 1-based to 0-based
+    jmp .hfg_resume
+.hfg_last:
+    mov rax, [job_count]
+    dec rax
+    test rax, rax
+    js .hfg_no_job
+
+.hfg_resume:
+    cmp rax, [job_count]
+    jge .hfg_no_job
+    cmp qword [job_status + rax*8], 2
+    je .hfg_no_job            ; job already done
+
+    mov rbx, rax              ; job index
+    mov rdi, [job_pids + rbx*8]
+
+    ; Send SIGCONT
+    mov rax, SYS_KILL
+    mov rsi, SIGCONT
+    syscall
+
+    ; Wait for the process (with WUNTRACED)
+    sub rsp, 16
+    mov rdi, [job_pids + rbx*8]
+    lea rsi, [rsp]
+    mov edx, WUNTRACED
+    xor r10d, r10d
+    mov rax, SYS_WAIT4
+    syscall
+    ; Check if stopped again
+    mov eax, [rsp]
+    mov ecx, eax
+    and ecx, 0xFF
+    cmp ecx, 0x7F
+    je .hfg_stopped_again
+    ; Finished: mark job as done
+    mov qword [job_status + rbx*8], 2
+    shr eax, 8
+    and eax, 0xFF
+    mov [last_status], rax
+    add rsp, 16
+    pop r12
+    pop rbx
+    ret
+.hfg_stopped_again:
+    mov qword [job_status + rbx*8], 1
+    add rsp, 16
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hfg_stopped_msg]
+    mov rdx, .hfg_stopped_len
+    syscall
+    pop r12
+    pop rbx
+    ret
+.hfg_no_job:
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [.hfg_no_msg]
+    mov rdx, .hfg_no_len
+    syscall
+    mov qword [last_status], 1
+    pop r12
+    pop rbx
+    ret
+.hfg_stopped_msg: db 10, "[stopped]", 10
+.hfg_stopped_len equ $ - .hfg_stopped_msg
+.hfg_no_msg: db "bare: no such job", 10
+.hfg_no_len equ $ - .hfg_no_msg
+
+; :bg N - resume a stopped job in background
+handle_bg:
+    push rbx
+    push r12
+    mov r12, rdi
+
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jz .hbg_last
+    call parse_int
+    dec rax
+    jmp .hbg_resume
+.hbg_last:
+    mov rax, [job_count]
+    dec rax
+    test rax, rax
+    js .hbg_no_job
+.hbg_resume:
+    cmp rax, [job_count]
+    jge .hbg_no_job
+    mov rbx, rax
+    ; Send SIGCONT
+    mov rdi, [job_pids + rbx*8]
+    mov rax, SYS_KILL
+    mov rsi, SIGCONT
+    syscall
+    ; Mark as running
+    mov qword [job_status + rbx*8], 0
+    mov qword [last_status], 0
+    pop r12
+    pop rbx
+    ret
+.hbg_no_job:
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [.hbg_no_msg]
+    mov rdx, .hbg_no_len
+    syscall
+    mov qword [last_status], 1
+    pop r12
+    pop rbx
+    ret
+.hbg_no_msg: db "bare: no such job", 10
+.hbg_no_len equ $ - .hbg_no_msg
+
+; Reap finished background jobs (non-blocking waitpid)
+reap_jobs:
+    push rbx
+    push r12
+    sub rsp, 16
+
+    xor r12, r12
+.rj_loop:
+    cmp r12, [job_count]
+    jge .rj_done
+    ; Only check running jobs
+    cmp qword [job_status + r12*8], 0
+    jne .rj_next
+
+    mov rdi, [job_pids + r12*8]
+    lea rsi, [rsp]
+    mov edx, WNOHANG
+    xor r10d, r10d
+    mov rax, SYS_WAIT4
+    syscall
+    test rax, rax
+    jle .rj_next             ; not finished yet
+    ; Job finished, mark as done
+    mov qword [job_status + r12*8], 2
+.rj_next:
+    inc r12
+    jmp .rj_loop
+.rj_done:
+    add rsp, 16
+    pop r12
+    pop rbx
+    ret
