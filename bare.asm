@@ -459,6 +459,10 @@ cmd_freq_storage: resb 8192
 ; Config file path
 config_path:    resb 256
 
+; Command-line flags
+login_flag:     resq 1              ; 1 if -l/--login
+cmd_flag:       resq 1              ; pointer to -c command string
+
 ; Prompt visible width (characters, excluding ANSI escapes)
 prompt_visible_width: resq 1
 
@@ -517,6 +521,37 @@ _start:
     lea rcx, [rsi + rax*8]  ; envp
     mov [envp], rcx
 
+    ; Parse command-line flags (-l/--login, -c "cmd")
+    mov qword [login_flag], 0
+    mov qword [cmd_flag], 0
+    cmp rdi, 1
+    jle .no_args
+    ; Check argv[1]
+    mov rax, [rsi + 8]       ; argv[1]
+    test rax, rax
+    jz .no_args
+    cmp word [rax], '-l'
+    jne .check_login_long
+    cmp byte [rax + 2], 0
+    je .set_login
+.check_login_long:
+    cmp dword [rax], '--lo'
+    jne .check_c_flag
+    mov qword [login_flag], 1
+    jmp .no_args
+.check_c_flag:
+    cmp word [rax], '-c'
+    jne .no_args
+    cmp byte [rax + 2], 0
+    jne .no_args
+    ; -c mode: argv[2] is the command
+    mov rax, [rsi + 16]
+    mov [cmd_flag], rax
+    jmp .no_args
+.set_login:
+    mov qword [login_flag], 1
+.no_args:
+
     ; Get and cache PID
     mov rax, SYS_GETPID
     syscall
@@ -567,6 +602,63 @@ _start:
 
     ; Initialize last_status
     mov qword [last_status], 0
+
+    ; Handle -c command mode
+    cmp qword [cmd_flag], 0
+    je .no_cmd_mode
+    ; Execute the command and exit
+    mov rsi, [cmd_flag]
+    lea rdi, [line_buf]
+    xor rcx, rcx
+.cmd_copy:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .cmd_exec
+    inc rcx
+    jmp .cmd_copy
+.cmd_exec:
+    mov [line_len], rcx
+    call expand_line
+    mov rdi, line_buf
+    call execute_chained_line
+    mov rdi, [last_status]
+    mov rax, SYS_EXIT
+    syscall
+
+.no_cmd_mode:
+    ; Handle login shell: source /etc/profile and ~/.profile
+    cmp qword [login_flag], 0
+    je .no_login
+    ; Source /etc/profile (execute line by line)
+    lea rdi, [.etc_profile]
+    call source_file
+    ; Source ~/.profile
+    mov rdi, [envp]
+    call find_env_home
+    test rax, rax
+    jz .no_login
+    lea rdi, [suggestion_buf]
+    mov rsi, rax
+.login_cp_home:
+    mov cl, [rsi]
+    mov [rdi], cl
+    test cl, cl
+    jz .login_append
+    inc rsi
+    inc rdi
+    jmp .login_cp_home
+.login_append:
+    mov dword [rdi], '/.pr'
+    mov dword [rdi + 4], 'ofil'
+    mov byte [rdi + 8], 'e'
+    mov byte [rdi + 9], 0
+    lea rdi, [suggestion_buf]
+    call source_file
+.no_login:
+    jmp .past_login_data
+.etc_profile: db "/etc/profile", 0
+.past_login_data:
 
 ; ── Main loop ────────────────────────────────────────────────────────
 .main_loop:
@@ -1825,9 +1917,23 @@ read_line:
     jmp .tab_process_results
 
 .tab_file_completion:
+    ; Check for $VAR completion
+    cmp byte [tab_word_buf], '$'
+    je .tab_var_completion
+
+    ; Check for subcommand completion (git, apt, cargo, etc.)
+    call check_subcommand_completion
+    test rax, rax
+    jnz .tab_process_results
+
     ; Search current directory for file matches
     lea rdi, [tab_word_buf]
     call tab_complete_file
+    jmp .tab_process_results
+
+.tab_var_completion:
+    lea rdi, [tab_word_buf]
+    call tab_complete_var
     jmp .tab_process_results
 
 .tab_process_results:
@@ -4385,6 +4491,32 @@ check_builtin:
     call handle_config
     jmp .cc_done
 .cc_not_config:
+    mov rdi, [r12]
+    lea rsi, [str_calc]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_calc
+    mov rdi, r12
+    call handle_calc
+    jmp .cc_done
+.cc_not_calc:
+    mov rdi, [r12]
+    lea rsi, [str_stats]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_stats
+    call handle_stats
+    jmp .cc_done
+.cc_not_stats:
+    mov rdi, [r12]
+    lea rsi, [str_validate]
+    call strcmp
+    test rax, rax
+    jnz .cc_not_validate
+    mov rdi, r12
+    call handle_validate
+    jmp .cc_done
+.cc_not_validate:
     ; Unknown colon command
     mov rax, SYS_WRITE
     mov rdi, 2
@@ -10813,6 +10945,812 @@ syntax_highlight_line:
 
 .shl_done:
     pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Tab complete $VAR from environment
+; rdi = word starting with $
+; ══════════════════════════════════════════════════════════════════════
+tab_complete_var:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    inc r12                  ; skip $
+    mov rdi, r12
+    call strlen
+    mov r13, rax             ; prefix length after $
+
+    mov qword [tab_count], 0
+    mov qword [tab_buf_pos], 0
+    xor rcx, rcx
+.tcv_loop:
+    cmp rcx, [env_count]
+    jge .tcv_done
+    mov rsi, [env_array + rcx*8]
+    test rsi, rsi
+    jz .tcv_next
+    push rcx
+    push rsi
+    xor rbx, rbx
+.tcv_cmp:
+    cmp rbx, r13
+    jge .tcv_match
+    movzx eax, byte [r12 + rbx]
+    movzx edx, byte [rsi + rbx]
+    cmp dl, '='
+    je .tcv_no_match
+    cmp al, dl
+    jne .tcv_no_match
+    inc rbx
+    jmp .tcv_cmp
+.tcv_match:
+    pop rsi
+    pop rcx
+    push rcx
+    cmp qword [tab_count], MAX_TAB_RESULTS - 1
+    jge .tcv_skip
+    mov rax, [tab_buf_pos]
+    lea rdi, [tab_buf + rax]
+    mov byte [rdi], '$'
+    inc rdi
+    push rsi
+    xor rbx, rbx
+.tcv_copy_name:
+    movzx eax, byte [rsi + rbx]
+    test al, al
+    jz .tcv_name_done
+    cmp al, '='
+    je .tcv_name_done
+    mov [rdi + rbx], al
+    inc rbx
+    jmp .tcv_copy_name
+.tcv_name_done:
+    mov byte [rdi + rbx], 0
+    pop rsi
+    mov rax, [tab_count]
+    mov rdx, [tab_buf_pos]
+    lea rdi, [tab_buf + rdx]
+    mov [tab_results + rax*8], rdi
+    inc qword [tab_count]
+    lea rdx, [rbx + 2]
+    add [tab_buf_pos], rdx
+.tcv_skip:
+    pop rcx
+.tcv_next:
+    inc rcx
+    jmp .tcv_loop
+.tcv_no_match:
+    pop rsi
+    pop rcx
+    jmp .tcv_next
+.tcv_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Check for subcommand completion (git, apt, cargo)
+; Returns rax=1 if handled (results in tab_results), 0 if not
+; ══════════════════════════════════════════════════════════════════════
+check_subcommand_completion:
+    push rbx
+    push r12
+    lea rdi, [line_buf]
+    xor rcx, rcx
+.csc_find_end:
+    cmp rcx, [line_len]
+    jge .csc_no
+    cmp byte [line_buf + rcx], ' '
+    je .csc_got_cmd
+    inc rcx
+    jmp .csc_find_end
+.csc_got_cmd:
+    test rcx, rcx
+    jz .csc_no
+    cmp rcx, 3
+    jne .csc_not3
+    cmp word [line_buf], 'gi'
+    jne .csc_try_apt
+    cmp byte [line_buf + 2], 't'
+    jne .csc_try_apt
+    lea rsi, [.git_subcmds]
+    jmp .csc_complete
+.csc_try_apt:
+    cmp word [line_buf], 'ap'
+    jne .csc_not3
+    cmp byte [line_buf + 2], 't'
+    jne .csc_not3
+    lea rsi, [.apt_subcmds]
+    jmp .csc_complete
+.csc_not3:
+    cmp rcx, 5
+    jne .csc_no
+    cmp dword [line_buf], 'carg'
+    jne .csc_no
+    cmp byte [line_buf + 4], 'o'
+    jne .csc_no
+    lea rsi, [.cargo_subcmds]
+.csc_complete:
+    mov qword [tab_count], 0
+    mov qword [tab_buf_pos], 0
+    lea rdi, [tab_word_buf]
+    push rdi
+    call strlen
+    mov r12, rax
+    pop rdi
+.csc_scan:
+    cmp byte [rsi], 0
+    je .csc_end_list
+    push rsi
+    xor rcx, rcx
+    test r12, r12
+    jz .csc_match
+.csc_cmp:
+    cmp rcx, r12
+    jge .csc_match
+    movzx eax, byte [rdi + rcx]
+    cmp al, [rsi + rcx]
+    jne .csc_skip
+    inc rcx
+    jmp .csc_cmp
+.csc_match:
+    cmp qword [tab_count], MAX_TAB_RESULTS - 1
+    jge .csc_skip
+    pop rsi
+    push rsi
+    mov rax, [tab_buf_pos]
+    lea rbx, [tab_buf + rax]
+    mov rcx, [tab_count]
+    mov [tab_results + rcx*8], rbx
+    push rsi
+.csc_copy:
+    movzx eax, byte [rsi]
+    mov [rbx], al
+    test al, al
+    jz .csc_copied
+    inc rsi
+    inc rbx
+    jmp .csc_copy
+.csc_copied:
+    pop rsi
+    inc qword [tab_count]
+    lea rax, [rbx + 1]
+    sub rax, tab_buf
+    mov [tab_buf_pos], rax
+.csc_skip:
+    pop rsi
+.csc_adv:
+    cmp byte [rsi], 0
+    je .csc_past_null
+    inc rsi
+    jmp .csc_adv
+.csc_past_null:
+    inc rsi
+    cmp byte [rsi], 0
+    jne .csc_scan
+.csc_end_list:
+    cmp qword [tab_count], 0
+    je .csc_no
+    mov rax, 1
+    pop r12
+    pop rbx
+    ret
+.csc_no:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
+.git_subcmds: db "add",0,"branch",0,"checkout",0,"clone",0,"commit",0,"diff",0,"fetch",0
+              db "init",0,"log",0,"merge",0,"pull",0,"push",0,"rebase",0,"remote",0
+              db "reset",0,"restore",0,"show",0,"stash",0,"status",0,"switch",0,"tag",0,0
+.apt_subcmds: db "install",0,"remove",0,"update",0,"upgrade",0,"search",0,"show",0
+              db "list",0,"autoremove",0,"purge",0,0
+.cargo_subcmds: db "build",0,"check",0,"clean",0,"doc",0,"init",0,"new",0,"run",0
+                db "test",0,"bench",0,"update",0,"publish",0,"install",0,"fmt",0,"clippy",0,0
+
+; ══════════════════════════════════════════════════════════════════════
+; :calc - integer calculator
+; ══════════════════════════════════════════════════════════════════════
+handle_calc:
+    push rbx
+    push r12
+    mov r12, rdi
+    lea rdi, [nick_expand_buf]
+    mov rcx, 1
+    xor rbx, rbx
+.hcalc_build:
+    mov rsi, [r12 + rcx*8]
+    test rsi, rsi
+    jz .hcalc_eval
+    cmp rcx, 1
+    je .hcalc_no_sp
+    mov byte [rdi + rbx], ' '
+    inc rbx
+.hcalc_no_sp:
+.hcalc_copy:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .hcalc_next
+    mov [rdi + rbx], al
+    inc rbx
+    inc rsi
+    jmp .hcalc_copy
+.hcalc_next:
+    inc rcx
+    jmp .hcalc_build
+.hcalc_eval:
+    mov byte [rdi + rbx], 0
+    test rbx, rbx
+    jz .hcalc_done
+    lea rsi, [nick_expand_buf]
+    call calc_eval
+    push rax
+    lea rdi, [num_buf]
+    test rax, rax
+    jns .hcalc_pos
+    neg rax
+    mov byte [num_buf], '-'
+    lea rdi, [num_buf + 1]
+.hcalc_pos:
+    call itoa
+    pop rdx
+    test rdx, rdx
+    jns .hcalc_pr
+    inc rax
+.hcalc_pr:
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+.hcalc_done:
+    mov qword [last_status], 0
+    pop r12
+    pop rbx
+    ret
+
+; Left-to-right integer eval: num op num op ...
+; rsi = expression, returns rax
+calc_eval:
+    push rbx
+    push r12
+    push r13
+    mov r12, rsi
+    call .ce_num
+    mov r13, rax
+.ce_op:
+    cmp byte [r12], ' '
+    jne .ce_check
+    inc r12
+    jmp .ce_op
+.ce_check:
+    cmp byte [r12], 0
+    je .ce_ret
+    movzx ebx, byte [r12]
+    inc r12
+.ce_skip:
+    cmp byte [r12], ' '
+    jne .ce_num2
+    inc r12
+    jmp .ce_skip
+.ce_num2:
+    call .ce_num
+    cmp bl, '+'
+    je .ce_add
+    cmp bl, '-'
+    je .ce_sub
+    cmp bl, '*'
+    je .ce_mul
+    cmp bl, '/'
+    je .ce_div
+    cmp bl, '%'
+    je .ce_mod
+    jmp .ce_ret
+.ce_add: add r13, rax
+    jmp .ce_op
+.ce_sub: sub r13, rax
+    jmp .ce_op
+.ce_mul: imul r13, rax
+    jmp .ce_op
+.ce_div:
+    test rax, rax
+    jz .ce_ret
+    xchg rax, r13
+    cqo
+    idiv r13
+    mov r13, rax
+    jmp .ce_op
+.ce_mod:
+    test rax, rax
+    jz .ce_ret
+    xchg rax, r13
+    cqo
+    idiv r13
+    mov r13, rdx
+    jmp .ce_op
+.ce_ret:
+    mov rax, r13
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ce_num:
+    xor rax, rax
+    xor ecx, ecx
+    cmp byte [r12], '-'
+    jne .cen_loop
+    mov ecx, 1
+    inc r12
+.cen_loop:
+    movzx edx, byte [r12]
+    sub dl, '0'
+    js .cen_done
+    cmp dl, 9
+    ja .cen_done
+    imul rax, 10
+    movzx edx, dl
+    add rax, rdx
+    inc r12
+    jmp .cen_loop
+.cen_done:
+    test ecx, ecx
+    jz .cen_ret
+    neg rax
+.cen_ret:
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; :stats - command frequency from history
+; ══════════════════════════════════════════════════════════════════════
+handle_stats:
+    push rbx
+    push r12
+    push r13
+    mov qword [cmd_freq_count], 0
+    xor r12, r12
+.hs_loop:
+    cmp r12, [hist_count]
+    jge .hs_display
+    mov rsi, [hist_lines + r12*8]
+    test rsi, rsi
+    jz .hs_next
+    lea rdi, [search_buf]
+    xor rcx, rcx
+.hs_cmd:
+    movzx eax, byte [rsi + rcx]
+    test al, al
+    jz .hs_got
+    cmp al, ' '
+    je .hs_got
+    mov [rdi + rcx], al
+    inc rcx
+    cmp rcx, 250
+    jge .hs_got
+    jmp .hs_cmd
+.hs_got:
+    mov byte [rdi + rcx], 0
+    test rcx, rcx
+    jz .hs_next
+    xor r13, r13
+.hs_find:
+    cmp r13, [cmd_freq_count]
+    jge .hs_add
+    push r13
+    mov rdi, [cmd_freq_names + r13*8]
+    lea rsi, [search_buf]
+    call strcmp
+    pop r13
+    test rax, rax
+    jz .hs_inc
+    inc r13
+    jmp .hs_find
+.hs_inc:
+    inc qword [cmd_freq_counts + r13*8]
+    jmp .hs_next
+.hs_add:
+    cmp r13, 127
+    jge .hs_next
+    lea rdi, [cmd_freq_storage]
+    test r13, r13
+    jz .hs_store
+    mov rdi, [cmd_freq_names + r13*8 - 8]
+    push rax
+    call strlen
+    pop rax
+    add rdi, rax
+    inc rdi
+.hs_store:
+    mov [cmd_freq_names + r13*8], rdi
+    lea rsi, [search_buf]
+.hs_cp:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .hs_stored
+    inc rsi
+    inc rdi
+    jmp .hs_cp
+.hs_stored:
+    mov qword [cmd_freq_counts + r13*8], 1
+    inc qword [cmd_freq_count]
+.hs_next:
+    inc r12
+    jmp .hs_loop
+.hs_display:
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hs_hdr]
+    mov rdx, .hs_hdr_len
+    syscall
+    xor r12, r12
+.hs_show:
+    cmp r12, 20
+    jge .hs_end
+    xor r13, r13
+    mov rbx, -1
+    xor rcx, rcx
+.hs_max:
+    cmp r13, [cmd_freq_count]
+    jge .hs_best
+    mov rax, [cmd_freq_counts + r13*8]
+    cmp rax, rcx
+    jle .hs_mx_next
+    mov rcx, rax
+    mov rbx, r13
+.hs_mx_next:
+    inc r13
+    jmp .hs_max
+.hs_best:
+    cmp rbx, -1
+    je .hs_end
+    push rbx
+    mov rax, [cmd_freq_counts + rbx*8]
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hs_sp]
+    mov rdx, 2
+    syscall
+    pop rbx
+    push rbx
+    mov rsi, [cmd_freq_names + rbx*8]
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    pop rbx
+    push rbx
+    mov rsi, [cmd_freq_names + rbx*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    pop rbx
+    mov qword [cmd_freq_counts + rbx*8], 0
+    inc r12
+    jmp .hs_show
+.hs_end:
+    mov qword [last_status], 0
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.hs_hdr: db "Top commands:", 10
+.hs_hdr_len equ $ - .hs_hdr
+.hs_sp: db "  "
+
+; ══════════════════════════════════════════════════════════════════════
+; :validate [pattern = action | -N | --templates]
+; ══════════════════════════════════════════════════════════════════════
+handle_validate:
+    push rbx
+    push r12
+    mov r12, rdi
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jz .hv_list
+    cmp byte [rdi], '-'
+    je .hv_delete
+    ; Add: pattern = action
+    lea rbx, [nick_expand_buf]
+    mov rcx, 1
+    xor rax, rax
+.hv_build:
+    mov rsi, [r12 + rcx*8]
+    test rsi, rsi
+    jz .hv_done
+    cmp byte [rsi], '='
+    je .hv_eq
+    test rax, rax
+    jz .hv_nsp
+    mov byte [rbx + rax], ' '
+    inc rax
+.hv_nsp:
+.hv_cpa:
+    movzx edx, byte [rsi]
+    test dl, dl
+    jz .hv_cpa_d
+    mov [rbx + rax], dl
+    inc rax
+    inc rsi
+    jmp .hv_cpa
+.hv_cpa_d:
+    inc rcx
+    jmp .hv_build
+.hv_eq:
+    mov byte [rbx + rax], 0
+    inc rcx
+    mov rsi, [r12 + rcx*8]
+    test rsi, rsi
+    jz .hv_done
+    mov rax, [valid_count]
+    cmp rax, 31
+    jge .hv_done
+    ; Store pattern
+    lea rdi, [valid_storage]
+    test rax, rax
+    jz .hv_sp
+    mov rdi, [valid_patterns + rax*8 - 8]
+    push rax
+    call strlen
+    pop rax
+    add rdi, rax
+    inc rdi
+.hv_sp:
+    mov [valid_patterns + rax*8], rdi
+    push rsi
+    push rax
+    lea rsi, [nick_expand_buf]
+.hv_cpp:
+    movzx edx, byte [rsi]
+    mov [rdi], dl
+    test dl, dl
+    jz .hv_cpd
+    inc rsi
+    inc rdi
+    jmp .hv_cpp
+.hv_cpd:
+    pop rax
+    pop rsi
+    cmp byte [rsi], 'b'
+    je .hv_blk
+    cmp byte [rsi], 'c'
+    je .hv_cfm
+    mov byte [valid_actions + rax], 0
+    jmp .hv_vinc
+.hv_cfm: mov byte [valid_actions + rax], 1
+    jmp .hv_vinc
+.hv_blk: mov byte [valid_actions + rax], 2
+.hv_vinc:
+    inc qword [valid_count]
+    jmp .hv_done
+.hv_delete:
+    inc rdi
+    cmp byte [rdi], '-'
+    je .hv_tmpl
+    call parse_int
+    dec rax
+    cmp rax, [valid_count]
+    jge .hv_done
+    mov rcx, rax
+    mov rdx, [valid_count]
+    dec rdx
+    mov [valid_count], rdx
+.hv_ds:
+    cmp rcx, rdx
+    jge .hv_done
+    mov rbx, [valid_patterns + rcx*8 + 8]
+    mov [valid_patterns + rcx*8], rbx
+    movzx ebx, byte [valid_actions + rcx + 1]
+    mov [valid_actions + rcx], bl
+    inc rcx
+    jmp .hv_ds
+.hv_tmpl:
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hv_tt]
+    mov rdx, .hv_tt_len
+    syscall
+    jmp .hv_done
+.hv_list:
+    xor rcx, rcx
+.hv_ll:
+    cmp rcx, [valid_count]
+    jge .hv_done
+    push rcx
+    mov rax, rcx
+    inc rax
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hv_dot]
+    mov rdx, 2
+    syscall
+    pop rcx
+    push rcx
+    mov rsi, [valid_patterns + rcx*8]
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    pop rcx
+    push rcx
+    mov rsi, [valid_patterns + rcx*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [nick_arrow]
+    mov rdx, 3
+    syscall
+    pop rcx
+    push rcx
+    movzx eax, byte [valid_actions + rcx]
+    lea rsi, [.hv_w]
+    test al, al
+    jz .hv_pa
+    lea rsi, [.hv_c]
+    cmp al, 1
+    je .hv_pa
+    lea rsi, [.hv_b]
+.hv_pa:
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    pop rcx
+    push rcx
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    pop rcx
+    inc rcx
+    jmp .hv_ll
+.hv_done:
+    mov qword [last_status], 0
+    pop r12
+    pop rbx
+    ret
+.hv_dot: db ". "
+.hv_w: db "warn", 0
+.hv_c: db "confirm", 0
+.hv_b: db "block", 0
+.hv_tt: db "Examples:", 10, "  :validate rm -rf = confirm", 10
+        db "  :validate DROP TABLE = block", 10
+.hv_tt_len equ $ - .hv_tt
+
+; ══════════════════════════════════════════════════════════════════════
+; Source a file: read it, execute each line
+; rdi = path to file
+; ══════════════════════════════════════════════════════════════════════
+source_file:
+    push rbx
+    push r12
+    push r13
+
+    ; Open file
+    mov rax, SYS_OPEN
+    xor esi, esi             ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .sf_done              ; file not found, skip silently
+
+    mov rbx, rax             ; fd
+    ; Read into session_buf (reuse)
+    mov rax, SYS_READ
+    mov rdi, rbx
+    lea rsi, [session_buf]
+    mov rdx, 16383
+    syscall
+    push rax                 ; bytes read
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+    pop rax
+    test rax, rax
+    jle .sf_done
+
+    mov byte [session_buf + rax], 0
+
+    ; Execute line by line
+    lea r12, [session_buf]
+.sf_next_line:
+    cmp byte [r12], 0
+    je .sf_done
+    ; Skip blank lines and comments
+    cmp byte [r12], 10
+    je .sf_skip_nl
+    cmp byte [r12], '#'
+    je .sf_skip_comment
+
+    ; Find end of line
+    mov r13, r12
+.sf_find_eol:
+    cmp byte [r13], 0
+    je .sf_got_line
+    cmp byte [r13], 10
+    je .sf_got_line
+    inc r13
+    jmp .sf_find_eol
+.sf_got_line:
+    ; Save and null-terminate
+    movzx ebx, byte [r13]
+    mov byte [r13], 0
+    ; Copy line to line_buf
+    lea rdi, [line_buf]
+    mov rsi, r12
+    xor rcx, rcx
+.sf_copy:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .sf_exec
+    inc rcx
+    jmp .sf_copy
+.sf_exec:
+    mov [line_len], rcx
+    ; Expand and execute
+    push r12
+    push r13
+    push rbx
+    call expand_line
+    mov rdi, line_buf
+    call execute_chained_line
+    pop rbx
+    pop r13
+    pop r12
+    ; Restore newline
+    mov [r13], bl
+    cmp bl, 10
+    jne .sf_done
+    lea r12, [r13 + 1]
+    jmp .sf_next_line
+
+.sf_skip_nl:
+    inc r12
+    jmp .sf_next_line
+.sf_skip_comment:
+    ; Skip to next line
+.sf_skip_to_nl:
+    cmp byte [r12], 0
+    je .sf_done
+    cmp byte [r12], 10
+    je .sf_skip_nl
+    inc r12
+    jmp .sf_skip_to_nl
+
+.sf_done:
     pop r13
     pop r12
     pop rbx
