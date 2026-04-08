@@ -1970,8 +1970,8 @@ read_line:
     sub rcx, rdx            ; chars to insert
     test rcx, rcx
     jle .tab_add_space
-    add rsi, rdx            ; point to remaining chars
-    ; Insert each char into line_buf at cursor
+    add rsi, rdx            ; point to remaining chars ("ME" for $HOME)
+    ; Insert chars into line_buf at cursor
 .tab_insert_loop:
     test rcx, rcx
     jz .tab_add_space
@@ -1979,26 +1979,6 @@ read_line:
     mov [line_buf + r12], al
     inc r12
     inc qword [line_len]
-    ; Echo the character
-    push rcx
-    push rsi
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    mov rsi, rsp
-    sub rsi, 8              ; character is at [rsp - 8] area, use tmp_buf
-    pop rsi
-    pop rcx
-    ; Write the character
-    push rcx
-    push rsi
-    mov [tmp_buf], al
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [tmp_buf]
-    mov rdx, 1
-    syscall
-    pop rsi
-    pop rcx
     inc rsi
     dec rcx
     jmp .tab_insert_loop
@@ -2008,12 +1988,10 @@ read_line:
     mov byte [line_buf + r12], ' '
     inc r12
     inc qword [line_len]
-    mov byte [tmp_buf], ' '
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [tmp_buf]
-    mov rdx, 1
-    syscall
+    ; Null-terminate and redraw with highlighting
+    mov rcx, [line_len]
+    mov byte [line_buf + rcx], 0
+    call full_redraw
     jmp .tab_done
 
 .tab_multiple:
