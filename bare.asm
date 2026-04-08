@@ -3284,24 +3284,10 @@ parse_and_exec_simple:
     jz .child_exec
     js .fork_error
 
-    ; Parent: set child's process group and give it terminal control
+    ; Parent: restore cooked terminal so child gets normal I/O + ISIG
     mov [child_pid], rax
     mov r13, rax             ; save child pid
-    ; Set child's pgid = child's pid (from parent side too, for race safety)
-    mov rdi, r13
-    mov rsi, r13
-    mov rax, SYS_SETPGID
-    syscall
-    ; Give child terminal control
-    sub rsp, 8
-    mov [rsp], r13d
-    mov rax, SYS_IOCTL
-    xor edi, edi
-    mov esi, TIOCSPGRP
-    mov rdx, rsp
-    syscall
-    add rsp, 8
-    call restore_termios     ; restore original terminal (has ISIG)
+    call restore_termios
     sub rsp, 16
 .paes_wait:
     mov rdi, r13
@@ -3321,14 +3307,12 @@ parse_and_exec_simple:
     and eax, 0xFF
     mov [last_status], rax
     add rsp, 16
-    call .paes_reclaim_tty
     call enable_raw_mode
     jmp .paes_done
 
 .paes_stopped:
     ; Child was stopped by Ctrl-Z, add to job table
     add rsp, 16
-    call .paes_reclaim_tty
     call enable_raw_mode
     mov rdi, r13             ; pid
     lea rsi, [line_buf]      ; command string
@@ -3350,42 +3334,8 @@ parse_and_exec_simple:
 .stopped_msg: db 10, "[stopped]", 10
 .stopped_msg_len equ $ - .stopped_msg
 
-; Reclaim terminal control for shell's process group
-.paes_reclaim_tty:
-    sub rsp, 8
-    mov rax, SYS_GETPID
-    syscall
-    mov [rsp], eax
-    mov rax, SYS_IOCTL
-    xor edi, edi
-    mov esi, TIOCSPGRP
-    mov rdx, rsp
-    syscall
-    add rsp, 8
-    ret
-
 .child_exec:
-    ; Put child in its own process group
-    xor edi, edi             ; pid=0 means self
-    xor esi, esi             ; pgid=0 means use own pid
-    mov rax, SYS_SETPGID
-    syscall
-    ; Give child's process group terminal control
-    mov rax, SYS_IOCTL
-    xor edi, edi             ; stdin fd
-    mov esi, TIOCSPGRP
-    mov rdx, rsp             ; need pointer to pgid
-    sub rsp, 8
-    mov rax, SYS_GETPID
-    syscall
-    mov [rsp], eax            ; store our pid as pgid
-    mov rax, SYS_IOCTL
-    xor edi, edi
-    mov esi, TIOCSPGRP
-    mov rdx, rsp
-    syscall
-    add rsp, 8
-    ; Restore default signals in child
+    ; Restore default signals in child (SIG_DFL for SIGTSTP etc.)
     call restore_child_signals
     call parse_and_exec_child_argv
     ; If we get here, exec failed
