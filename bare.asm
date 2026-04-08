@@ -1918,8 +1918,8 @@ read_line:
     jmp .tab_process_results
 
 .tab_file_completion:
-    ; Check for $VAR completion
-    cmp byte [tab_word_buf], '$'
+    ; Check for $VAR completion (0x24 = ASCII dollar sign; '$' in NASM means current address)
+    cmp byte [tab_word_buf], 0x24
     je .tab_var_completion
 
     ; Check for subcommand completion (git, apt, cargo, etc.)
@@ -2100,17 +2100,8 @@ read_line:
     ; Replace word at r14..r12 with selected match
     ; First rebuild line with selected match
     call .tab_preview_selection
-    ; Redraw prompt + previewed line
-    call print_prompt
-    mov rcx, [line_len]
-    test rcx, rcx
-    jz .tab_cycle_key
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [line_buf]
-    mov rdx, rcx
-    syscall
-    call reposition_cursor
+    ; Redraw prompt + previewed line with syntax highlighting
+    call full_redraw
 
 .tab_cycle_key:
     ; Read next key
