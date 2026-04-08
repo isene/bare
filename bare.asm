@@ -2261,17 +2261,8 @@ read_line:
     lea rsi, [clr_eol_global]
     mov rdx, clr_eol_len
     syscall
-    ; Redraw prompt + final line
-    call print_prompt
-    mov rcx, [line_len]
-    test rcx, rcx
-    jz .tab_done
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [line_buf]
-    mov rdx, rcx
-    syscall
-    call reposition_cursor
+    ; Redraw prompt + final line with syntax highlighting
+    call full_redraw
     jmp .tab_done
 
 .tab_up_cr: db 27, "[A", 13        ; cursor up + carriage return
@@ -10769,175 +10760,189 @@ check_continuation:
 ; Colors the first word as command (check nick/builtin), switches as
 ; cyan, paths as yellow, and the rest as default command color.
 ; ══════════════════════════════════════════════════════════════════════
+; Syntax highlighting: process line_buf char by char
+; Colors: commands, colon commands, nicks, switches (-x), pipe chars
+; Handles pipe segments (each | starts a new command context)
 syntax_highlight_line:
     push rbx
     push r12
     push r13
     push r14
+    push r15
 
-    lea rsi, [line_buf]
     mov r13, [line_len]
     test r13, r13
     jz .shl_done
 
-    ; Find end of first word
-    xor rcx, rcx
-.shl_find_cmd_end:
-    cmp rcx, r13
-    jge .shl_cmd_end_found
-    cmp byte [rsi + rcx], ' '
-    je .shl_cmd_end_found
-    inc rcx
-    jmp .shl_find_cmd_end
-.shl_cmd_end_found:
-    mov r14, rcx             ; r14 = first word length
+    lea rdi, [suggestion_buf]
+    xor rbx, rbx             ; output position
+    xor rcx, rcx             ; input position
+    mov r15, 1               ; r15 = 1 means "next word is a command"
 
-    ; Determine command color
-    ; Check if first word starts with ':' (colon command)
-    movzx eax, byte [color_settings + C_CMD]
-    cmp byte [line_buf], ':'
-    jne .shl_not_colon
-    movzx eax, byte [color_settings + C_COLON]
-    jmp .shl_got_cmd_color
-.shl_not_colon:
-    ; Check if first word is a nick
-    push rax
-    xor rcx, rcx
-.shl_check_nick:
-    cmp rcx, [nick_count]
-    jge .shl_not_nick
-    push rcx
-    ; Compare first word with nick name
-    mov rdi, [nick_names + rcx*8]
-    call strlen
-    pop rcx
-    cmp rax, r14
-    jne .shl_nick_next
-    ; Length matches, compare bytes
-    push rcx
-    mov rdi, [nick_names + rcx*8]
-    lea rsi, [line_buf]
-    xor rbx, rbx
-.shl_nick_cmp:
-    cmp rbx, r14
-    jge .shl_is_nick
-    movzx eax, byte [rdi + rbx]
-    cmp al, [rsi + rbx]
-    jne .shl_nick_no
-    inc rbx
-    jmp .shl_nick_cmp
-.shl_is_nick:
-    pop rcx
-    pop rax                  ; discard saved default color
-    movzx eax, byte [color_settings + C_NICK]
-    jmp .shl_got_cmd_color
-.shl_nick_no:
-    pop rcx
-.shl_nick_next:
-    inc rcx
-    lea rsi, [line_buf]     ; restore rsi
-    jmp .shl_check_nick
-.shl_not_nick:
-    pop rax                  ; restore default cmd color
-
-.shl_got_cmd_color:
-    ; Write command word with color
-    push rax                 ; save cmd color
-    lea rdi, [suggestion_buf] ; reuse as output buffer
-    call write_fg_color
-    mov rbx, rax             ; output position
-    ; Copy command word
-    xor rcx, rcx
-.shl_copy_cmd:
-    cmp rcx, r14
-    jge .shl_cmd_copied
-    movzx eax, byte [line_buf + rcx]
-    mov [suggestion_buf + rbx], al
-    inc rbx
-    inc rcx
-    jmp .shl_copy_cmd
-.shl_cmd_copied:
-    pop rax                  ; discard saved cmd color
-
-    ; Reset color
-    mov byte [suggestion_buf + rbx], 27
-    mov byte [suggestion_buf + rbx + 1], '['
-    mov byte [suggestion_buf + rbx + 2], '0'
-    mov byte [suggestion_buf + rbx + 3], 'm'
-    add rbx, 4
-
-    ; Now process remaining characters with context coloring
-    mov rcx, r14             ; start from after command
-.shl_rest:
+.shl_char:
     cmp rcx, r13
     jge .shl_write_output
     movzx eax, byte [line_buf + rcx]
 
-    ; Check for switch (-x or --x)
+    ; Pipe: reset command flag for next segment
+    cmp al, '|'
+    jne .shl_not_pipe
+    ; Check for || (not a pipe, it's OR)
+    cmp rcx, r13
+    jge .shl_copy_pipe
+    cmp byte [line_buf + rcx + 1], '|'
+    je .shl_copy_pipe
+    ; Single pipe: copy it, set command flag
+    mov [rdi + rbx], al
+    inc rbx
+    inc rcx
+    ; Skip spaces after pipe
+.shl_pipe_skip:
+    cmp rcx, r13
+    jge .shl_write_output
+    cmp byte [line_buf + rcx], ' '
+    jne .shl_pipe_cmd
+    mov byte [rdi + rbx], ' '
+    inc rbx
+    inc rcx
+    jmp .shl_pipe_skip
+.shl_pipe_cmd:
+    mov r15, 1               ; next word is command
+    jmp .shl_char
+.shl_copy_pipe:
+    mov [rdi + rbx], al
+    inc rbx
+    inc rcx
+    jmp .shl_char
+
+.shl_not_pipe:
+    ; Semicolon: also starts new command
+    cmp al, ';'
+    jne .shl_not_semi
+    mov [rdi + rbx], al
+    inc rbx
+    inc rcx
+    mov r15, 1
+    jmp .shl_char
+.shl_not_semi:
+
+    ; Space: just copy
+    cmp al, ' '
+    jne .shl_not_space
+    mov [rdi + rbx], al
+    inc rbx
+    inc rcx
+    jmp .shl_char
+.shl_not_space:
+
+    ; If this is a command position (r15=1), color the word
+    test r15, r15
+    jz .shl_not_cmd
+
+    ; Determine command color
+    mov r14, rcx             ; save word start
+    ; Find word end
+.shl_cmd_end:
+    cmp rcx, r13
+    jge .shl_cmd_color
+    cmp byte [line_buf + rcx], ' '
+    je .shl_cmd_color
+    cmp byte [line_buf + rcx], '|'
+    je .shl_cmd_color
+    cmp byte [line_buf + rcx], ';'
+    je .shl_cmd_color
+    inc rcx
+    jmp .shl_cmd_end
+.shl_cmd_color:
+    ; rcx = word end, r14 = word start
+    push rcx
+    ; Pick color based on first char
+    movzx eax, byte [color_settings + C_CMD]
+    cmp byte [line_buf + r14], ':'
+    jne .shl_cmd_def
+    movzx eax, byte [color_settings + C_COLON]
+.shl_cmd_def:
+    ; Write color
+    push rax
+    lea rdi, [suggestion_buf + rbx]
+    call write_fg_color
+    add rbx, rax
+    pop rax
+    ; Copy word
+    lea rdi, [suggestion_buf]
+    pop rcx
+    push rcx
+    mov rdx, r14
+.shl_cmd_copy:
+    cmp rdx, rcx
+    jge .shl_cmd_reset
+    movzx eax, byte [line_buf + rdx]
+    mov [rdi + rbx], al
+    inc rbx
+    inc rdx
+    jmp .shl_cmd_copy
+.shl_cmd_reset:
+    ; Reset color
+    mov byte [rdi + rbx], 27
+    mov byte [rdi + rbx + 1], '['
+    mov byte [rdi + rbx + 2], '0'
+    mov byte [rdi + rbx + 3], 'm'
+    add rbx, 4
+    pop rcx
+    mov r15, 0               ; no longer in command position
+    jmp .shl_char
+
+.shl_not_cmd:
+    ; Switch coloring (-x or --x)
     cmp al, '-'
     jne .shl_not_switch
-    ; Check if preceded by space (or at start of args)
     test rcx, rcx
     jz .shl_not_switch
     cmp byte [line_buf + rcx - 1], ' '
     jne .shl_not_switch
-    ; Write switch color
+    ; Color switch
     push rcx
     movzx eax, byte [color_settings + C_SWITCH]
     lea rdi, [suggestion_buf + rbx]
     call write_fg_color
     add rbx, rax
     pop rcx
-    ; Copy switch chars until space
-.shl_switch_chars:
+    lea rdi, [suggestion_buf]
+.shl_sw_ch:
     cmp rcx, r13
-    jge .shl_reset_after
-    cmp byte [line_buf + rcx], ' '
-    je .shl_reset_after
+    jge .shl_sw_reset
     movzx eax, byte [line_buf + rcx]
-    mov [suggestion_buf + rbx], al
+    cmp al, ' '
+    je .shl_sw_reset
+    mov [rdi + rbx], al
     inc rbx
     inc rcx
-    jmp .shl_switch_chars
-.shl_reset_after:
-    ; Reset
-    mov byte [suggestion_buf + rbx], 27
-    mov byte [suggestion_buf + rbx + 1], '['
-    mov byte [suggestion_buf + rbx + 2], '0'
-    mov byte [suggestion_buf + rbx + 3], 'm'
+    jmp .shl_sw_ch
+.shl_sw_reset:
+    mov byte [rdi + rbx], 27
+    mov byte [rdi + rbx + 1], '['
+    mov byte [rdi + rbx + 2], '0'
+    mov byte [rdi + rbx + 3], 'm'
     add rbx, 4
-    jmp .shl_rest
+    jmp .shl_char
 
 .shl_not_switch:
-    ; Check for path (contains /)
-    cmp al, '/'
-    jne .shl_not_path
-    cmp byte [line_buf + rcx - 1], ' '
-    jne .shl_not_path_start
-    ; Color as path
-    push rcx
-    movzx eax, byte [color_settings + C_PATH]
-    lea rdi, [suggestion_buf + rbx]
-    call write_fg_color
-    add rbx, rax
-    pop rcx
-.shl_not_path_start:
-.shl_not_path:
-    ; Default: copy character
-    mov [suggestion_buf + rbx], al
+    ; Default: copy character as-is
+    lea rdi, [suggestion_buf]
+    mov [rdi + rbx], al
     inc rbx
     inc rcx
-    jmp .shl_rest
+    jmp .shl_char
 
 .shl_write_output:
+    lea rdi, [suggestion_buf]
     ; Final reset
-    mov byte [suggestion_buf + rbx], 27
-    mov byte [suggestion_buf + rbx + 1], '['
-    mov byte [suggestion_buf + rbx + 2], '0'
-    mov byte [suggestion_buf + rbx + 3], 'm'
+    mov byte [rdi + rbx], 27
+    mov byte [rdi + rbx + 1], '['
+    mov byte [rdi + rbx + 2], '0'
+    mov byte [rdi + rbx + 3], 'm'
     add rbx, 4
-
-    ; Write the highlighted output
+    ; Write
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [suggestion_buf]
@@ -10945,6 +10950,7 @@ syntax_highlight_line:
     syscall
 
 .shl_done:
+    pop r15
     pop r14
     pop r13
     pop r12
