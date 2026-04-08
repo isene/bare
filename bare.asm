@@ -3284,18 +3284,71 @@ parse_and_exec_simple:
     jz .child_exec
     js .fork_error
 
-    ; Parent: set cooked terminal with ISIG so Ctrl-Z works on child
+    ; Parent: wait for child, handling Ctrl-Z from raw stdin
     mov [child_pid], rax
     mov r13, rax             ; save child pid
-    call enable_cooked_mode
+    ; Stay in raw mode - we'll handle Ctrl-Z ourselves
     sub rsp, 16
 .paes_wait:
+    ; Non-blocking check if child has exited/stopped
     mov rdi, r13
     lea rsi, [rsp]
-    mov edx, WUNTRACED
+    mov edx, WNOHANG | WUNTRACED
     xor r10d, r10d
     mov rax, SYS_WAIT4
     syscall
+    ; rax > 0: child changed state
+    cmp rax, 0
+    jg .paes_child_changed
+    ; rax == 0: child still running, check stdin for Ctrl-Z/Ctrl-C
+    ; Use a short read with timeout (set VMIN=0, VTIME=1 = 100ms)
+    push r13
+    mov byte [raw_termios + 17 + VMIN], 0
+    mov byte [raw_termios + 17 + VTIME], 1
+    mov rax, SYS_IOCTL
+    xor edi, edi
+    mov esi, TCSETSW
+    lea rdx, [raw_termios]
+    syscall
+    ; Try to read one byte
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    ; Restore VMIN=1, VTIME=0
+    mov byte [raw_termios + 17 + VMIN], 1
+    mov byte [raw_termios + 17 + VTIME], 0
+    mov rax, SYS_IOCTL
+    xor edi, edi
+    mov esi, TCSETSW
+    lea rdx, [raw_termios]
+    syscall
+    pop r13
+    ; Check what we got
+    cmp byte [tmp_buf], 26   ; Ctrl-Z
+    je .paes_send_tstp
+    cmp byte [tmp_buf], 3    ; Ctrl-C
+    je .paes_send_int
+    jmp .paes_wait
+
+.paes_send_tstp:
+    ; Send SIGTSTP to child
+    mov rax, SYS_KILL
+    mov rdi, r13
+    mov rsi, SIGTSTP
+    syscall
+    jmp .paes_wait
+
+.paes_send_int:
+    ; Send SIGINT to child
+    mov rax, SYS_KILL
+    mov rdi, r13
+    mov rsi, SIGINT
+    syscall
+    jmp .paes_wait
+
+.paes_child_changed:
     ; Check if child was stopped (WIFSTOPPED: status & 0xFF == 0x7F)
     mov eax, [rsp]
     mov ecx, eax
@@ -3307,13 +3360,11 @@ parse_and_exec_simple:
     and eax, 0xFF
     mov [last_status], rax
     add rsp, 16
-    call enable_raw_mode
     jmp .paes_done
 
 .paes_stopped:
     ; Child was stopped by Ctrl-Z, add to job table
     add rsp, 16
-    call enable_raw_mode
     mov rdi, r13             ; pid
     lea rsi, [line_buf]      ; command string
     call add_job
