@@ -3661,100 +3661,19 @@ parse_and_exec_simple:
     jz .child_exec
     js .fork_error
 
-    ; Parent: wait for child, handling Ctrl-Z from raw stdin
+    ; Parent: set cooked mode so child gets normal terminal, then block wait
     mov [child_pid], rax
     mov r13, rax             ; save child pid
-    ; Re-enable raw mode (read_line restores termios before returning)
-    call enable_raw_mode
+    call enable_cooked_mode  ; ICANON + ECHO + ISIG for child
     sub rsp, 16
-.paes_wait:
-    ; Non-blocking check if child has exited/stopped
-    mov rdi, r13
-    lea rsi, [rsp]
-    mov edx, WNOHANG | WUNTRACED
-    xor r10d, r10d
-    mov rax, SYS_WAIT4
-    syscall
-    ; rax > 0: child changed state
-    cmp rax, 0
-    jg .paes_child_changed
-    ; rax == 0: child still running, check stdin for Ctrl-Z/Ctrl-C
-    ; Only poll stdin in interactive (TTY) mode
-    cmp qword [is_tty], 0
-    je .paes_no_input_notty
-    push r13
-    sub rsp, 8
-    mov rax, SYS_IOCTL
-    xor edi, edi             ; stdin
-    mov esi, 0x541B          ; FIONREAD
-    mov rdx, rsp
-    syscall
-    mov eax, [rsp]           ; bytes available
-    add rsp, 8
-    test eax, eax
-    jz .paes_no_input
-    ; Data available, read one byte
-    mov rax, SYS_READ
-    xor edi, edi
-    lea rsi, [tmp_buf]
-    mov rdx, 1
-    syscall
-    cmp rax, 1
-    jne .paes_no_input
-    ; Check what we got
-    movzx eax, byte [tmp_buf]
-    cmp al, 26               ; Ctrl-Z
-    je .paes_send_tstp_pop
-    cmp al, 3                ; Ctrl-C
-    je .paes_send_int_pop
-.paes_no_input_notty:
-    ; Non-TTY: blocking wait
+    ; Blocking wait with WUNTRACED (detect Ctrl-Z via ISIG)
     mov rdi, r13
     lea rsi, [rsp]
     mov edx, WUNTRACED
     xor r10d, r10d
     mov rax, SYS_WAIT4
     syscall
-    jmp .paes_child_changed
 
-.paes_no_input:
-    pop r13
-    ; Small sleep to avoid busy-waiting (1ms via nanosleep)
-    sub rsp, 16
-    mov qword [rsp], 0       ; tv_sec = 0
-    mov qword [rsp+8], 1000000  ; tv_nsec = 1ms
-    mov rax, 35              ; SYS_NANOSLEEP
-    mov rdi, rsp
-    xor esi, esi
-    syscall
-    add rsp, 16
-    jmp .paes_wait
-
-.paes_send_tstp_pop:
-    pop r13
-    jmp .paes_send_tstp
-
-.paes_send_int_pop:
-    pop r13
-    jmp .paes_send_int
-
-.paes_send_tstp:
-    ; Send SIGSTOP to child (cannot be caught/ignored, unlike SIGTSTP)
-    mov rdi, r13
-    mov rsi, 19              ; SIGSTOP = 19
-    mov rax, SYS_KILL
-    syscall
-    jmp .paes_wait
-
-.paes_send_int:
-    ; Send SIGINT to child
-    mov rax, SYS_KILL
-    mov rdi, r13
-    mov rsi, SIGINT
-    syscall
-    jmp .paes_wait
-
-.paes_child_changed:
     ; Check if child was stopped (WIFSTOPPED: status & 0xFF == 0x7F)
     mov eax, [rsp]
     mov ecx, eax
@@ -3766,11 +3685,13 @@ parse_and_exec_simple:
     and eax, 0xFF
     mov [last_status], rax
     add rsp, 16
+    call enable_raw_mode
     jmp .paes_done
 
 .paes_stopped:
     ; Child was stopped by Ctrl-Z, add to job table
     add rsp, 16
+    call enable_raw_mode
     mov rdi, r13             ; pid
     lea rsi, [line_buf]      ; command string
     call add_job
