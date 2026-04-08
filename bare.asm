@@ -7325,6 +7325,14 @@ print_prompt_dynamic:
     inc r12
     jmp .ppd_copy_full_cwd
 .ppd_cwd_done:
+    ; Add trailing / to indicate directory
+    cmp r12, 1
+    jle .ppd_skip_slash       ; don't add to bare "/" root
+    cmp byte [tmp_buf + r12 - 1], '/'
+    je .ppd_skip_slash        ; already has slash
+    mov byte [tmp_buf + r12], '/'
+    inc r12
+.ppd_skip_slash:
 
     ; Try to detect git branch
     call detect_git_branch
