@@ -8698,7 +8698,7 @@ expand_braces:
 ; ══════════════════════════════════════════════════════════════════════
 try_expand_abbrev:
     push rbx
-    push r12
+    ; NOTE: r12 is NOT saved - we intentionally update the caller's cursor
     push r13
     push r14
 
@@ -8843,7 +8843,6 @@ try_expand_abbrev:
     mov rax, 1
     pop r14
     pop r13
-    pop r12
     pop rbx
     ret
 
@@ -8851,7 +8850,6 @@ try_expand_abbrev:
     xor eax, eax
     pop r14
     pop r13
-    pop r12
     pop rbx
     ret
 
