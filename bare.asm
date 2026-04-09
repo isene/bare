@@ -439,18 +439,21 @@ nick_names:     resq MAX_NICKS          ; pointers to name strings
 nick_values:    resq MAX_NICKS          ; pointers to expansion strings
 nick_count:     resq 1
 nick_storage:   resb MAX_NICK_STORAGE
+nick_storage_pos: resq 1               ; next free byte in storage
 
 ; Global nick aliases
 gnick_names:    resq MAX_GNICKS
 gnick_values:   resq MAX_GNICKS
 gnick_count:    resq 1
 gnick_storage:  resb MAX_GNICK_STORAGE
+gnick_storage_pos: resq 1
 
 ; Abbreviations
 abbrev_names:   resq MAX_ABBREVS
 abbrev_values:  resq MAX_ABBREVS
 abbrev_count:   resq 1
 abbrev_storage: resb MAX_ABBREV_STORAGE
+abbrev_storage_pos: resq 1
 
 ; Bookmarks
 bm_names:       resq MAX_BOOKMARKS      ; name strings
@@ -3676,12 +3679,16 @@ parse_and_exec_simple:
     call expand_nicks
     test rax, rax
     jz .paes_no_nick
-    ; Nick was expanded, re-parse and re-execute
-    mov rdi, line_buf
-    pop r13
-    pop r12
-    pop rbx
-    jmp parse_and_exec_simple
+    ; Nick was expanded, re-parse argv from updated line_buf
+    mov qword [redir_out], 0
+    mov qword [redir_in], 0
+    mov qword [redir_append], 0
+    lea rsi, [line_buf]
+    call parse_argv
+    cmp qword [argc], 0
+    je .paes_done
+    call glob_expand_argv
+    ; Don't expand nicks again (prevents recursion)
 .paes_no_nick:
 
     ; Check builtins (use expanded_argv if glob expanded)
@@ -3701,6 +3708,8 @@ parse_and_exec_simple:
     lea r13, [argv_ptrs]
 .paes_chk_bm:
     mov rdi, [r13]
+    test rdi, rdi
+    jz .paes_done
     xor rcx, rcx
 .paes_bm_loop:
     cmp rcx, [bm_count]
@@ -6715,19 +6724,9 @@ config_add_nick:
     mov rax, [nick_count]
     cmp rax, MAX_NICKS
     jge .can_done
-    ; Calculate storage position
+    ; Get storage position
     lea rbx, [nick_storage]
-    ; Find end of current storage
-    mov rcx, rax
-    test rcx, rcx
-    jz .can_store
-    ; Walk to end of last value
-    mov rdi, [nick_values + rcx*8 - 8]
-    call strlen
-    add rdi, rax
-    inc rdi                 ; past null
-    mov rbx, rdi
-    jmp .can_store
+    add rbx, [nick_storage_pos]
 .can_store:
     ; Copy name
     mov [nick_names + rax*8], rbx
@@ -6755,6 +6754,11 @@ config_add_nick:
     inc rbx
     jmp .can_copy_val
 .can_val_done:
+    ; Update storage position
+    inc rbx                  ; past null
+    lea rax, [rbx]
+    sub rax, nick_storage
+    mov [nick_storage_pos], rax
     inc qword [nick_count]
 .can_done:
     pop r13
@@ -6773,14 +6777,7 @@ config_add_gnick:
     cmp rax, MAX_GNICKS
     jge .cag_done
     lea rbx, [gnick_storage]
-    mov rcx, rax
-    test rcx, rcx
-    jz .cag_store
-    mov rdi, [gnick_values + rcx*8 - 8]
-    call strlen
-    add rdi, rax
-    inc rdi
-    mov rbx, rdi
+    add rbx, [gnick_storage_pos]
 .cag_store:
     mov rax, [gnick_count]
     mov [gnick_names + rax*8], rbx
@@ -6807,6 +6804,10 @@ config_add_gnick:
     inc rbx
     jmp .cag_copy_val
 .cag_val_done:
+    inc rbx
+    lea rax, [rbx]
+    sub rax, gnick_storage
+    mov [gnick_storage_pos], rax
     inc qword [gnick_count]
 .cag_done:
     pop r13
@@ -6825,14 +6826,7 @@ config_add_abbrev:
     cmp rax, MAX_ABBREVS
     jge .cab_done
     lea rbx, [abbrev_storage]
-    mov rcx, rax
-    test rcx, rcx
-    jz .cab_store
-    mov rdi, [abbrev_values + rcx*8 - 8]
-    call strlen
-    add rdi, rax
-    inc rdi
-    mov rbx, rdi
+    add rbx, [abbrev_storage_pos]
 .cab_store:
     mov rax, [abbrev_count]
     mov [abbrev_names + rax*8], rbx
@@ -6859,6 +6853,10 @@ config_add_abbrev:
     inc rbx
     jmp .cab_copy_val
 .cab_val_done:
+    inc rbx
+    lea rax, [rbx]
+    sub rax, abbrev_storage
+    mov [abbrev_storage_pos], rax
     inc qword [abbrev_count]
 .cab_done:
     pop r13
@@ -7515,6 +7513,26 @@ expand_nicks:
     jmp .en_search
 
 .en_found:
+    ; Guard: if expansion's first word equals the nick name, skip (prevent recursion)
+    mov rsi, [nick_values + rcx*8]
+    mov rdi, [nick_names + rcx*8]
+.en_guard_cmp:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .en_guard_check
+    cmp al, [rsi]
+    jne .en_do_expand         ; different, safe to expand
+    inc rdi
+    inc rsi
+    jmp .en_guard_cmp
+.en_guard_check:
+    movzx eax, byte [rsi]
+    cmp al, ' '
+    je .en_no                 ; self-referencing, skip
+    test al, al
+    je .en_no                 ; exact match, skip
+
+.en_do_expand:
     ; Build expanded line: nick_value + rest of original args
     lea rdi, [nick_expand_buf]
     mov rsi, [nick_values + rcx*8]
