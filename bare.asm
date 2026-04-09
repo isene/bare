@@ -7286,10 +7286,10 @@ print_prompt_dynamic:
     mov byte [tmp_buf + r12 + 3], '1'
     mov byte [tmp_buf + r12 + 4], 'm'
     add r12, 5
-    ; Unicode bullet (U+25CF = E2 97 8F)
+    ; Unicode bullet (U+2022 = E2 80 A2)
     mov byte [tmp_buf + r12], 0xE2
-    mov byte [tmp_buf + r12 + 1], 0x97
-    mov byte [tmp_buf + r12 + 2], 0x8F
+    mov byte [tmp_buf + r12 + 1], 0x80
+    mov byte [tmp_buf + r12 + 2], 0xA2
     add r12, 3
     jmp .ppd_git_reset
 .ppd_git_clean:
