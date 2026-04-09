@@ -5530,11 +5530,11 @@ tab_complete_file:
 
 .tcf_match_f:
     pop rdi
-    ; Save d_type: it's at rdi - DIRENT64_D_NAME + DIRENT64_D_TYPE = rdi - 1
-    movzx eax, byte [rdi - 1]    ; d_type is 1 byte before d_name
-    push rax                      ; save d_type
+    ; Save d_type from dirent (1 byte before d_name)
+    movzx eax, byte [rdi - 1]
+    mov [.tcf_saved_dtype], al
     cmp qword [tab_count], MAX_TAB_RESULTS - 1
-    jge .tcf_skip_f_dtype
+    jge .tcf_skip_f
 
     ; Copy name to tab_buf
     mov rcx, [tab_buf_pos]
@@ -5580,22 +5580,19 @@ tab_complete_file:
     lea rax, [tab_buf + rdx]
     mov rcx, [tab_count]
     mov [tab_results + rcx*8], rax
-    ; Store d_type (saved on stack before the copy)
-    push rax                      ; save tab entry pointer
-    mov rax, [rsp + 8]            ; d_type from stack (pushed earlier, now +8 due to push)
+    ; Store d_type
+    movzx eax, byte [.tcf_saved_dtype]
     mov byte [tab_types + rcx], al
-    pop rdi                       ; restore tab entry pointer
+    mov rdi, [tab_results + rcx*8]  ; restore entry pointer for strlen
     inc qword [tab_count]
     ; Calculate new buf_pos: find end of what we wrote
     call strlen
     inc rax
     add [tab_buf_pos], rax
-    jmp .tcf_skip_f_dtype
+    jmp .tcf_skip_f
 
 .tcf_no_match_f:
     pop rdi
-.tcf_skip_f_dtype:
-    pop rax                  ; discard d_type
 .tcf_skip_f:
     pop rdx
     pop rcx
@@ -5615,6 +5612,7 @@ tab_complete_file:
     pop r12
     pop rbx
     ret
+.tcf_saved_dtype: db 0
 
 ; Find longest common prefix among all tab results
 ; Returns: rax = length of common prefix
