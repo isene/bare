@@ -532,6 +532,7 @@ cmd_flag:       resq 1              ; pointer to -c command string
 time_flag:      resq 1              ; 1 if "time" prefix was used
 git_status_cached: resb 1           ; cached git dirty result (0=clean, 1=dirty)
 git_status_cache_time: resq 1       ; monotonic time of last fork check
+git_root_buf:   resb 4096           ; path to git repo root (where .git/ is)
 
 ; Previous directory for cd -
 prev_dir:       resb 4096
@@ -7763,6 +7764,12 @@ detect_git_branch:
     jmp .dgb_try
 
 .dgb_found_file:
+    ; Save git root path (r12 points to the dir containing .git)
+    push rax
+    lea rdi, [git_root_buf]
+    mov rsi, r12
+    call strcpy_rsi_rdi
+    pop rax
     mov rbx, rax            ; fd
     mov rax, SYS_READ
     mov rdi, rbx
@@ -13209,19 +13216,35 @@ check_git_dirty:
     sub rsp, 288
 
     ; Quick stat check first (free, no fork)
-    lea rdi, [.cgd_index]
+    ; Build full path: git_root_buf + /.git/index
+    lea rdi, [path_buf]
+    lea rsi, [git_root_buf]
+    cmp byte [rsi], 0
+    je .cgd_clean             ; no git root known
+    call strcpy_rsi_rdi
+    lea rdi, [path_buf + rax]
+    lea rsi, [.cgd_index]
+    call strcpy_rsi_rdi
+    lea rdi, [path_buf]
     mov rsi, rsp
     mov rax, SYS_STAT
     syscall
     test rax, rax
-    js .cgd_clean             ; no .git/index, not a git repo
+    js .cgd_clean
 
     mov r12, [rsp + 88]       ; index mtime
 
-    ; Build ref path
+    ; Build ref path: git_root_buf + /.git/refs/heads/<branch>
     lea rdi, [path_buf]
+    lea rsi, [git_root_buf]
+    call strcpy_rsi_rdi
+    lea rdi, [path_buf + rax]
     lea rsi, [.cgd_refs_prefix]
     call strcpy_rsi_rdi
+    lea rdi, [path_buf + rax]
+    ; recalculate full offset
+    lea rdi, [path_buf]
+    call strlen
     lea rdi, [path_buf + rax]
     lea rsi, [git_branch_buf]
 .cgd_cp_branch:
@@ -13350,6 +13373,10 @@ check_git_dirty:
     ret
 
 .cgd_child:
+    ; cd to git root so git status works from subdirectories
+    mov rax, SYS_CHDIR
+    lea rdi, [git_root_buf]
+    syscall
     ; Redirect stdout to pipe write end
     mov rax, SYS_DUP2
     mov edi, [pipe_fds + 4]
@@ -13407,8 +13434,8 @@ check_git_dirty:
     pop rbx
     ret
 
-.cgd_index: db ".git/index", 0
-.cgd_refs_prefix: db ".git/refs/heads/", 0
+.cgd_index: db "/.git/index", 0
+.cgd_refs_prefix: db "/.git/refs/heads/", 0
 .cgd_git: db "/usr/bin/git", 0
 .cgd_status: db "status", 0
 .cgd_porcelain: db "--porcelain", 0
