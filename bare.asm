@@ -85,7 +85,7 @@ DEFAULT REL
 
 ; Max constants
 %define MAX_ENV_ENTRIES 256
-%define MAX_ENV_STORAGE 8192
+%define MAX_ENV_STORAGE 16384
 %define MAX_GLOB_RESULTS 256
 %define MAX_GLOB_BUF 16384
 %define MAX_TAB_RESULTS 128
@@ -341,8 +341,8 @@ is_tty:         resq 1
 input_buf:      resb 4096
 input_len:      resq 1
 
-; Line editing buffer
-line_buf:       resb 4096
+; Line editing buffer (16KB to handle large exports like LS_COLORS)
+line_buf:       resb 16384
 line_len:       resq 1
 cursor_pos:     resq 1
 
@@ -847,7 +847,7 @@ read_line:
     cmp byte [line_buf + r12], 10
     je .rl_pipe_done
     inc r12
-    cmp r12, 4094
+    cmp r12, 16382
     jl .rl_pipe_read
 .rl_pipe_done:
     mov byte [line_buf + r12], 0
@@ -989,7 +989,7 @@ read_line:
     mov qword [hist_prefix_len], 0
 
     ; Regular character: insert at cursor
-    cmp r12, 4094
+    cmp r12, 16382
     jge .read_char          ; buffer full
 
     ; Shift chars right if cursor not at end
@@ -1399,7 +1399,7 @@ read_line:
     mov rax, SYS_READ
     mov rdi, rbx
     lea rsi, [line_buf]
-    mov rdx, 4094
+    mov rdx, 16382
     syscall
     push rax
     mov rax, SYS_CLOSE
@@ -1730,7 +1730,7 @@ read_line:
 .as_copy:
     test rcx, rcx
     jz .as_done
-    cmp rdi, 4094
+    cmp rdi, 16382
     jge .as_done
     movzx eax, byte [rsi]
     mov [line_buf + rdi], al
@@ -2511,7 +2511,7 @@ load_hist_line:
     jz .lhl_done
     mov [rdi + rcx], al
     inc rcx
-    cmp rcx, 4094
+    cmp rcx, 16382
     jge .lhl_done
     jmp .lhl_copy
 .lhl_done:
@@ -11757,6 +11757,22 @@ source_file:
     jmp .sf_copy
 .sf_exec:
     mov [line_len], rcx
+    ; Check if line starts with "export " - handle directly to avoid ; splitting
+    cmp dword [line_buf], 'expo'
+    jne .sf_normal_exec
+    cmp word [line_buf + 4], 'rt'
+    jne .sf_normal_exec
+    cmp byte [line_buf + 6], ' '
+    jne .sf_normal_exec
+    ; Direct export: pass VAR=VALUE to env_set_entry
+    lea rdi, [line_buf + 7]
+    push r12
+    push r13
+    push rbx
+    call env_set_entry
+    jmp .sf_exec_done
+
+.sf_normal_exec:
     ; Expand and execute
     push r12
     push r13
@@ -11764,6 +11780,7 @@ source_file:
     call expand_line
     mov rdi, line_buf
     call execute_chained_line
+.sf_exec_done:
     pop rbx
     pop r13
     pop r12
