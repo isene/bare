@@ -2402,8 +2402,14 @@ read_line:
 
 .tab_multiple:
     ; ── Interactive tab cycling ──
-    ; Display matches below prompt line, highlight current selection
-    ; TAB = next, Shift-TAB = prev, Enter/Space = accept, Esc = cancel
+    ; Limit displayed matches to completion_limit
+    mov rax, [completion_limit]
+    test rax, rax
+    jz .tab_done              ; limit 0 = disabled
+    cmp [tab_count], rax
+    jle .tab_count_ok
+    mov [tab_count], rax      ; cap to limit
+.tab_count_ok:
     xor r15, r15             ; r15 = current selection index
 
 .tab_cycle_redraw:
@@ -2558,17 +2564,12 @@ read_line:
     dec r15                  ; wrap to last
 
 .tab_cycle_erase:
-    ; Move to matches line (down) and clear it
+    ; Move down to matches area and clear everything below
     call write_nl
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [.tab_cr]
-    mov rdx, 1
-    syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [clr_eol_global]
-    mov rdx, clr_eol_len
+    lea rsi, [.tab_clr_below]
+    mov rdx, .tab_clr_below_len
     syscall
     ; Move back up
     mov rax, SYS_WRITE
@@ -2631,17 +2632,12 @@ read_line:
 
 .tab_cycle_cleanup:
 .tab_cycle_cleanup_noread:
-    ; Clear the matches line below
+    ; Clear everything below prompt line
     call write_nl
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [.tab_cr]
-    mov rdx, 1
-    syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [clr_eol_global]
-    mov rdx, clr_eol_len
+    lea rsi, [.tab_clr_below]
+    mov rdx, .tab_clr_below_len
     syscall
     ; Move back up
     mov rax, SYS_WRITE
@@ -2660,6 +2656,8 @@ read_line:
 
 .tab_up_cr: db 27, "[A", 13        ; cursor up + carriage return
 .tab_cr: db 13
+.tab_clr_below: db 13, 27, "[J"   ; CR + clear from cursor to end of screen
+.tab_clr_below_len equ $ - .tab_clr_below
 
 ; Preview selection: save original line, replace word with selected match
 .tab_preview_selection:
