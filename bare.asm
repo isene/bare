@@ -1805,8 +1805,12 @@ read_line:
 
 .hist_prev:
     ; If line has content and prefix not yet saved, save it for prefix search
+    ; But only if we haven't started navigating history yet (hist_pos == hist_count)
     cmp qword [hist_prefix_len], 0
     jne .hp_have_prefix
+    mov rax, [hist_pos]
+    cmp rax, [hist_count]
+    jne .hp_no_prefix         ; already navigating, don't save prefix
     mov rax, [line_len]
     test rax, rax
     jz .hp_no_prefix
