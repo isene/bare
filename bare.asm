@@ -801,6 +801,9 @@ _start:
     call show_rprompt
 .skip_rprompt:
 
+    ; Check ~/.pointer/lastdir for file manager auto-cd
+    call check_lastdir
+
     jmp .main_loop
 
 .eof:
@@ -12789,3 +12792,106 @@ check_git_dirty:
 
 .cgd_index: db ".git/index", 0
 .cgd_refs_prefix: db ".git/refs/heads/", 0
+
+; ══════════════════════════════════════════════════════════════════════
+; Check ~/.pointer/lastdir after command execution
+; If file was modified within last 2 seconds, cd to its content
+; ══════════════════════════════════════════════════════════════════════
+check_lastdir:
+    push rbx
+    push r12
+
+    ; Build path: $HOME/.pointer/lastdir
+    mov rdi, [envp]
+    call find_env_home
+    test rax, rax
+    jz .cld_done
+
+    lea rdi, [path_buf]
+    mov rsi, rax
+    call strcpy_rsi_rdi
+    lea rdi, [path_buf + rax]
+    lea rsi, [.cld_suffix]
+    call strcpy_rsi_rdi
+
+    ; Stat the file
+    sub rsp, 144
+    mov rax, SYS_STAT
+    lea rdi, [path_buf]
+    mov rsi, rsp
+    syscall
+    test rax, rax
+    js .cld_no_file
+
+    ; Check mtime: compare with current time
+    mov r12, [rsp + 88]       ; st_mtim.tv_sec
+    add rsp, 144
+
+    ; Get current time
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    lea rsi, [rsp]
+    syscall
+    ; Use realtime clock instead for file mtime comparison
+    mov rax, 228              ; SYS_CLOCK_GETTIME
+    xor edi, edi              ; CLOCK_REALTIME = 0
+    lea rsi, [rsp]
+    syscall
+    mov rbx, [rsp]            ; current time
+    add rsp, 16
+
+    ; Age = current - mtime
+    sub rbx, r12
+    cmp rbx, 2
+    jg .cld_done              ; older than 2 seconds, skip
+
+    ; Read the file content
+    mov rax, SYS_OPEN
+    lea rdi, [path_buf]
+    xor esi, esi              ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .cld_done
+    mov rbx, rax              ; fd
+
+    mov rax, SYS_READ
+    mov rdi, rbx
+    lea rsi, [suggestion_buf]
+    mov rdx, 4095
+    syscall
+    push rax
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+    pop rax
+    test rax, rax
+    jle .cld_done
+
+    ; Null-terminate and strip trailing newline
+    mov byte [suggestion_buf + rax], 0
+    dec rax
+    cmp byte [suggestion_buf + rax], 10
+    jne .cld_no_strip
+    mov byte [suggestion_buf + rax], 0
+.cld_no_strip:
+
+    ; cd to the directory
+    mov rax, SYS_CHDIR
+    lea rdi, [suggestion_buf]
+    syscall
+    test rax, rax
+    js .cld_done
+    call update_cwd
+    call add_dir_history
+    jmp .cld_done
+
+.cld_no_file:
+    add rsp, 144
+.cld_done:
+    pop r12
+    pop rbx
+    ret
+
+.cld_suffix: db "/.pointer/lastdir", 0
