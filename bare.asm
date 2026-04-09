@@ -118,7 +118,9 @@ DEFAULT REL
 %define C_TABSEL   13
 %define C_TABOPT   14
 %define C_SUGGEST  15
-%define NUM_COLORS 16
+%define C_USER_ROOT 16
+%define C_HOST_ROOT 17
+%define NUM_COLORS 18
 
 ; Config flag bits
 %define CFG_AUTO_CORRECT      0
@@ -275,12 +277,13 @@ theme_names:
 
 theme_data:
 ; default:    user host cwd  prompt cmd nick gnick path switch bm  colon git stamp tabsel tabopt suggest
-.td_default:   db 2,  2,  81, 208, 48,  6,  33,   3,   6,    5,  4,   208, 245,  7,   245,  240
-.td_solarized: db 64, 64, 37, 136, 33,  37, 33,   136, 37,   125,33,  166, 245,  7,   245,  240
-.td_dracula:   db 84, 84, 141,212, 84,  117,189,  228, 117,  212,189, 215, 245,  7,   245,  240
-.td_gruvbox:   db 142,142,214,208, 142, 108,109,  223, 108,  175,109, 208, 245,  7,   245,  240
-.td_nord:      db 110,110,111,173, 110, 110,111,  222, 110,  139,111, 173, 245,  7,   245,  240
-.td_monokai:   db 148,148,81, 208, 148, 81, 141,  228, 81,   197,141, 208, 245,  7,   245,  240
+; Indices: user host cwd prompt cmd nick gnick path switch bm colon git stamp tabsel tabopt suggest user_root host_root
+.td_default:   db 2,  2,  81, 208, 48,  6,  33,   3,   6,    5,  4,   208, 245,  7,   245,  240, 196, 196
+.td_solarized: db 64, 64, 37, 136, 33,  37, 33,   136, 37,   125,33,  166, 245,  7,   245,  240, 196, 196
+.td_dracula:   db 84, 84, 141,212, 84,  117,189,  228, 117,  212,189, 215, 245,  7,   245,  240, 196, 196
+.td_gruvbox:   db 142,142,214,208, 142, 108,109,  223, 108,  175,109, 208, 245,  7,   245,  240, 196, 196
+.td_nord:      db 110,110,111,173, 110, 110,111,  222, 110,  139,111, 173, 245,  7,   245,  240, 196, 196
+.td_monokai:   db 148,148,81, 208, 148, 81, 141,  228, 81,   197,141, 208, 245,  7,   245,  240, 196, 196
 
 ; :info text
 info_text:
@@ -6209,6 +6212,8 @@ init_default_colors:
     mov byte [rdi + C_TABSEL], 7      ; white (reverse)
     mov byte [rdi + C_TABOPT], 245    ; gray
     mov byte [rdi + C_SUGGEST], 240   ; dark gray
+    mov byte [rdi + C_USER_ROOT], 196 ; red
+    mov byte [rdi + C_HOST_ROOT], 196 ; red
     ; Default config flags: rprompt on, hist_dedup smart
     mov qword [config_flags], (1 << CFG_RPROMPT) | (1 << CFG_HIST_DEDUP_SMART) | (1 << CFG_AUTO_PAIR) | (1 << CFG_SHOW_TIPS)
     mov qword [completion_limit], 10
@@ -7037,8 +7042,16 @@ print_prompt_dynamic:
     mov rdx, 1
     syscall
 
-    ; Print username with color
+    ; Print username with color (use root colors if UID=0)
+    mov rax, SYS_GETUID
+    syscall
+    test eax, eax
+    jnz .ppd_not_root
+    movzx eax, byte [color_settings + C_USER_ROOT]
+    jmp .ppd_user_color
+.ppd_not_root:
     movzx eax, byte [color_settings + C_USER]
+.ppd_user_color:
     lea rdi, [tmp_buf]
     call write_fg_color
     mov r12, rax            ; length of color escape
@@ -7063,8 +7076,16 @@ print_prompt_dynamic:
     mov byte [tmp_buf + r12], '@'
     inc r12
 
-    ; hostname with color
+    ; hostname with color (root check cached from username)
+    mov rax, SYS_GETUID
+    syscall
+    test eax, eax
+    jnz .ppd_host_not_root
+    movzx eax, byte [color_settings + C_HOST_ROOT]
+    jmp .ppd_host_color
+.ppd_host_not_root:
     movzx eax, byte [color_settings + C_HOST]
+.ppd_host_color:
     lea rdi, [tmp_buf + r12]
     call write_fg_color
     add r12, rax
@@ -10327,6 +10348,7 @@ color_name_table:
     dq cn_cmd, cn_nick, cn_gnick, cn_path
     dq cn_switch, cn_bookmark, cn_colon, cn_git
     dq cn_stamp, cn_tabsel, cn_tabopt, cn_suggest
+    dq cn_user_root, cn_host_root
 cn_user: db "user", 0
 cn_host: db "host", 0
 cn_cwd: db "cwd", 0
@@ -10343,6 +10365,8 @@ cn_stamp: db "stamp", 0
 cn_tabsel: db "tabsel", 0
 cn_tabopt: db "tabopt", 0
 cn_suggest: db "suggest", 0
+cn_user_root: db "user_root", 0
+cn_host_root: db "host_root", 0
 
 hcfg_header: db "Configuration:", 10
 hcfg_header_len equ $ - hcfg_header
