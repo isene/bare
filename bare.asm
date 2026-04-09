@@ -2347,6 +2347,9 @@ read_line:
     jmp .tab_process_results
 
 .tab_process_results:
+    ; Sort results alphabetically
+    call sort_tab_results
+
     mov rax, [tab_count]
     test rax, rax
     jz .tab_done            ; no matches
@@ -5610,6 +5613,99 @@ tab_complete_command:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; Sort tab_results array alphabetically (insertion sort)
+; Also keeps tab_types in sync with tab_results
+sort_tab_results:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, [tab_count]
+    cmp r12, 2
+    jl .str_done              ; 0 or 1 items, nothing to sort
+
+    mov r13, 1                ; i = 1
+.str_outer:
+    cmp r13, r12
+    jge .str_done
+
+    mov r14, [tab_results + r13*8]  ; key_ptr = tab_results[i]
+    movzx r15d, byte [tab_types + r13] ; key_type = tab_types[i]
+    mov rbx, r13                     ; j = i
+
+.str_inner:
+    test rbx, rbx
+    jz .str_insert
+    ; Compare tab_results[j-1] with key (case-insensitive)
+    mov rdi, [tab_results + rbx*8 - 8]
+    mov rsi, r14
+    call strcasecmp_sort
+    test eax, eax
+    jle .str_insert           ; tab_results[j-1] <= key, stop
+
+    ; Shift tab_results[j-1] and tab_types[j-1] right
+    mov rax, [tab_results + rbx*8 - 8]
+    mov [tab_results + rbx*8], rax
+    movzx eax, byte [tab_types + rbx - 1]
+    mov byte [tab_types + rbx], al
+    dec rbx
+    jmp .str_inner
+
+.str_insert:
+    mov [tab_results + rbx*8], r14
+    mov byte [tab_types + rbx], r15b
+    inc r13
+    jmp .str_outer
+
+.str_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Case-insensitive string compare for sorting
+; rdi = string a, rsi = string b
+; Returns: <0 if a<b, 0 if a==b, >0 if a>b
+strcasecmp_sort:
+    push rbx
+.scs_loop:
+    movzx eax, byte [rdi]
+    movzx ebx, byte [rsi]
+    ; Lowercase both
+    cmp al, 'A'
+    jb .scs_no_lower_a
+    cmp al, 'Z'
+    ja .scs_no_lower_a
+    add al, 32
+.scs_no_lower_a:
+    cmp bl, 'A'
+    jb .scs_no_lower_b
+    cmp bl, 'Z'
+    ja .scs_no_lower_b
+    add bl, 32
+.scs_no_lower_b:
+    cmp al, bl
+    jne .scs_diff
+    test al, al
+    jz .scs_equal
+    inc rdi
+    inc rsi
+    jmp .scs_loop
+.scs_diff:
+    movzx eax, al
+    movzx ebx, bl
+    sub eax, ebx
+    pop rbx
+    ret
+.scs_equal:
+    xor eax, eax
     pop rbx
     ret
 

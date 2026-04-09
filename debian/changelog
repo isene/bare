@@ -1,3 +1,18 @@
+bare (0.2.0-1) unstable; urgency=low
+
+  * Alphabetically sorted tab completions
+  * Full feature parity with rush shell
+  * Git dirty indicator with caching
+  * Interactive tab cycling with LS_COLORS
+  * Syntax highlighting
+  * Job control (Ctrl-Z, fg, bg)
+  * Plugin system with AI integration
+  * Nick, gnick, abbreviation aliases
+  * Bookmarks, sessions, themes
+  * Config auto-save on exit
+
+ -- Geir Isene <g@isene.com>  Wed, 09 Apr 2026 00:00:00 +0000
+
 bare (0.1.0-1) unstable; urgency=low
 
   * Initial release
