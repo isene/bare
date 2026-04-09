@@ -533,6 +533,7 @@ time_flag:      resq 1              ; 1 if "time" prefix was used
 git_status_cached: resb 1           ; cached git dirty result (0=clean, 1=dirty)
 git_status_cache_time: resq 1       ; monotonic time of last fork check
 git_root_buf:   resb 4096           ; path to git repo root (where .git/ is)
+git_root_prev:  resb 4096           ; previous git root (to detect repo change)
 
 ; Previous directory for cd -
 prev_dir:       resb 4096
@@ -13221,6 +13222,20 @@ check_git_dirty:
     push rbx
     push r12
     sub rsp, 288
+
+    ; Invalidate cache if repo root changed
+    lea rdi, [git_root_buf]
+    lea rsi, [git_root_prev]
+    call strcmp
+    test rax, rax
+    jz .cgd_same_repo
+    ; Different repo: reset cache, save new root
+    mov byte [git_status_cached], 0
+    mov qword [git_status_cache_time], 0
+    lea rdi, [git_root_prev]
+    lea rsi, [git_root_buf]
+    call strcpy_rsi_rdi
+.cgd_same_repo:
 
     ; Quick stat check first (free, no fork)
     ; Build full path: git_root_buf + /.git/index
