@@ -131,6 +131,7 @@ DEFAULT REL
 %define CFG_SHOW_CMD          5
 %define CFG_HIST_DEDUP_FULL   6
 %define CFG_HIST_DEDUP_SMART  7
+%define CFG_SHOW_GIT_BRANCH   8
 
 ; Syscalls for timing and terminal size
 %define SYS_CLOCK_GETTIME 228
@@ -6675,7 +6676,7 @@ load_config:
     lea rsi, [.str_auto_pair]
     call strcmp
     test rax, rax
-    jnz .lc_advance         ; unknown key, skip
+    jnz .lc_not_ap
     mov rdi, r14
     mov rsi, CFG_AUTO_PAIR
     call config_set_bool
@@ -6689,6 +6690,18 @@ load_config:
     jmp .lc_done             ; was \0, end of file
 
 .str_auto_pair: db "auto_pair", 0
+
+.lc_not_ap:
+    mov rdi, r12
+    lea rsi, [.str_show_git_branch]
+    call strcmp
+    test rax, rax
+    jnz .lc_advance
+    mov rdi, r14
+    mov rsi, CFG_SHOW_GIT_BRANCH
+    call config_set_bool
+    jmp .lc_advance
+.str_show_git_branch: db "show_git_branch", 0
 
 .lc_skip_newline:
     inc r12
@@ -7215,34 +7228,39 @@ print_prompt_dynamic:
     test rax, rax
     jz .ppd_no_git
 
-    ; " (" + branch + ")"
+    ; Git indicator: " (branch)" or just dirty marker
     ; Reset color first
     lea rdi, [tmp_buf + r12]
     mov dword [rdi], 0x5b1b
     mov byte [rdi+2], '0'
     mov byte [rdi+3], 'm'
     add r12, 4
-    mov word [tmp_buf + r12], ' ('
-    add r12, 2
-    ; Git branch color
+    mov byte [tmp_buf + r12], ' '
+    inc r12
+
+    ; Check if branch name should be shown
+    test qword [config_flags], (1 << CFG_SHOW_GIT_BRANCH)
+    jz .ppd_git_dirty_only
+
+    ; Show "(branch)" with color
+    mov byte [tmp_buf + r12], '('
+    inc r12
     movzx eax, byte [color_settings + C_GIT]
     lea rdi, [tmp_buf + r12]
     call write_fg_color
     add r12, rax
-    ; Copy branch name
     lea rsi, [git_branch_buf]
 .ppd_copy_git:
     mov al, [rsi]
     test al, al
-    jz .ppd_git_done
-    cmp al, 10              ; strip newline
-    je .ppd_git_done
+    jz .ppd_git_branch_done
+    cmp al, 10
+    je .ppd_git_branch_done
     mov [tmp_buf + r12], al
     inc rsi
     inc r12
     jmp .ppd_copy_git
-.ppd_git_done:
-    ; Reset + ")"
+.ppd_git_branch_done:
     lea rdi, [tmp_buf + r12]
     mov dword [rdi], 0x5b1b
     mov byte [rdi+2], '0'
@@ -7250,6 +7268,45 @@ print_prompt_dynamic:
     add r12, 4
     mov byte [tmp_buf + r12], ')'
     inc r12
+
+.ppd_git_dirty_only:
+    ; Check git dirty status: stat .git/index and compare with HEAD ref
+    ; If .git/index mtime > .git/refs/heads/<branch> mtime, show red dot
+    ; Otherwise show green dot
+    call check_git_dirty
+    test rax, rax
+    jz .ppd_git_clean
+    ; Dirty: red dot
+    mov byte [tmp_buf + r12], 27
+    mov byte [tmp_buf + r12 + 1], '['
+    mov byte [tmp_buf + r12 + 2], '3'
+    mov byte [tmp_buf + r12 + 3], '1'
+    mov byte [tmp_buf + r12 + 4], 'm'
+    add r12, 5
+    ; Unicode bullet (U+25CF = E2 97 8F)
+    mov byte [tmp_buf + r12], 0xE2
+    mov byte [tmp_buf + r12 + 1], 0x97
+    mov byte [tmp_buf + r12 + 2], 0x8F
+    add r12, 3
+    jmp .ppd_git_reset
+.ppd_git_clean:
+    ; Clean: green dot
+    mov byte [tmp_buf + r12], 27
+    mov byte [tmp_buf + r12 + 1], '['
+    mov byte [tmp_buf + r12 + 2], '3'
+    mov byte [tmp_buf + r12 + 3], '2'
+    mov byte [tmp_buf + r12 + 4], 'm'
+    add r12, 5
+    mov byte [tmp_buf + r12], 0xE2
+    mov byte [tmp_buf + r12 + 1], 0x97
+    mov byte [tmp_buf + r12 + 2], 0x8F
+    add r12, 3
+.ppd_git_reset:
+    lea rdi, [tmp_buf + r12]
+    mov dword [rdi], 0x5b1b
+    mov byte [rdi+2], '0'
+    mov byte [rdi+3], 'm'
+    add r12, 4
 
 .ppd_no_git:
     ; Reset + " > "
@@ -10272,9 +10329,19 @@ handle_config:
     lea rsi, [hcfg_rprompt_str]
     call strcmp
     test rax, rax
-    jnz .hcfg_done
+    jnz .hcfg_cb5
     mov rdi, [r12 + 16]
     mov rsi, CFG_RPROMPT
+    call config_set_bool
+    jmp .hcfg_done
+.hcfg_cb5:
+    mov rdi, [r12 + 8]
+    lea rsi, [hcfg_show_git_branch]
+    call strcmp
+    test rax, rax
+    jnz .hcfg_done
+    mov rdi, [r12 + 16]
+    mov rsi, CFG_SHOW_GIT_BRANCH
     call config_set_bool
 
 .hcfg_done:
@@ -10442,6 +10509,7 @@ hcfg_show_tips: db "show_tips", 0
 hcfg_auto_correct: db "auto_correct", 0
 hcfg_auto_pair_str: db "auto_pair", 0
 hcfg_rprompt_str: db "rprompt", 0
+hcfg_show_git_branch: db "show_git_branch", 0
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Save config to ~/.barerc
@@ -12651,3 +12719,73 @@ try_run_plugin:
     pop r12
     pop rbx
     ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Check if git working tree is dirty (uncommitted changes)
+; Compares .git/index mtime with HEAD commit ref mtime
+; Returns: rax = 1 if dirty, 0 if clean
+; ══════════════════════════════════════════════════════════════════════
+check_git_dirty:
+    push rbx
+    push r12
+    sub rsp, 288              ; two stat buffers (144 each)
+
+    ; Stat .git/index
+    lea rdi, [.cgd_index]
+    mov rsi, rsp
+    mov rax, SYS_STAT
+    syscall
+    test rax, rax
+    js .cgd_clean             ; no .git/index, consider clean
+
+    ; Save index mtime (st_mtim.tv_sec at offset 88)
+    mov r12, [rsp + 88]
+
+    ; Build ref path: .git/refs/heads/<branch>
+    lea rdi, [path_buf]
+    lea rsi, [.cgd_refs_prefix]
+    call strcpy_rsi_rdi
+    lea rdi, [path_buf + rax]
+    lea rsi, [git_branch_buf]
+.cgd_cp_branch:
+    mov al, [rsi]
+    test al, al
+    jz .cgd_branch_done
+    cmp al, 10
+    je .cgd_branch_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .cgd_cp_branch
+.cgd_branch_done:
+    mov byte [rdi], 0
+
+    ; Stat the ref file
+    lea rdi, [path_buf]
+    lea rsi, [rsp + 144]
+    mov rax, SYS_STAT
+    syscall
+    test rax, rax
+    js .cgd_dirty             ; no ref file, probably dirty
+
+    ; Compare mtimes: if index > ref, dirty
+    mov rbx, [rsp + 144 + 88]  ; ref mtime
+    cmp r12, rbx
+    jg .cgd_dirty
+
+.cgd_clean:
+    xor eax, eax
+    add rsp, 288
+    pop r12
+    pop rbx
+    ret
+
+.cgd_dirty:
+    mov eax, 1
+    add rsp, 288
+    pop r12
+    pop rbx
+    ret
+
+.cgd_index: db ".git/index", 0
+.cgd_refs_prefix: db ".git/refs/heads/", 0
