@@ -132,6 +132,7 @@ DEFAULT REL
 %define CFG_HIST_DEDUP_FULL   6
 %define CFG_HIST_DEDUP_SMART  7
 %define CFG_SHOW_GIT_BRANCH   8
+%define CFG_GIT_STATUS_FORK   9
 
 ; Syscalls for timing and terminal size
 %define SYS_CLOCK_GETTIME 228
@@ -529,6 +530,8 @@ config_path:    resb 256
 login_flag:     resq 1              ; 1 if -l/--login
 cmd_flag:       resq 1              ; pointer to -c command string
 time_flag:      resq 1              ; 1 if "time" prefix was used
+git_status_cached: resb 1           ; cached git dirty result (0=clean, 1=dirty)
+git_status_cache_time: resq 1       ; monotonic time of last fork check
 
 ; Previous directory for cd -
 prev_dir:       resb 4096
@@ -6527,7 +6530,7 @@ init_default_colors:
     mov byte [rdi + C_USER_ROOT], 196 ; red
     mov byte [rdi + C_HOST_ROOT], 196 ; red
     ; Default config flags: rprompt on, hist_dedup smart
-    mov qword [config_flags], (1 << CFG_RPROMPT) | (1 << CFG_HIST_DEDUP_SMART) | (1 << CFG_AUTO_PAIR) | (1 << CFG_SHOW_TIPS)
+    mov qword [config_flags], (1 << CFG_RPROMPT) | (1 << CFG_HIST_DEDUP_SMART) | (1 << CFG_AUTO_PAIR) | (1 << CFG_SHOW_TIPS) | (1 << CFG_GIT_STATUS_FORK)
     mov qword [completion_limit], 10
     mov qword [slow_cmd_threshold], 0
     ret
@@ -6955,12 +6958,24 @@ load_config:
     lea rsi, [.str_show_git_branch]
     call strcmp
     test rax, rax
-    jnz .lc_advance
+    jnz .lc_not_sgb
     mov rdi, r14
     mov rsi, CFG_SHOW_GIT_BRANCH
     call config_set_bool
     jmp .lc_advance
 .str_show_git_branch: db "show_git_branch", 0
+
+.lc_not_sgb:
+    mov rdi, r12
+    lea rsi, [.str_git_status_fork]
+    call strcmp
+    test rax, rax
+    jnz .lc_advance
+    mov rdi, r14
+    mov rsi, CFG_GIT_STATUS_FORK
+    call config_set_bool
+    jmp .lc_advance
+.str_git_status_fork: db "git_status_fork", 0
 
 .lc_skip_newline:
     inc r12
@@ -10580,9 +10595,19 @@ handle_config:
     lea rsi, [hcfg_show_git_branch]
     call strcmp
     test rax, rax
-    jnz .hcfg_done
+    jnz .hcfg_cb6
     mov rdi, [r12 + 16]
     mov rsi, CFG_SHOW_GIT_BRANCH
+    call config_set_bool
+    jmp .hcfg_done
+.hcfg_cb6:
+    mov rdi, [r12 + 8]
+    lea rsi, [hcfg_git_status_fork]
+    call strcmp
+    test rax, rax
+    jnz .hcfg_done
+    mov rdi, [r12 + 16]
+    mov rsi, CFG_GIT_STATUS_FORK
     call config_set_bool
 
 .hcfg_done:
@@ -10751,6 +10776,7 @@ hcfg_auto_correct: db "auto_correct", 0
 hcfg_auto_pair_str: db "auto_pair", 0
 hcfg_rprompt_str: db "rprompt", 0
 hcfg_show_git_branch: db "show_git_branch", 0
+hcfg_git_status_fork: db "git_status_fork", 0
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Save config to ~/.barerc
@@ -11039,6 +11065,19 @@ save_config:
     mov rdx, .sc_git_branch_false_len
 .sc_gb_write:
     syscall
+    ; git_status_fork
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    test qword [config_flags], (1 << CFG_GIT_STATUS_FORK)
+    jz .sc_gsf_false
+    lea rsi, [.sc_gsf_true_str]
+    mov rdx, .sc_gsf_true_str_len
+    jmp .sc_gsf_write
+.sc_gsf_false:
+    lea rsi, [.sc_gsf_false_str]
+    mov rdx, .sc_gsf_false_str_len
+.sc_gsf_write:
+    syscall
     ; completion_fuzzy
     mov rax, SYS_WRITE
     mov rdi, r12
@@ -11145,6 +11184,10 @@ save_config:
 .sc_git_branch_true_len equ $ - .sc_git_branch_true
 .sc_git_branch_false: db "show_git_branch = false", 10
 .sc_git_branch_false_len equ $ - .sc_git_branch_false
+.sc_gsf_true_str: db "git_status_fork = true", 10
+.sc_gsf_true_str_len equ $ - .sc_gsf_true_str
+.sc_gsf_false_str: db "git_status_fork = false", 10
+.sc_gsf_false_str_len equ $ - .sc_gsf_false_str
 .sc_comp_fuzzy_true: db "completion_fuzzy = true", 10
 .sc_comp_fuzzy_true_len equ $ - .sc_comp_fuzzy_true
 .sc_comp_fuzzy_false: db "completion_fuzzy = false", 10
@@ -13138,23 +13181,26 @@ try_run_plugin:
 ; Compares .git/index mtime with HEAD commit ref mtime
 ; Returns: rax = 1 if dirty, 0 if clean
 ; ══════════════════════════════════════════════════════════════════════
+; check_git_dirty: hybrid approach
+; 1. Quick stat check (index vs ref mtime) - always
+; 2. Fork "git status --porcelain" every 5 seconds - if git_status_fork enabled
+; Returns: rax = 1 if dirty, 0 if clean
 check_git_dirty:
     push rbx
     push r12
-    sub rsp, 288              ; two stat buffers (144 each)
+    sub rsp, 288
 
-    ; Stat .git/index
+    ; Quick stat check first (free, no fork)
     lea rdi, [.cgd_index]
     mov rsi, rsp
     mov rax, SYS_STAT
     syscall
     test rax, rax
-    js .cgd_clean             ; no .git/index, consider clean
+    js .cgd_clean             ; no .git/index, not a git repo
 
-    ; Save index mtime (st_mtim.tv_sec at offset 88)
-    mov r12, [rsp + 88]
+    mov r12, [rsp + 88]       ; index mtime
 
-    ; Build ref path: .git/refs/heads/<branch>
+    ; Build ref path
     lea rdi, [path_buf]
     lea rsi, [.cgd_refs_prefix]
     call strcpy_rsi_rdi
@@ -13173,18 +13219,143 @@ check_git_dirty:
 .cgd_branch_done:
     mov byte [rdi], 0
 
-    ; Stat the ref file
     lea rdi, [path_buf]
     lea rsi, [rsp + 144]
     mov rax, SYS_STAT
     syscall
     test rax, rax
-    js .cgd_dirty             ; no ref file, probably dirty
+    js .cgd_try_fork          ; no ref, check via fork
 
-    ; Compare mtimes: if index > ref, dirty
-    mov rbx, [rsp + 144 + 88]  ; ref mtime
+    mov rbx, [rsp + 144 + 88]
     cmp r12, rbx
-    jg .cgd_dirty
+    jg .cgd_dirty             ; index newer = staged changes, definitely dirty
+
+    ; Stat says clean. Check fork cache if enabled.
+.cgd_try_fork:
+    test qword [config_flags], (1 << CFG_GIT_STATUS_FORK)
+    jz .cgd_use_cache         ; fork disabled, use cached result
+
+    ; Check if 5 seconds have passed since last fork
+    add rsp, 288
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    add rsp, 16
+    sub rsp, 288              ; restore stack frame
+    mov rbx, [git_status_cache_time]
+    sub rax, rbx
+    cmp rax, 5
+    jl .cgd_use_cache         ; less than 5 seconds, use cache
+
+    ; Time to re-check: fork "git status --porcelain"
+    ; Save current time
+    add rsp, 288
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    mov [git_status_cache_time], rax
+    add rsp, 16
+    sub rsp, 288
+
+    ; Create pipe
+    mov rax, SYS_PIPE
+    lea rdi, [pipe_fds]
+    syscall
+    test rax, rax
+    jnz .cgd_use_cache
+
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    jz .cgd_child
+    js .cgd_use_cache
+
+    ; Parent: close write end, read output
+    mov rbx, rax              ; child pid
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+
+    ; Read up to 1 byte (we only care if output is empty)
+    mov rax, SYS_READ
+    mov edi, [pipe_fds]
+    lea rsi, [rsp]            ; reuse stack buffer
+    mov rdx, 1
+    syscall
+    mov r12, rax              ; bytes read (0 = clean, >0 = dirty)
+
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+
+    ; Wait for child
+    sub rsp, 16
+    mov rax, SYS_WAIT4
+    mov rdi, rbx
+    lea rsi, [rsp]
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    add rsp, 16
+
+    ; Cache result
+    test r12, r12
+    jz .cgd_fork_clean
+    mov byte [git_status_cached], 1
+    jmp .cgd_dirty
+.cgd_fork_clean:
+    mov byte [git_status_cached], 0
+    jmp .cgd_clean
+
+.cgd_child:
+    ; Redirect stdout to pipe write end
+    mov rax, SYS_DUP2
+    mov edi, [pipe_fds + 4]
+    mov esi, 1
+    syscall
+    ; Redirect stderr to /dev/null
+    mov rax, SYS_OPEN
+    lea rdi, [.cgd_devnull]
+    mov rsi, O_WRONLY
+    xor edx, edx
+    syscall
+    mov edi, eax
+    mov rax, SYS_DUP2
+    mov esi, 2
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+    ; exec git status --porcelain
+    sub rsp, 40
+    lea rax, [.cgd_git]
+    mov [rsp], rax
+    lea rax, [.cgd_status]
+    mov [rsp + 8], rax
+    lea rax, [.cgd_porcelain]
+    mov [rsp + 16], rax
+    mov qword [rsp + 24], 0
+    mov rax, SYS_EXECVE
+    lea rdi, [.cgd_git]
+    mov rsi, rsp
+    lea rdx, [env_array]
+    syscall
+    mov rax, SYS_EXIT
+    xor edi, edi
+    syscall
+
+.cgd_use_cache:
+    cmp byte [git_status_cached], 0
+    jne .cgd_dirty
 
 .cgd_clean:
     xor eax, eax
@@ -13202,6 +13373,10 @@ check_git_dirty:
 
 .cgd_index: db ".git/index", 0
 .cgd_refs_prefix: db ".git/refs/heads/", 0
+.cgd_git: db "/usr/bin/git", 0
+.cgd_status: db "status", 0
+.cgd_porcelain: db "--porcelain", 0
+.cgd_devnull: db "/dev/null", 0
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Check ~/.pointer/lastdir after command execution
