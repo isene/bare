@@ -196,6 +196,7 @@ str_replay:     db ":replay", 0
 str_version:    db ":version", 0
 str_info:       db ":info", 0
 str_help:       db ":help", 0
+str_time:       db "time", 0
 str_pushd:      db "pushd", 0
 str_popd:       db "popd", 0
 
@@ -527,6 +528,7 @@ config_path:    resb 256
 ; Command-line flags
 login_flag:     resq 1              ; 1 if -l/--login
 cmd_flag:       resq 1              ; pointer to -c command string
+time_flag:      resq 1              ; 1 if "time" prefix was used
 
 ; Previous directory for cd -
 prev_dir:       resb 4096
@@ -580,6 +582,18 @@ global _start
 ; Entry point
 ; ══════════════════════════════════════════════════════════════════════
 _start:
+    ; Record startup time for --bench
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    mov [cmd_start_time], rax     ; reuse cmd_start_time for startup
+    mov rax, [rsp + 8]
+    mov [cmd_start_time + 8], rax
+    add rsp, 16
+
     ; Save environment pointer from stack
     ; Stack layout: [argc] [argv...] [NULL] [envp...] [NULL]
     mov rdi, [rsp]          ; argc
@@ -604,9 +618,65 @@ _start:
     je .set_login
 .check_login_long:
     cmp dword [rax], '--lo'
-    jne .check_c_flag
+    jne .check_bench
     mov qword [login_flag], 1
     jmp .no_args
+.check_bench:
+    cmp dword [rax], '--be'
+    jne .check_c_flag
+    cmp word [rax+4], 'nc'
+    jne .check_c_flag
+    cmp byte [rax+6], 'h'
+    jne .check_c_flag
+    ; Benchmark mode: measure and print startup time
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    ; Calculate elapsed: (end_sec - start_sec) * 1000000 + (end_nsec - start_nsec) / 1000
+    mov rax, [rsp]
+    sub rax, [cmd_start_time]
+    imul rax, 1000000         ; seconds to microseconds
+    mov rcx, [rsp + 8]
+    sub rcx, [cmd_start_time + 8]
+    push rax
+    mov rax, rcx
+    xor edx, edx
+    mov rcx, 1000
+    cqo
+    idiv rcx                  ; nanoseconds to microseconds
+    pop rcx
+    add rax, rcx              ; total microseconds
+    add rsp, 16
+    ; Print result
+    push rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.bench_pre]
+    mov rdx, .bench_pre_len
+    syscall
+    pop rax
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.bench_post]
+    mov rdx, .bench_post_len
+    syscall
+    xor edi, edi
+    mov rax, SYS_EXIT
+    syscall
+.bench_pre: db "bare startup: "
+.bench_pre_len equ $ - .bench_pre
+.bench_post: db " microseconds", 10
+.bench_post_len equ $ - .bench_post
+
 .check_c_flag:
     cmp word [rax], '-c'
     jne .no_args
@@ -714,6 +784,12 @@ _start:
 .no_login:
     jmp .past_login_data
 .bare_profile_suffix: db "/.bare_profile", 0
+.time_real: db 10, "real    "
+.time_real_len equ $ - .time_real
+.time_dot: db "."
+.time_suffix: db "s", 10
+.time_suffix_len equ $ - .time_suffix
+
 .past_login_data:
 
     ; Show random tip on startup (~30% chance)
@@ -782,6 +858,20 @@ _start:
     ; Global alias (gnick) expansion
     call expand_gnicks
 
+    ; Check for "time " prefix
+    mov qword [time_flag], 0
+    cmp dword [line_buf], 'time'
+    jne .no_time_prefix
+    cmp byte [line_buf + 4], ' '
+    jne .no_time_prefix
+    mov qword [time_flag], 1
+    ; Shift line_buf left by 5 to remove "time "
+    lea rsi, [line_buf + 5]
+    lea rdi, [line_buf]
+    call strcpy_rsi_rdi
+    mov [line_len], rax
+.no_time_prefix:
+
     ; Record start time
     mov rax, SYS_CLOCK_GETTIME
     mov rdi, CLOCK_MONOTONIC
@@ -791,6 +881,74 @@ _start:
     ; Execute the line (handles chains, pipes, background)
     mov rdi, line_buf
     call execute_chained_line
+
+    ; If "time" was used, print elapsed
+    cmp qword [time_flag], 0
+    je .no_time_output
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    lea rsi, [cmd_end_time]
+    syscall
+    ; Calculate and print
+    mov rax, [cmd_end_time]
+    sub rax, [cmd_start_time]
+    mov rcx, [cmd_end_time + 8]
+    sub rcx, [cmd_start_time + 8]
+    test rcx, rcx
+    jns .time_no_borrow
+    dec rax
+    add rcx, 1000000000
+.time_no_borrow:
+    push rcx
+    push rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.time_real]
+    mov rdx, .time_real_len
+    syscall
+    pop rax
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.time_dot]
+    mov rdx, 1
+    syscall
+    pop rax                   ; nanoseconds
+    xor edx, edx
+    mov rcx, 1000000
+    div rcx                   ; milliseconds
+    ; Pad to 3 digits
+    lea rdi, [num_buf]
+    mov byte [num_buf], '0'
+    mov byte [num_buf+1], '0'
+    mov byte [num_buf+2], '0'
+    cmp rax, 100
+    jge .time_ms3
+    cmp rax, 10
+    jge .time_ms2
+    lea rdi, [num_buf + 2]
+    jmp .time_ms3
+.time_ms2:
+    lea rdi, [num_buf + 1]
+.time_ms3:
+    call itoa
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    mov rdx, 3
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.time_suffix]
+    mov rdx, .time_suffix_len
+    syscall
+.no_time_output:
 
     ; Record end time and show duration
     mov rax, SYS_CLOCK_GETTIME
