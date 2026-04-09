@@ -13238,11 +13238,13 @@ check_git_dirty:
 
     ; Stat says clean. Check fork cache if enabled.
 .cgd_try_fork:
+    ; Free stat frame first
+    add rsp, 288
+
     test qword [config_flags], (1 << CFG_GIT_STATUS_FORK)
-    jz .cgd_use_cache         ; fork disabled, use cached result
+    jz .cgd_use_cache2
 
     ; Check if 5 seconds have passed since last fork
-    add rsp, 288
     sub rsp, 16
     mov rax, SYS_CLOCK_GETTIME
     mov rdi, CLOCK_MONOTONIC
@@ -13250,15 +13252,12 @@ check_git_dirty:
     syscall
     mov rax, [rsp]
     add rsp, 16
-    sub rsp, 288              ; restore stack frame
     mov rbx, [git_status_cache_time]
     sub rax, rbx
     cmp rax, 5
-    jl .cgd_use_cache         ; less than 5 seconds, use cache
+    jl .cgd_use_cache2
 
     ; Time to re-check: fork "git status --porcelain"
-    ; Save current time
-    add rsp, 288
     sub rsp, 16
     mov rax, SYS_CLOCK_GETTIME
     mov rdi, CLOCK_MONOTONIC
@@ -13267,34 +13266,34 @@ check_git_dirty:
     mov rax, [rsp]
     mov [git_status_cache_time], rax
     add rsp, 16
-    sub rsp, 288
 
     ; Create pipe
     mov rax, SYS_PIPE
     lea rdi, [pipe_fds]
     syscall
     test rax, rax
-    jnz .cgd_use_cache
+    jnz .cgd_use_cache2
 
     mov rax, SYS_FORK
     syscall
     test rax, rax
     jz .cgd_child
-    js .cgd_use_cache
+    js .cgd_use_cache2
 
-    ; Parent: close write end, read output
-    mov rbx, rax              ; child pid
+    ; Parent: close write end, read 1 byte
+    mov rbx, rax
     mov rax, SYS_CLOSE
     mov edi, [pipe_fds + 4]
     syscall
 
-    ; Read up to 1 byte (we only care if output is empty)
+    sub rsp, 16
     mov rax, SYS_READ
     mov edi, [pipe_fds]
-    lea rsi, [rsp]            ; reuse stack buffer
+    mov rsi, rsp
     mov rdx, 1
     syscall
-    mov r12, rax              ; bytes read (0 = clean, >0 = dirty)
+    mov r12, rax              ; bytes read
+    add rsp, 16
 
     mov rax, SYS_CLOSE
     mov edi, [pipe_fds]
@@ -13314,10 +13313,29 @@ check_git_dirty:
     test r12, r12
     jz .cgd_fork_clean
     mov byte [git_status_cached], 1
-    jmp .cgd_dirty
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
 .cgd_fork_clean:
     mov byte [git_status_cached], 0
-    jmp .cgd_clean
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
+.cgd_use_cache2:
+    cmp byte [git_status_cached], 0
+    jne .cgd_dirty2
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+.cgd_dirty2:
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
 
 .cgd_child:
     ; Redirect stdout to pipe write end
