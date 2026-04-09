@@ -2402,21 +2402,25 @@ read_line:
 
 .tab_multiple:
     ; ── Interactive tab cycling ──
-    ; Limit displayed matches to completion_limit
-    mov rax, [completion_limit]
-    test rax, rax
-    jz .tab_done              ; limit 0 = disabled
-    cmp [tab_count], rax
-    jle .tab_count_ok
-    mov [tab_count], rax      ; cap to limit
-.tab_count_ok:
     xor r15, r15             ; r15 = current selection index
 
 .tab_cycle_redraw:
-    ; Print newline + matches with selection highlighting
+    ; Save cursor, print newline + matches with selection highlighting
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_save_cur]
+    mov rdx, 2
+    syscall
     call write_nl
     xor rcx, rcx
 .tab_cycle_print:
+    ; Limit display to completion_limit
+    mov rax, [completion_limit]
+    test rax, rax
+    jz .tab_cycle_use_count
+    cmp rcx, rax
+    jge .tab_cycle_printed
+.tab_cycle_use_count:
     cmp rcx, [tab_count]
     jge .tab_cycle_printed
     push rcx
@@ -2499,17 +2503,11 @@ read_line:
 .tab_color_link_len equ $ - .tab_color_link_seq
 
 .tab_cycle_printed:
-    ; Redraw prompt + current line above (cursor up, carriage return)
+    ; Restore cursor to prompt line
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [.tab_up_cr]
-    mov rdx, 4
-    syscall
-    ; Clear the prompt line
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [clr_eol_global]
-    mov rdx, clr_eol_len
+    lea rsi, [.tab_restore_cur]
+    mov rdx, 2
     syscall
     ; Show current selection in the command line
     ; Replace word at r14..r12 with selected match
@@ -2564,18 +2562,16 @@ read_line:
     dec r15                  ; wrap to last
 
 .tab_cycle_erase:
-    ; Move down to matches area and clear everything below
-    call write_nl
+    ; Restore cursor to prompt line, clear everything below
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_restore_cur]
+    mov rdx, 2
+    syscall
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_clr_below]
     mov rdx, .tab_clr_below_len
-    syscall
-    ; Move back up
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [.tab_up_cr]
-    mov rdx, 4
     syscall
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -2632,18 +2628,16 @@ read_line:
 
 .tab_cycle_cleanup:
 .tab_cycle_cleanup_noread:
-    ; Clear everything below prompt line
-    call write_nl
+    ; Restore cursor to prompt line, clear everything below
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_restore_cur]
+    mov rdx, 2
+    syscall
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_clr_below]
     mov rdx, .tab_clr_below_len
-    syscall
-    ; Move back up
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [.tab_up_cr]
-    mov rdx, 4
     syscall
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -2656,6 +2650,8 @@ read_line:
 
 .tab_up_cr: db 27, "[A", 13        ; cursor up + carriage return
 .tab_cr: db 13
+.tab_save_cur: db 27, '7'          ; save cursor position
+.tab_restore_cur: db 27, '8'       ; restore cursor position
 .tab_clr_below: db 13, 27, "[J"   ; CR + clear from cursor to end of screen
 .tab_clr_below_len equ $ - .tab_clr_below
 
