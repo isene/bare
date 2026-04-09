@@ -10687,7 +10687,7 @@ save_config:
     lea rbx, [color_name_table]
 .sc_color_loop:
     cmp r13, NUM_COLORS
-    jge .sc_close
+    jge .sc_settings
     ; "c_<name> = <value>\n"
     mov rax, SYS_WRITE
     mov rdi, r12
@@ -10734,6 +10734,144 @@ save_config:
 
 .sc_c_pre: db "c_"
 
+.sc_settings:
+    ; Write boolean/numeric settings
+    ; show_tips
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    test qword [config_flags], (1 << CFG_SHOW_TIPS)
+    jz .sc_tips_false
+    lea rsi, [.sc_show_tips_true]
+    mov rdx, .sc_show_tips_true_len
+    jmp .sc_tips_write
+.sc_tips_false:
+    lea rsi, [.sc_show_tips_false]
+    mov rdx, .sc_show_tips_false_len
+.sc_tips_write:
+    syscall
+    ; auto_correct
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    test qword [config_flags], (1 << CFG_AUTO_CORRECT)
+    jz .sc_ac_false
+    lea rsi, [.sc_auto_correct_true]
+    mov rdx, .sc_auto_correct_true_len
+    jmp .sc_ac_write
+.sc_ac_false:
+    lea rsi, [.sc_auto_correct_false]
+    mov rdx, .sc_auto_correct_false_len
+.sc_ac_write:
+    syscall
+    ; auto_pair
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    test qword [config_flags], (1 << CFG_AUTO_PAIR)
+    jz .sc_ap_false
+    lea rsi, [.sc_auto_pair_true]
+    mov rdx, .sc_auto_pair_true_len
+    jmp .sc_ap_write
+.sc_ap_false:
+    lea rsi, [.sc_auto_pair_false]
+    mov rdx, .sc_auto_pair_false_len
+.sc_ap_write:
+    syscall
+    ; rprompt
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    test qword [config_flags], (1 << CFG_RPROMPT)
+    jz .sc_rp_false
+    lea rsi, [.sc_rprompt_true]
+    mov rdx, .sc_rprompt_true_len
+    jmp .sc_rp_write
+.sc_rp_false:
+    lea rsi, [.sc_rprompt_false]
+    mov rdx, .sc_rprompt_false_len
+.sc_rp_write:
+    syscall
+    ; show_git_branch
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    test qword [config_flags], (1 << CFG_SHOW_GIT_BRANCH)
+    jz .sc_gb_false
+    lea rsi, [.sc_git_branch_true]
+    mov rdx, .sc_git_branch_true_len
+    jmp .sc_gb_write
+.sc_gb_false:
+    lea rsi, [.sc_git_branch_false]
+    mov rdx, .sc_git_branch_false_len
+.sc_gb_write:
+    syscall
+    ; completion_fuzzy
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    test qword [config_flags], (1 << CFG_COMPLETION_FUZZY)
+    jz .sc_cf_false
+    lea rsi, [.sc_comp_fuzzy_true]
+    mov rdx, .sc_comp_fuzzy_true_len
+    jmp .sc_cf_write
+.sc_cf_false:
+    lea rsi, [.sc_comp_fuzzy_false]
+    mov rdx, .sc_comp_fuzzy_false_len
+.sc_cf_write:
+    syscall
+    ; history_dedup
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    test qword [config_flags], (1 << CFG_HIST_DEDUP_FULL)
+    jnz .sc_hd_full
+    test qword [config_flags], (1 << CFG_HIST_DEDUP_SMART)
+    jnz .sc_hd_smart
+    lea rsi, [.sc_hd_off]
+    mov rdx, .sc_hd_off_len
+    jmp .sc_hd_write
+.sc_hd_full:
+    lea rsi, [.sc_hd_full_str]
+    mov rdx, .sc_hd_full_len
+    jmp .sc_hd_write
+.sc_hd_smart:
+    lea rsi, [.sc_hd_smart_str]
+    mov rdx, .sc_hd_smart_len
+.sc_hd_write:
+    syscall
+    ; slow_command_threshold
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [.sc_slow_pre]
+    mov rdx, .sc_slow_pre_len
+    syscall
+    mov rax, [slow_cmd_threshold]
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [num_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    ; completion_limit
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [.sc_climit_pre]
+    mov rdx, .sc_climit_pre_len
+    syscall
+    mov rax, [completion_limit]
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [num_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+
 .sc_close:
     mov rax, SYS_CLOSE
     mov rdi, r12
@@ -10749,6 +10887,40 @@ save_config:
 .sc_gnick_pre: db "gnick."
 .sc_abbrev_pre: db "abbrev."
 .sc_bm_pre: db "bm."
+.sc_show_tips_true: db "show_tips = true", 10
+.sc_show_tips_true_len equ $ - .sc_show_tips_true
+.sc_show_tips_false: db "show_tips = false", 10
+.sc_show_tips_false_len equ $ - .sc_show_tips_false
+.sc_auto_correct_true: db "auto_correct = true", 10
+.sc_auto_correct_true_len equ $ - .sc_auto_correct_true
+.sc_auto_correct_false: db "auto_correct = false", 10
+.sc_auto_correct_false_len equ $ - .sc_auto_correct_false
+.sc_auto_pair_true: db "auto_pair = true", 10
+.sc_auto_pair_true_len equ $ - .sc_auto_pair_true
+.sc_auto_pair_false: db "auto_pair = false", 10
+.sc_auto_pair_false_len equ $ - .sc_auto_pair_false
+.sc_rprompt_true: db "rprompt = true", 10
+.sc_rprompt_true_len equ $ - .sc_rprompt_true
+.sc_rprompt_false: db "rprompt = false", 10
+.sc_rprompt_false_len equ $ - .sc_rprompt_false
+.sc_git_branch_true: db "show_git_branch = true", 10
+.sc_git_branch_true_len equ $ - .sc_git_branch_true
+.sc_git_branch_false: db "show_git_branch = false", 10
+.sc_git_branch_false_len equ $ - .sc_git_branch_false
+.sc_comp_fuzzy_true: db "completion_fuzzy = true", 10
+.sc_comp_fuzzy_true_len equ $ - .sc_comp_fuzzy_true
+.sc_comp_fuzzy_false: db "completion_fuzzy = false", 10
+.sc_comp_fuzzy_false_len equ $ - .sc_comp_fuzzy_false
+.sc_hd_off: db "history_dedup = off", 10
+.sc_hd_off_len equ $ - .sc_hd_off
+.sc_hd_full_str: db "history_dedup = full", 10
+.sc_hd_full_len equ $ - .sc_hd_full_str
+.sc_hd_smart_str: db "history_dedup = smart", 10
+.sc_hd_smart_len equ $ - .sc_hd_smart_str
+.sc_slow_pre: db "slow_command_threshold = "
+.sc_slow_pre_len equ $ - .sc_slow_pre
+.sc_climit_pre: db "completion_limit = "
+.sc_climit_pre_len equ $ - .sc_climit_pre
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Save undo state (snapshot of line_buf)
