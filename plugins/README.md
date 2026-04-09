@@ -27,11 +27,13 @@ chmod +x ~/.bare/plugins/*
 
 ### Setup (for :ask and :suggest)
 
-Both plugins use the OpenAI API. Provide your key one of three ways:
+Both plugins use the Anthropic Claude API. Provide your key one of three ways:
 
-1. **Environment variable:** `export OPENAI_API_KEY="sk-..."`
-2. **Config file:** `echo "sk-..." > ~/.config/bare/openai_key`
-3. **Shared file:** Store in `/home/.safe/openai.txt`
+1. **Environment variable:** `export ANTHROPIC_API_KEY="sk-ant-..."`
+2. **Config file:** `echo "sk-ant-..." > ~/.config/bare/anthropic_key`
+3. **Shared file:** Store in `/home/.safe/anthropic.txt`
+
+Get an API key at https://console.anthropic.com/
 
 ## Writing your own plugin
 

@@ -3,9 +3,9 @@
 # Ask AI a question and get a conversational response.
 #
 # Setup:
-#   1. Get an API key from https://platform.openai.com/api-keys
-#   2. Store it in a file: echo "sk-..." > ~/.config/bare/openai_key
-#   3. Or set the environment variable: export OPENAI_API_KEY="sk-..."
+#   1. Get an API key from https://console.anthropic.com/
+#   2. Store it in a file: echo "sk-ant-..." > ~/.config/bare/anthropic_key
+#   3. Or set the environment variable: export ANTHROPIC_API_KEY="sk-ant-..."
 #   4. Copy this file to ~/.bare/plugins/ask and chmod +x it
 #
 # Usage:
@@ -15,14 +15,14 @@
 set -e
 
 # Read API key
-if [ -n "$OPENAI_API_KEY" ]; then
-    API_KEY="$OPENAI_API_KEY"
-elif [ -f "$HOME/.config/bare/openai_key" ]; then
-    API_KEY=$(cat "$HOME/.config/bare/openai_key" | tr -d '\n')
-elif [ -f "/home/.safe/openai.txt" ]; then
-    API_KEY=$(cat "/home/.safe/openai.txt" | tr -d '\n')
+if [ -n "$ANTHROPIC_API_KEY" ]; then
+    API_KEY="$ANTHROPIC_API_KEY"
+elif [ -f "$HOME/.config/bare/anthropic_key" ]; then
+    API_KEY=$(cat "$HOME/.config/bare/anthropic_key" | tr -d '\n')
+elif [ -f "/home/.safe/anthropic.txt" ]; then
+    API_KEY=$(cat "/home/.safe/anthropic.txt" | tr -d '\n')
 else
-    echo "No API key found. Set OPENAI_API_KEY or create ~/.config/bare/openai_key"
+    echo "No API key found. Set ANTHROPIC_API_KEY or create ~/.config/bare/anthropic_key"
     exit 1
 fi
 
@@ -35,17 +35,18 @@ fi
 # Escape JSON
 ESCAPED=$(echo "$QUESTION" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g')
 
-RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $API_KEY" \
+    -H "x-api-key: $API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
     -d "{
-        \"model\": \"gpt-4o-mini\",
-        \"temperature\": 0.3,
+        \"model\": \"claude-haiku-4-5-20251001\",
+        \"max_tokens\": 512,
+        \"system\": \"You are a helpful terminal assistant. Give concise, practical answers. Use examples when helpful. Keep responses under 10 lines.\",
         \"messages\": [
-            {\"role\": \"system\", \"content\": \"You are a helpful terminal assistant. Give concise, practical answers. Use examples when helpful. Keep responses under 10 lines.\"},
             {\"role\": \"user\", \"content\": \"$ESCAPED\"}
         ]
     }" 2>/dev/null)
 
-# Extract content from JSON response (simple grep, no jq dependency)
-echo "$RESPONSE" | grep -o '"content":"[^"]*"' | head -1 | sed 's/"content":"//;s/"$//' | sed 's/\\n/\n/g; s/\\"/"/g; s/\\\\/\\/g'
+# Extract text from Anthropic response
+echo "$RESPONSE" | grep -o '"text":"[^"]*"' | head -1 | sed 's/"text":"//;s/"$//' | sed 's/\\n/\n/g; s/\\"/"/g; s/\\\\/\\/g'
