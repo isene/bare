@@ -689,37 +689,25 @@ _start:
     syscall
 
 .no_cmd_mode:
-    ; Handle login shell: source /etc/profile and ~/.profile
+    ; Handle login shell: source ~/.bare_profile (simple export lines only)
+    ; Skips /etc/profile and ~/.profile (bash scripts with if/then/for)
     cmp qword [login_flag], 0
     je .no_login
-    ; Source /etc/profile (execute line by line)
-    lea rdi, [.etc_profile]
-    call source_file
-    ; Source ~/.profile
     mov rdi, [envp]
     call find_env_home
     test rax, rax
     jz .no_login
     lea rdi, [suggestion_buf]
     mov rsi, rax
-.login_cp_home:
-    mov cl, [rsi]
-    mov [rdi], cl
-    test cl, cl
-    jz .login_append
-    inc rsi
-    inc rdi
-    jmp .login_cp_home
-.login_append:
-    mov dword [rdi], '/.pr'
-    mov dword [rdi + 4], 'ofil'
-    mov byte [rdi + 8], 'e'
-    mov byte [rdi + 9], 0
+    call strcpy_rsi_rdi
+    lea rdi, [suggestion_buf + rax]
+    lea rsi, [.bare_profile_suffix]
+    call strcpy_rsi_rdi
     lea rdi, [suggestion_buf]
     call source_file
 .no_login:
     jmp .past_login_data
-.etc_profile: db "/etc/profile", 0
+.bare_profile_suffix: db "/.bare_profile", 0
 .past_login_data:
 
     ; Show random tip on startup (~30% chance)
