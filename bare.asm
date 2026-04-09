@@ -421,6 +421,7 @@ tab_count:      resq 1
 tab_buf:        resb 8192              ; storage for tab matches
 tab_buf_pos:    resq 1
 tab_word_buf:   resb 256               ; current word being completed
+tab_saved_dtype: resb 1               ; d_type from last file match
 tab_dir_buf:    resb 4096              ; directory listing buffer
 
 ; Chain parsing
@@ -5527,7 +5528,7 @@ tab_complete_file:
     pop rdi
     ; Save d_type from dirent (1 byte before d_name)
     movzx eax, byte [rdi - 1]
-    mov [.tcf_saved_dtype], al
+    mov [tab_saved_dtype], al
     cmp qword [tab_count], MAX_TAB_RESULTS - 1
     jge .tcf_skip_f
 
@@ -5576,7 +5577,7 @@ tab_complete_file:
     mov rcx, [tab_count]
     mov [tab_results + rcx*8], rax
     ; Store d_type
-    movzx eax, byte [.tcf_saved_dtype]
+    movzx eax, byte [tab_saved_dtype]
     mov byte [tab_types + rcx], al
     mov rdi, [tab_results + rcx*8]  ; restore entry pointer for strlen
     inc qword [tab_count]
@@ -5607,7 +5608,6 @@ tab_complete_file:
     pop r12
     pop rbx
     ret
-.tcf_saved_dtype: db 0
 
 ; Find longest common prefix among all tab results
 ; Returns: rax = length of common prefix
