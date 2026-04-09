@@ -7563,20 +7563,19 @@ print_prompt_dynamic:
     call check_git_dirty
     test rax, rax
     jz .ppd_git_clean
-    ; Dirty: red dot
+    ; Dirty: red middle dot
     mov byte [tmp_buf + r12], 27
     mov byte [tmp_buf + r12 + 1], '['
     mov byte [tmp_buf + r12 + 2], '3'
     mov byte [tmp_buf + r12 + 3], '1'
     mov byte [tmp_buf + r12 + 4], 'm'
     add r12, 5
-    ; Middle dot (U+00B7 = C2 B7)
     mov byte [tmp_buf + r12], 0xC2
     mov byte [tmp_buf + r12 + 1], 0xB7
     add r12, 2
     jmp .ppd_git_reset
 .ppd_git_clean:
-    ; Clean: green dot
+    ; Clean: green middle dot
     mov byte [tmp_buf + r12], 27
     mov byte [tmp_buf + r12 + 1], '['
     mov byte [tmp_buf + r12 + 2], '3'
@@ -7766,9 +7765,17 @@ detect_git_branch:
 .dgb_found_file:
     ; Save git root path (r12 points to the dir containing .git)
     push rax
+    ; Save git root: git_head_buf has "<root>/.git/HEAD"
+    ; Copy to git_root_buf, then strip "/.git/HEAD" (10 chars)
     lea rdi, [git_root_buf]
-    mov rsi, r12
+    lea rsi, [git_head_buf]
     call strcpy_rsi_rdi
+    ; Strip /.git/HEAD from end (10 chars)
+    sub rax, 10
+    test rax, rax
+    js .dgb_root_ok
+    mov byte [git_root_buf + rax], 0
+.dgb_root_ok:
     pop rax
     mov rbx, rax            ; fd
     mov rax, SYS_READ
