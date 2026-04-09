@@ -7557,11 +7557,10 @@ print_prompt_dynamic:
     mov byte [tmp_buf + r12 + 3], '1'
     mov byte [tmp_buf + r12 + 4], 'm'
     add r12, 5
-    ; Unicode bullet (U+2022 = E2 80 A2)
-    mov byte [tmp_buf + r12], 0xE2
-    mov byte [tmp_buf + r12 + 1], 0x80
-    mov byte [tmp_buf + r12 + 2], 0xA2
-    add r12, 3
+    ; Middle dot (U+00B7 = C2 B7)
+    mov byte [tmp_buf + r12], 0xC2
+    mov byte [tmp_buf + r12 + 1], 0xB7
+    add r12, 2
     jmp .ppd_git_reset
 .ppd_git_clean:
     ; Clean: green dot
@@ -7571,10 +7570,9 @@ print_prompt_dynamic:
     mov byte [tmp_buf + r12 + 3], '2'
     mov byte [tmp_buf + r12 + 4], 'm'
     add r12, 5
-    mov byte [tmp_buf + r12], 0xE2
-    mov byte [tmp_buf + r12 + 1], 0x97
-    mov byte [tmp_buf + r12 + 2], 0x8F
-    add r12, 3
+    mov byte [tmp_buf + r12], 0xC2
+    mov byte [tmp_buf + r12 + 1], 0xB7
+    add r12, 2
 .ppd_git_reset:
     lea rdi, [tmp_buf + r12]
     mov dword [rdi], 0x5b1b
@@ -7613,9 +7611,17 @@ print_prompt_dynamic:
 .ppd_vis_count:
     cmp rcx, r12
     jge .ppd_vis_done
-    cmp byte [tmp_buf + rcx], 27  ; ESC
+    movzx eax, byte [tmp_buf + rcx]
+    cmp al, 27                ; ESC
     je .ppd_skip_esc
-    inc rbx
+    ; Skip UTF-8 continuation bytes (10xxxxxx = 0x80-0xBF)
+    cmp al, 0x80
+    jb .ppd_vis_ascii
+    cmp al, 0xBF
+    jbe .ppd_vis_cont         ; continuation byte, don't count
+.ppd_vis_ascii:
+    inc rbx                   ; count as 1 visible character
+.ppd_vis_cont:
     inc rcx
     jmp .ppd_vis_count
 .ppd_skip_esc:
