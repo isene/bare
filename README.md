@@ -6,6 +6,8 @@
 
 Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, roughly 115KB. Every feature is hand-coded with direct kernel interaction.
 
+Pure syscalls, zero overhead. No interpreter, no runtime, no garbage collector. Just your keystrokes and the kernel.
+
 <br clear="left"/>
 
 ## Build
