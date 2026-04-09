@@ -4828,6 +4828,8 @@ has_glob_chars:
     je .hgc_yes
     cmp al, '?'
     je .hgc_yes
+    cmp al, '['
+    je .hgc_yes
     inc rdi
     jmp .hgc_loop
 .hgc_yes:
@@ -5067,6 +5069,8 @@ glob_match:
     je .gm_star
     cmp al, '?'
     je .gm_question
+    cmp al, '['
+    je .gm_bracket
 
     ; Literal character
     movzx ecx, byte [r12]
@@ -5110,6 +5114,57 @@ glob_match:
     jnz .gm_succeed
     inc r12
     jmp .gm_star_try
+
+.gm_bracket:
+    ; Character class [abc] or [a-z] or [!abc] (negation)
+    cmp byte [r12], 0
+    je .gm_fail              ; no char to match
+    inc r13                  ; skip '['
+    movzx ecx, byte [r12]   ; char to match
+    xor ebx, ebx            ; match found flag
+    xor edx, edx            ; negation flag
+    cmp byte [r13], '!'
+    jne .gm_br_loop
+    mov edx, 1
+    inc r13
+.gm_br_loop:
+    cmp byte [r13], 0
+    je .gm_fail              ; unterminated bracket
+    cmp byte [r13], ']'
+    je .gm_br_done
+    ; Check for range: a-z
+    cmp byte [r13 + 1], '-'
+    jne .gm_br_literal
+    cmp byte [r13 + 2], ']'
+    je .gm_br_literal        ; treat - before ] as literal
+    cmp byte [r13 + 2], 0
+    je .gm_br_literal
+    ; Range: [r13] to [r13+2]
+    movzx eax, byte [r13]
+    cmp cl, al
+    jl .gm_br_range_no
+    movzx eax, byte [r13 + 2]
+    cmp cl, al
+    jg .gm_br_range_no
+    mov ebx, 1              ; match
+.gm_br_range_no:
+    add r13, 3               ; skip x-y
+    jmp .gm_br_loop
+.gm_br_literal:
+    cmp cl, [r13]
+    jne .gm_br_next
+    mov ebx, 1              ; match
+.gm_br_next:
+    inc r13
+    jmp .gm_br_loop
+.gm_br_done:
+    inc r13                  ; skip ']'
+    ; Apply negation
+    xor ebx, edx            ; if negated, flip match
+    test ebx, ebx
+    jz .gm_fail
+    inc r12                  ; consume matched char
+    jmp .gm_loop
 
 .gm_check_end:
     cmp byte [r12], 0
