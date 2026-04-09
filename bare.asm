@@ -7382,6 +7382,33 @@ print_prompt_dynamic:
     mov rdx, 1
     syscall
 
+    ; Emit OSC 7 (cwd) so terminal can track working directory
+    ; Format: ESC]7;file://hostname/path ESC backslash
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.ppd_osc7]
+    mov rdx, .ppd_osc7_len
+    syscall
+    lea rdi, [hostname_buf]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [hostname_buf]
+    syscall
+    lea rdi, [cwd_buf]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [cwd_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.ppd_st]
+    mov rdx, 2
+    syscall
+
     ; Print username with color (use root colors if UID=0)
     mov rax, SYS_GETUID
     syscall
@@ -7669,6 +7696,9 @@ print_prompt_dynamic:
 
 .ppd_osc: db 27, "]2;"         ; OSC set title
 .ppd_bel: db 7                  ; BEL (end OSC)
+.ppd_osc7: db 27, "]7;file://" ; OSC 7 cwd notification
+.ppd_osc7_len equ $ - .ppd_osc7
+.ppd_st: db 27, "\"            ; ST (string terminator)
 
 ; write_fg_color: al = 256-color code, rdi = buffer
 ; Returns: rax = bytes written
