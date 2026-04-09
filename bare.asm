@@ -416,6 +416,7 @@ expanded_argc:  resq 1
 
 ; Tab completion
 tab_results:    resq MAX_TAB_RESULTS   ; matching completions
+tab_types:      resb MAX_TAB_RESULTS   ; file type for each match (d_type)
 tab_count:      resq 1
 tab_buf:        resb 8192              ; storage for tab matches
 tab_buf_pos:    resq 1
@@ -2201,11 +2202,34 @@ read_line:
     syscall
     jmp .tab_cycle_name
 .tab_cycle_normal:
-    ; Dim color for non-selected
+    ; Color based on file type (LS_COLORS style)
+    pop rcx
+    push rcx
+    movzx eax, byte [tab_types + rcx]
+    ; DT_DIR=4: blue+bold, DT_LNK=10: cyan, DT_REG+exec: green, default: gray
+    cmp al, 4               ; directory
+    je .tab_color_dir
+    cmp al, 10              ; symlink
+    je .tab_color_link
+    ; Default: dim gray
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_hl_dim]
     mov rdx, .tab_hl_dim_len
+    syscall
+    jmp .tab_cycle_name
+.tab_color_dir:
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_color_dir_seq]
+    mov rdx, .tab_color_dir_len
+    syscall
+    jmp .tab_cycle_name
+.tab_color_link:
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_color_link_seq]
+    mov rdx, .tab_color_link_len
     syscall
 .tab_cycle_name:
     pop rcx
@@ -2241,6 +2265,10 @@ read_line:
 .tab_hl_dim_len equ $ - .tab_hl_dim
 .tab_hl_off: db 27, "[0m"
 .tab_sep: db "  "
+.tab_color_dir_seq: db 27, "[38;5;111;1m"    ; blue bold (matching LS_COLORS di=)
+.tab_color_dir_len equ $ - .tab_color_dir_seq
+.tab_color_link_seq: db 27, "[38;5;248;1m"   ; gray bold (matching LS_COLORS ln=)
+.tab_color_link_len equ $ - .tab_color_link_seq
 
 .tab_cycle_printed:
     ; Redraw prompt + current line above (cursor up, carriage return)
@@ -2366,6 +2394,7 @@ read_line:
     mov byte [line_buf + r12], ' '
     inc r12
     inc qword [line_len]
+    mov byte [line_buf + r12], 0  ; null-terminate
     jmp .tab_cycle_cleanup
 
 .tab_cycle_cancel:
@@ -5501,8 +5530,11 @@ tab_complete_file:
 
 .tcf_match_f:
     pop rdi
+    ; Save d_type: it's at rdi - DIRENT64_D_NAME + DIRENT64_D_TYPE = rdi - 1
+    movzx eax, byte [rdi - 1]    ; d_type is 1 byte before d_name
+    push rax                      ; save d_type
     cmp qword [tab_count], MAX_TAB_RESULTS - 1
-    jge .tcf_skip_f
+    jge .tcf_skip_f_dtype
 
     ; Copy name to tab_buf
     mov rcx, [tab_buf_pos]
@@ -5548,16 +5580,22 @@ tab_complete_file:
     lea rax, [tab_buf + rdx]
     mov rcx, [tab_count]
     mov [tab_results + rcx*8], rax
+    ; Store d_type (saved on stack before the copy)
+    push rax                      ; save tab entry pointer
+    mov rax, [rsp + 8]            ; d_type from stack (pushed earlier, now +8 due to push)
+    mov byte [tab_types + rcx], al
+    pop rdi                       ; restore tab entry pointer
     inc qword [tab_count]
     ; Calculate new buf_pos: find end of what we wrote
-    mov rdi, rax
     call strlen
     inc rax
     add [tab_buf_pos], rax
-    jmp .tcf_skip_f
+    jmp .tcf_skip_f_dtype
 
 .tcf_no_match_f:
     pop rdi
+.tcf_skip_f_dtype:
+    pop rax                  ; discard d_type
 .tcf_skip_f:
     pop rdx
     pop rcx
