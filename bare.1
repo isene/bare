@@ -1,0 +1,152 @@
+.TH BARE 1 "April 2026" "bare 0.1.0" "User Commands"
+.SH NAME
+bare \- interactive shell in x86_64 Linux assembly
+.SH SYNOPSIS
+.B bare
+[\fB\-l\fR|\fB\-\-login\fR]
+[\fB\-c\fR \fIcommand\fR]
+[\fB\-\-bench\fR]
+.SH DESCRIPTION
+.B bare
+is an interactive shell written entirely in x86_64 Linux assembly.
+No libc, no runtime, pure syscalls. Single static binary.
+.PP
+Pure syscalls, zero overhead. No interpreter, no runtime, no garbage
+collector. Just your keystrokes and the kernel.
+.SH OPTIONS
+.TP
+.B \-l, \-\-login
+Login shell mode. Sources \fI~/.bare_profile\fR on startup.
+.TP
+.B \-c \fIcommand\fR
+Execute \fIcommand\fR and exit.
+.TP
+.B \-\-bench
+Print startup time in microseconds and exit.
+.SH KEY BINDINGS
+.TP
+.B TAB / Shift\-TAB
+Interactive completion cycling with LS_COLORS.
+.TP
+.B Ctrl\-R
+Reverse incremental history search.
+.TP
+.B Up / Down
+History navigation. With typed prefix, filters matching entries.
+.TP
+.B Alt\-F / Alt\-B
+Move cursor forward/backward by word.
+.TP
+.B Ctrl\-A / Ctrl\-E
+Move to beginning/end of line.
+.TP
+.B Ctrl\-K / Ctrl\-U / Ctrl\-W
+Kill to end / clear line / delete word backward.
+.TP
+.B Ctrl\-L
+Clear screen.
+.TP
+.B Ctrl\-C
+Clear current line.
+.TP
+.B Ctrl\-Z
+Suspend foreground process.
+.TP
+.B Ctrl\-G
+Edit current line in $EDITOR.
+.TP
+.B Ctrl\-Y
+Copy line to clipboard (xclip).
+.TP
+.B Ctrl\-D
+Exit (on empty line).
+.SH COLON COMMANDS
+.TP
+.B :nick \fR[\fIname = value\fR | \fI\-name\fR]
+Command aliases.
+.TP
+.B :gnick \fR[\fIname = value\fR | \fI\-name\fR]
+Global aliases (expand anywhere in line).
+.TP
+.B :abbrev \fR[\fIname = value\fR | \fI\-name\fR]
+Abbreviations (expand on space).
+.TP
+.B :bm \fR[\fIname\fR [\fIpath\fR] [\fI#tags\fR]]
+Bookmarks. \fB:bm ?tag\fR to search.
+.TP
+.B :dirs
+Directory history. \fBcd N\fR to jump to entry N.
+.TP
+.B :theme \fR[\fIname\fR]
+Color themes: default, solarized, dracula, gruvbox, nord, monokai.
+.TP
+.B :config \fR[\fIkey\fR [\fIvalue\fR]]
+View or change configuration.
+.TP
+.B :calc \fIexpression\fR
+Integer calculator (+, \-, *, /, %).
+.TP
+.B :stats
+Command frequency analysis from history.
+.TP
+.B :validate \fIpattern\fR = \fIaction\fR
+Safety rules (warn, confirm, block).
+.TP
+.B :save_session / :load_session / :list_sessions
+Session management.
+.TP
+.B :jobs / :fg \fR[\fIN\fR] / :bg \fR[\fIN\fR]
+Job control.
+.TP
+.B :env \fR[\fIVAR\fR | set \fIVAR val\fR | unset \fIVAR\fR]
+Environment management.
+.TP
+.B :reload
+Reload ~/.barerc configuration.
+.TP
+.B :info / :version / :help
+Shell information.
+.SH PLUGINS
+Plugins are executables in \fI~/.bare/plugins/\fR. Any unknown colon
+command runs the matching plugin with remaining arguments.
+.SH FILES
+.TP
+.I ~/.barerc
+Configuration file (auto\-saved on exit).
+.TP
+.I ~/.bare_profile
+Login profile (sourced with \-l flag). Simple export lines only.
+.TP
+.I ~/.bare_history
+Command history (capped at 1000 entries).
+.TP
+.I ~/.bare/plugins/
+Plugin directory.
+.TP
+.I ~/.bare/sessions/
+Saved sessions.
+.SH CONFIGURATION
+Settings in ~/.barerc use \fIkey = value\fR format:
+.PP
+.nf
+nick.ls = ls \-\-color \-F
+gnick.G = | grep
+abbrev.gst = git status
+bm.home = /home/user
+c_prompt = 208
+show_tips = false
+auto_pair = true
+rprompt = true
+history_dedup = smart
+.fi
+.SH PART OF
+CHasm (CHange to ASM) suite.
+.SH SEE ALSO
+.BR rush (1),
+.BR bareconf (1)
+.SH AUTHOR
+Geir Isene <g@isene.com>
+.br
+With extensive pair\-programming with Claude Code.
+.SH LICENSE
+Unlicense (public domain).
