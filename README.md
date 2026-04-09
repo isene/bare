@@ -17,52 +17,76 @@ nasm -f elf64 bare.asm -o bare.o && ld bare.o -o bare
 ## Features
 
 ### Prompt and Navigation
-- Dynamic prompt: `user@host: ~/cwd (git-branch) >`
-- Bookmarks with tags (`:bm`), auto-cd from bookmark and directory names
-- Directory history (`:dirs`), pushd/popd
-- Ctrl-L clear screen, Ctrl-C clear line
+- Dynamic prompt: `user@host: ~/cwd/ (git-branch) >`
+- Git branch detection (reads `.git/HEAD`, walks up directories)
+- Right prompt: command duration display for long-running commands
+- Root user detection: separate colors for sudo sessions (`c_user_root`, `c_host_root`)
+- Tilde substitution in prompt (`$HOME` shown as `~`)
+- Window title via OSC escape sequence
+- Bookmarks with tags (`:bm name [path] [#tags]`), tag search (`:bm ?tag`)
+- Auto-cd from bookmark names and bare directory names
+- Directory history (`:dirs`), `cd N` to jump to Nth entry, `cd -` for previous
+- `pushd`/`popd` directory stack
 
 ### Command Execution
-- Multi-pipe support (up to 16 segments)
+- Multi-pipe support (up to 16 segments): `cmd1 | cmd2 | cmd3`
 - Redirections: `>`, `>>`, `<`
 - Command chaining: `;`, `&&`, `||`
-- Command substitution: `$(cmd)`
-- Background execution with `&`
-- Command timing for slow commands
+- Command substitution: `$(cmd)` with nesting
+- Background execution: `&`
+- Command timing for slow commands (configurable threshold)
+- Login shell support: `-l`/`--login` (sources `/etc/profile`, `~/.profile`)
+- Command mode: `-c "cmd"` (execute and exit)
 
 ### Expansion
-- Brace expansion: `{a,b,c}`
+- Brace expansion: `file.{txt,md,rs}` -> `file.txt file.md file.rs`
 - Tilde expansion: `~`, `~/path`
 - Variable expansion: `$VAR`, `${VAR}`, `$?`, `$$`
 - Glob expansion: `*`, `?`
 - History expansion: `!!`, `!N`, `!-N`
+- Global nick (gnick) expansion anywhere in the command line
 
 ### Aliases and Abbreviations
-- Nick aliases: `:nick`
-- Global aliases: `:gnick`
-- Abbreviations: `:abbrev` (expand on space)
+- Nick aliases: `:nick ls = ls --color -F` (expand at execution)
+- Global aliases: `:gnick G = | grep` (expand anywhere in line)
+- Abbreviations: `:abbrev gst = git status` (expand live on space)
+- List, add, delete for all three types
 
 ### Line Editing and Completion
-- Interactive tab cycling with highlighting (TAB/Shift-TAB)
-- Ctrl-R reverse incremental history search
-- Inline history suggestions (grayed text, right-arrow to accept)
-- Ctrl-G edit current line in `$EDITOR`
-- Tab completion for commands (PATH search) and files
+- Interactive tab cycling with highlighted selection (TAB/Shift-TAB)
+- Ctrl-R reverse incremental history search (substring match)
+- Inline history suggestions (grayed preview, right-arrow to accept)
+- Prefix history search: type text, press Up/Down to filter matching entries
+- `$VAR` tab completion from environment variables
+- Subcommand completion for git, apt, cargo
+- Ctrl-G edit current line in `$EDITOR` (falls back to vi)
+- Ctrl-Y copy line to clipboard (xclip)
+- Ctrl-L clear screen, Ctrl-C clear line
+- Ctrl-A/E home/end, Ctrl-K kill to end, Ctrl-U clear, Ctrl-W delete word
+- Syntax highlighting: commands, colon commands, switches, pipe segments
+- Multi-line editing: continuation on `\`, `|`, `&&`, `||`, unclosed quotes
+- Auto-pairing brackets and quotes (configurable)
+- Tab completion deduplication across PATH directories
 
 ### Job Control
 - Ctrl-Z suspend foreground process
-- `:jobs`, `:fg`, `:bg` builtins
+- `:jobs` list, `:fg [N]` foreground, `:bg [N]` background
+- Background job reaping
 
 ### Themes and Colors
 - 6 built-in themes: default, solarized, dracula, gruvbox, nord, monokai
 - Switch with `:theme <name>`
-- 16 individual color settings via `:config c_<name> <value>`
+- 18 individual color settings via `:config c_<name> <value>`
+- Root-specific colors: `c_user_root`, `c_host_root` (red by default)
+- Colors: user, host, cwd, prompt, cmd, nick, gnick, path, switch, bookmark, colon, git, stamp, tabsel, tabopt, suggest
 
 ### Configuration
-- Config file: `~/.barerc` (line-based key=value format)
-- Auto-saved on exit
-- History: `~/.bare_history` with smart deduplication
-- Companion TUI config tool: [bareconf](https://github.com/isene/bareconf)
+- Config file: `~/.barerc` (line-based key=value format, auto-saved on exit)
+- History: `~/.bare_history` with smart deduplication (off/full/smart)
+- Settings: `:config key value` for runtime changes
+- Boolean toggles: `show_tips`, `auto_correct`, `auto_pair`, `rprompt`
+- Numeric: `slow_command_threshold`, `completion_limit`
+- Companion TUI configurator: [bareconf](https://github.com/isene/bareconf)
 
 ### Plugins
 
@@ -80,17 +104,18 @@ Included plugins:
 
 See [plugins/README.md](plugins/README.md) for setup and writing your own.
 
-### Other
-- Signal handling and TTY detection
-- Syntax highlighting (commands, switches, pipe segments)
-- Multi-line editing (continuation on `\`, `|`, `&&`, `||`)
-- Auto-pairing brackets and quotes
-- Auto-correct suggestions on command not found
-- Session save/load (`:save_session`, `:load_session`)
-- Calculator (`:calc`), command stats (`:stats`)
-- Validation rules (`:validate pattern = warn/confirm/block`)
-- Prefix history search (type text, press Up to filter)
-- Builtins: cd, pwd, exit, export, unset, history, pushd, popd
+### Other Builtins
+- `cd`, `pwd`, `exit`, `export`, `unset`, `history`, `pushd`, `popd`
+- `:calc` integer calculator (+, -, *, /, %)
+- `:stats` command frequency analysis (top 20 from history)
+- `:validate pattern = warn/confirm/block` safety rules
+- `:save_session`, `:load_session`, `:list_sessions` session management
+- `:env [VAR | set VAR val | unset VAR]` environment management
+- `:rehash` rebuild PATH cache, `:reload` reload config
+- `:rmhistory` clear history, `:info` feature overview
+- `:version`, `:help`
+- Auto-correct: suggests similar commands on "command not found"
+- Random startup tips (~30% chance, configurable)
 
 ## Part of CHasm (CHange to ASM)
 
