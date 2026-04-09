@@ -2,132 +2,163 @@
 
 <img src="img/bare.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~115KB-orange) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.1.0-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-8%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
-Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, roughly 115KB. Every feature is hand-coded with direct kernel interaction.
+Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, 126KB. **8 microsecond startup.**
 
 Pure syscalls, zero overhead. No interpreter, no runtime, no garbage collector. Just your keystrokes and the kernel.
 
 <br clear="left"/>
 
-## Build
+## Install
+
+### From source (requires nasm and ld)
 
 ```bash
-nasm -f elf64 bare.asm -o bare.o && ld bare.o -o bare
+git clone https://github.com/isene/bare.git
+cd bare
+make
+sudo make install
+```
+
+### Arch Linux (AUR)
+
+```bash
+yay -S bare-shell
+```
+
+### Debian/Ubuntu
+
+```bash
+curl -LO https://github.com/isene/bare/releases/latest/download/bare_0.1.0_amd64.deb
+sudo dpkg -i bare_0.1.0_amd64.deb
+```
+
+### Set as default shell
+
+```bash
+# Add to allowed shells
+sudo sh -c 'echo /usr/local/bin/bare >> /etc/shells'
+
+# Set as default terminal shell (wezterm)
+# In ~/.config/wezterm/wezterm.lua:
+config.default_prog = { '/usr/local/bin/bare', '-l' }
+```
+
+### Setup
+
+```bash
+# Install AI plugins (optional, needs Anthropic API key)
+make install-plugins
+
+# Create login profile
+cat > ~/.bare_profile << 'EOF'
+export PATH=/usr/local/bin:/usr/bin:/bin:$HOME/bin:$HOME/.local/bin
+export EDITOR=vim
+export PAGER=less
+EOF
+```
+
+## Benchmark
+
+```
+$ ./bare --bench
+bare startup: 8 microseconds
+
+$ time ./bare -c exit
+./bare -c exit  0.00s user 0.00s system 94% cpu 0.003 total
 ```
 
 ## Features
 
 ### Prompt and Navigation
-- Dynamic prompt: `user@host: ~/cwd/ (git-branch) >`
-- Git branch detection (reads `.git/HEAD`, walks up directories)
-- Right prompt: command duration display for long-running commands
-- Root user detection: separate colors for sudo sessions (`c_user_root`, `c_host_root`)
-- Tilde substitution in prompt (`$HOME` shown as `~`)
-- Window title via OSC escape sequence
+- Dynamic prompt: `user@host: ~/cwd/ (git-branch) >` with configurable colors
+- Git dirty indicator: green dot (clean) / red dot (uncommitted changes)
+- Git branch display (toggleable via `show_git_branch`)
+- Root user detection: separate colors for sudo sessions
 - Bookmarks with tags (`:bm name [path] [#tags]`), tag search (`:bm ?tag`)
 - Auto-cd from bookmark names and bare directory names
-- Directory history (`:dirs`), `cd N` to jump to Nth entry, `cd -` for previous
+- Directory history (`:dirs`), `cd N` to jump, `cd -` for previous
 - `pushd`/`popd` directory stack
+- Pointer/RTFM file manager auto-cd on exit
 
 ### Command Execution
-- Multi-pipe support (up to 16 segments): `cmd1 | cmd2 | cmd3`
+- Multi-pipe (up to 16 segments): `cmd1 | cmd2 | cmd3`
 - Redirections: `>`, `>>`, `<`
 - Command chaining: `;`, `&&`, `||`
 - Command substitution: `$(cmd)` with nesting
 - Background execution: `&`
-- Command timing for slow commands (configurable threshold)
-- Login shell support: `-l`/`--login` (sources `/etc/profile`, `~/.profile`)
-- Command mode: `-c "cmd"` (execute and exit)
+- `time` builtin: `time sleep 1` shows elapsed with ms precision
+- Login shell (`-l`), command mode (`-c "cmd"`)
 
 ### Expansion
 - Brace expansion: `file.{txt,md,rs}` -> `file.txt file.md file.rs`
-- Tilde expansion: `~`, `~/path`
-- Variable expansion: `$VAR`, `${VAR}`, `$?`, `$$`
-- Glob expansion: `*`, `?`
+- Tilde, variable (`$VAR`, `${VAR}`, `$?`, `$$`), glob (`*`, `?`, `[a-z]`, `[!x]`)
 - History expansion: `!!`, `!N`, `!-N`
-- Global nick (gnick) expansion anywhere in the command line
+- Global nick expansion anywhere in line
 
 ### Aliases and Abbreviations
-- Nick aliases: `:nick ls = ls --color -F` (expand at execution)
-- Global aliases: `:gnick G = | grep` (expand anywhere in line)
-- Abbreviations: `:abbrev gst = git status` (expand live on space)
-- List, add, delete for all three types
+- `:nick ls = ls --color -F` (expand at execution, self-referencing works)
+- `:gnick G = | grep` (expand anywhere in line)
+- `:abbrev gst = git status` (expand live on space)
 
 ### Line Editing and Completion
-- Interactive tab cycling with highlighted selection (TAB/Shift-TAB)
-- Ctrl-R reverse incremental history search (substring match)
+- Interactive tab cycling with LS_COLORS (dirs blue, symlinks gray)
+- Tab completion for `:commands` (`:th<TAB>` -> `:theme`)
+- `$VAR` tab completion, subcommand completion (git, apt, cargo)
+- Ctrl-R reverse incremental history search
 - Inline history suggestions (grayed preview, right-arrow to accept)
-- Prefix history search: type text, press Up/Down to filter matching entries
-- `$VAR` tab completion from environment variables
-- Subcommand completion for git, apt, cargo
-- Ctrl-G edit current line in `$EDITOR` (falls back to vi)
-- Ctrl-Y copy line to clipboard (xclip)
-- Ctrl-L clear screen, Ctrl-C clear line
-- Ctrl-A/E home/end, Ctrl-K kill to end, Ctrl-U clear, Ctrl-W delete word
+- Prefix history search: type text, press Up/Down to filter
+- Alt-F / Alt-B: word movement forward/backward
+- Ctrl-G edit in `$EDITOR`, Ctrl-Y copy to clipboard
 - Syntax highlighting: commands, colon commands, switches, pipe segments
 - Multi-line editing: continuation on `\`, `|`, `&&`, `||`, unclosed quotes
 - Auto-pairing brackets and quotes (configurable)
-- Tab completion deduplication across PATH directories
 
 ### Job Control
-- Ctrl-Z suspend foreground process
-- `:jobs` list, `:fg [N]` foreground, `:bg [N]` background
-- Background job reaping
+- Ctrl-Z suspend, `:jobs`, `:fg [N]`, `:bg [N]`
 
 ### Themes and Colors
-- 6 built-in themes: default, solarized, dracula, gruvbox, nord, monokai
-- Switch with `:theme <name>`
-- 18 individual color settings via `:config c_<name> <value>`
-- Root-specific colors: `c_user_root`, `c_host_root` (red by default)
-- Colors: user, host, cwd, prompt, cmd, nick, gnick, path, switch, bookmark, colon, git, stamp, tabsel, tabopt, suggest
+- 6 themes: default, solarized, dracula, gruvbox, nord, monokai
+- 18 individual color settings including root-specific colors
+- Companion TUI configurator: [bareconf](https://github.com/isene/bareconf)
 
 ### Configuration
-- Config file: `~/.barerc` (line-based key=value format, auto-saved on exit)
-- History: `~/.bare_history` with smart deduplication (off/full/smart)
-- Settings: `:config key value` for runtime changes
-- Boolean toggles: `show_tips`, `auto_correct`, `auto_pair`, `rprompt`
-- Numeric: `slow_command_threshold`, `completion_limit`
-- Companion TUI configurator: [bareconf](https://github.com/isene/bareconf)
+- `~/.barerc`: auto-saved on exit, line-based key=value format
+- `~/.bare_profile`: login profile (simple export lines)
+- `~/.bare_history`: capped at 1000 entries, smart deduplication
+- Runtime changes: `:config key value`
+- Toggles: show_tips, auto_correct, auto_pair, rprompt, show_git_branch, completion_fuzzy
 
 ### Plugins
 
-Plugins are executables in `~/.bare/plugins/`. Any unknown colon command runs the matching plugin. Write plugins in any language.
+Plugins are executables in `~/.bare/plugins/`. Any unknown colon command runs the matching plugin.
 
 ```bash
-# Install included plugins
-cp plugins/* ~/.bare/plugins/
-chmod +x ~/.bare/plugins/*
+make install-plugins    # installs :ask and :suggest (AI via Anthropic API)
 ```
 
-Included plugins:
-- `:ask <question>` - ask AI a question (requires OpenAI API key)
-- `:suggest <task>` - get a shell command suggestion from AI
+- `:ask <question>` - ask AI a question
+- `:suggest <task>` - get a shell command suggestion
 
 See [plugins/README.md](plugins/README.md) for setup and writing your own.
 
 ### Other Builtins
-- `cd`, `pwd`, `exit`, `export`, `unset`, `history`, `pushd`, `popd`
-- `:calc` integer calculator (+, -, *, /, %)
-- `:stats` command frequency analysis (top 20 from history)
-- `:validate pattern = warn/confirm/block` safety rules
-- `:save_session`, `:load_session`, `:list_sessions` session management
-- `:env [VAR | set VAR val | unset VAR]` environment management
-- `:rehash` rebuild PATH cache, `:reload` reload config
-- `:rmhistory` clear history, `:info` feature overview
-- `:version`, `:help`
-- Auto-correct: suggests similar commands on "command not found"
-- Random startup tips (~30% chance, configurable)
+- `cd`, `pwd`, `exit`, `export`, `unset`, `history`, `pushd`, `popd`, `time`
+- `:calc`, `:stats`, `:validate`, `:save_session`, `:load_session`
+- `:env`, `:rehash`, `:reload`, `:rmhistory`, `:info`, `:version`, `:help`
+- Auto-correct suggestions on command not found
+- Startup tips (configurable)
 
 ## Part of CHasm (CHange to ASM)
 
 The same shell, three languages:
 
-| Shell | Language | Suite |
-|-------|----------|-------|
-| **[bare](https://github.com/isene/bare)** | **x86_64 Assembly** | **CHasm** |
-| [rush](https://github.com/isene/rush) | Rust | Fe2O3 |
-| [rsh](https://github.com/isene/rsh) | Ruby | |
+| Shell | Language | Startup | Suite |
+|-------|----------|---------|-------|
+| **[bare](https://github.com/isene/bare)** | **x86_64 Assembly** | **8us** | **CHasm** |
+| [rush](https://github.com/isene/rush) | Rust | ~26ms | Fe2O3 |
+| [rsh](https://github.com/isene/rsh) | Ruby | ~300ms | |
 
 Companion: [bareconf](https://github.com/isene/bareconf) (TUI configurator, built on [crust](https://github.com/isene/crust))
 

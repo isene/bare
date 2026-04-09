@@ -1,0 +1,17 @@
+Source: bare
+Section: shells
+Priority: optional
+Maintainer: Geir Isene <g@isene.com>
+Build-Depends: nasm
+Standards-Version: 4.6.0
+Homepage: https://github.com/isene/bare
+
+Package: bare
+Architecture: amd64
+Depends:
+Description: Interactive shell in x86_64 Linux assembly
+ No libc, no runtime, pure syscalls. Single static binary.
+ 8 microsecond startup. Features include dynamic prompt with
+ git integration, tab completion with LS_COLORS, syntax
+ highlighting, job control, aliases, bookmarks, themes,
+ plugin system, and more.
