@@ -7604,26 +7604,8 @@ expand_nicks:
     jmp .en_search
 
 .en_found:
-    ; Guard: if expansion's first word equals the nick name, skip (prevent recursion)
-    mov rsi, [nick_values + rcx*8]
-    mov rdi, [nick_names + rcx*8]
-.en_guard_cmp:
-    movzx eax, byte [rdi]
-    test al, al
-    jz .en_guard_check
-    cmp al, [rsi]
-    jne .en_do_expand         ; different, safe to expand
-    inc rdi
-    inc rsi
-    jmp .en_guard_cmp
-.en_guard_check:
-    movzx eax, byte [rsi]
-    cmp al, ' '
-    je .en_no                 ; self-referencing, skip
-    test al, al
-    je .en_no                 ; exact match, skip
-
-.en_do_expand:
+    ; No guard needed: the caller (parse_and_exec_simple) already
+    ; skips nick expansion on the re-parsed result, preventing recursion.
     ; Build expanded line: nick_value + rest of original args
     lea rdi, [nick_expand_buf]
     mov rsi, [nick_values + rcx*8]
