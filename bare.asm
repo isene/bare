@@ -6897,7 +6897,19 @@ load_config:
 .str_hist_dedup: db "history_dedup", 0
 
 .lc_not_histdedup:
-    ; Check boolean flags: auto_correct, completion_fuzzy, rprompt, auto_pair
+    ; Check boolean flags: show_tips, auto_correct, completion_fuzzy, rprompt, auto_pair
+    mov rdi, r12
+    lea rsi, [.str_show_tips]
+    call strcmp
+    test rax, rax
+    jnz .lc_not_st
+    mov rdi, r14
+    mov rsi, CFG_SHOW_TIPS
+    call config_set_bool
+    jmp .lc_advance
+.str_show_tips: db "show_tips", 0
+
+.lc_not_st:
     mov rdi, r12
     lea rsi, [.str_auto_correct]
     call strcmp
