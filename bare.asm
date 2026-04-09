@@ -2061,12 +2061,9 @@ read_line:
     test rdx, rdx
     jnz .tab_has_word
     mov byte [tab_word_buf], 0
-    mov rcx, 0
-    push rcx
     jmp .tab_word_ready
 .tab_has_word:
     mov rcx, rdx
-    push rcx                ; save word length
 .tab_copy_word:
     mov al, [rsi]
     mov [rdi], al
@@ -2075,7 +2072,6 @@ read_line:
     dec rcx
     jnz .tab_copy_word
     mov byte [rdi], 0
-    pop rcx                 ; rcx = word length
 .tab_word_ready:
 
     ; Determine if this is a command (first word) or file completion
