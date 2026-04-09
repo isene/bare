@@ -2203,8 +2203,7 @@ read_line:
     jmp .tab_cycle_name
 .tab_cycle_normal:
     ; Color based on file type (LS_COLORS style)
-    pop rcx
-    push rcx
+    mov rcx, [rsp]           ; peek at saved rcx without pop
     movzx eax, byte [tab_types + rcx]
     ; DT_DIR=4: blue+bold, DT_LNK=10: cyan, DT_REG+exec: green, default: gray
     cmp al, 4               ; directory
