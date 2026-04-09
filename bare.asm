@@ -1678,7 +1678,15 @@ read_line:
     test rax, rax
     jle .read_char
     cmp byte [tmp_buf], '['
-    jne .read_char
+    je .esc_bracket
+    ; Alt+key: ESC followed by a letter (not [)
+    cmp byte [tmp_buf], 'f'
+    je .word_forward
+    cmp byte [tmp_buf], 'b'
+    je .word_backward
+    jmp .read_char
+
+.esc_bracket:
 
     mov rax, SYS_READ
     xor edi, edi
@@ -1764,6 +1772,49 @@ read_line:
     syscall
     jmp .read_char
 .left_seq: db 27, '[', 'D'
+
+.word_forward:
+    ; Alt-F: move cursor forward to end of next word
+.wf_skip_spaces:
+    cmp r12, [line_len]
+    jge .wf_done
+    cmp byte [line_buf + r12], ' '
+    jne .wf_word
+    inc r12
+    jmp .wf_skip_spaces
+.wf_word:
+    cmp r12, [line_len]
+    jge .wf_done
+    cmp byte [line_buf + r12], ' '
+    je .wf_done
+    inc r12
+    jmp .wf_word
+.wf_done:
+    call reposition_cursor
+    jmp .read_char
+
+.word_backward:
+    ; Alt-B: move cursor backward to start of previous word
+    test r12, r12
+    jz .read_char
+    dec r12
+.wb_skip_spaces:
+    test r12, r12
+    jz .wb_done
+    cmp byte [line_buf + r12 - 1], ' '
+    jne .wb_word
+    dec r12
+    jmp .wb_skip_spaces
+.wb_word:
+    test r12, r12
+    jz .wb_done
+    cmp byte [line_buf + r12 - 1], ' '
+    je .wb_done
+    dec r12
+    jmp .wb_word
+.wb_done:
+    call reposition_cursor
+    jmp .read_char
 
 .delete_key:
     ; Read the ~ after [3
@@ -2099,9 +2150,17 @@ read_line:
     ; Check for $VAR even in command position
     cmp byte [tab_word_buf], 0x24
     je .tab_var_completion
+    ; Check for :command completion
+    cmp byte [tab_word_buf], ':'
+    je .tab_colon_completion
     ; Search PATH directories for matches
     lea rdi, [tab_word_buf]
     call tab_complete_command
+    jmp .tab_process_results
+
+.tab_colon_completion:
+    lea rdi, [tab_word_buf]
+    call tab_complete_colon
     jmp .tab_process_results
 
 .tab_file_completion:
@@ -6104,8 +6163,12 @@ save_history:
     js .sh_done
     mov r12, rax             ; fd
 
-    ; Write each history line
-    xor r13d, r13d
+    ; Write last 1000 history entries (cap for rotation)
+    mov r13, [hist_count]
+    sub r13, 1000
+    test r13, r13
+    jns .sh_loop
+    xor r13, r13             ; start from 0 if < 1000 entries
 .sh_loop:
     cmp r13, [hist_count]
     jge .sh_close
@@ -13084,3 +13147,62 @@ check_lastdir:
     ret
 
 .cld_suffix: db "/.pointer/lastdir", 0
+
+; ══════════════════════════════════════════════════════════════════════
+; Tab complete colon commands (:th -> :theme, etc.)
+; rdi = word starting with ':'
+; ══════════════════════════════════════════════════════════════════════
+tab_complete_colon:
+    push rbx
+    push r12
+    push r13
+
+    mov r12, rdi             ; prefix (":th" etc.)
+    call strlen
+    mov r13, rax             ; prefix length
+
+    mov qword [tab_count], 0
+    mov qword [tab_buf_pos], 0
+
+    ; Scan colon_dispatch_table
+    lea rbx, [colon_dispatch_table]
+.tcc_loop:
+    mov rsi, [rbx]           ; string pointer
+    test rsi, rsi
+    jz .tcc_done             ; sentinel
+
+    ; Compare prefix against this command name
+    xor rcx, rcx
+.tcc_cmp:
+    cmp rcx, r13
+    jge .tcc_match           ; prefix fully matched
+    movzx eax, byte [r12 + rcx]
+    cmp al, [rsi + rcx]
+    jne .tcc_next
+    inc rcx
+    jmp .tcc_cmp
+
+.tcc_match:
+    cmp qword [tab_count], MAX_TAB_RESULTS - 1
+    jge .tcc_next
+    ; Copy command name to tab_buf
+    mov rax, [tab_buf_pos]
+    lea rdi, [tab_buf + rax]
+    mov rcx, [tab_count]
+    mov [tab_results + rcx*8], rdi
+    push rsi
+    call strcpy_rsi_rdi
+    pop rsi
+    inc rax                  ; past null
+    add [tab_buf_pos], rax
+    inc qword [tab_count]
+
+.tcc_next:
+    add rbx, 16              ; next entry (2 qwords: string + handler)
+    jmp .tcc_loop
+
+.tcc_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
