@@ -1,6 +1,6 @@
-bare (0.2.1-1) unstable; urgency=low
+bare (0.2.2-1) unstable; urgency=low
 
-  * Fix SIGSEGV on first keypress when no history file exists
+  * Fix SIGSEGV properly: zero rcx after syscall, not before
   * Add :save command for immediate config persistence
   * Fix nick/gnick/abbrev definitions containing semicolons
 
