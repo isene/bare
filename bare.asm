@@ -6411,7 +6411,6 @@ add_history:
     ret
 
 load_history:
-    xor ecx, ecx             ; init count to 0 (rcx clobbered by syscall)
     ; Open history file
     mov rax, SYS_OPEN
     lea rdi, [hist_path]
@@ -6419,7 +6418,7 @@ load_history:
     xor edx, edx
     syscall
     test rax, rax
-    js .lh_done              ; file doesn't exist
+    js .lh_no_history        ; file doesn't exist
     mov r12, rax             ; fd
 
     ; Read into hist_buf
@@ -6435,7 +6434,7 @@ load_history:
     syscall
 
     test r13, r13
-    jle .lh_done
+    jle .lh_no_history
 
     ; Parse lines
     lea rsi, [hist_buf]
@@ -6467,6 +6466,8 @@ load_history:
     inc rsi
     jmp .lh_parse
 
+.lh_no_history:
+    xor ecx, ecx
 .lh_done:
     mov [hist_count], rcx
     ret
