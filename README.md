@@ -8,6 +8,8 @@ Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure sy
 
 Pure syscalls, zero overhead. No interpreter, no runtime, no garbage collector. Just your keystrokes and the kernel.
 
+This is my login shell. It is not released for your use. It is released for inspiration. This is how you can benefit: 1) Clone this repo, 2) Fire up Claude Code, 3) Prompt it to make it into what you want or need.
+
 <br clear="left"/>
 
 ## Install

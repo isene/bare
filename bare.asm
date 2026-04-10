@@ -194,6 +194,7 @@ str_list_sess:  db ":list_sessions", 0
 str_del_sess:   db ":delete_session", 0
 str_record:     db ":record", 0
 str_replay:     db ":replay", 0
+str_save:       db ":save", 0
 str_version:    db ":version", 0
 str_info:       db ":info", 0
 str_help:       db ":help", 0
@@ -222,6 +223,7 @@ colon_dispatch_table:
     dq str_stats, handle_stats
     dq str_validate, handle_validate
     dq str_info, handle_info
+    dq str_save, handle_save
     dq str_save_sess, handle_save_session
     dq str_load_sess, handle_load_session
     dq str_list_sess, handle_list_sessions
@@ -3344,6 +3346,69 @@ parse_chain:
     mov rsi, r15
     xor ecx, ecx            ; command count
     mov [chain_cmds], rsi    ; first command starts at beginning
+
+    ; Skip chain splitting for alias definitions (value may contain ;)
+    cmp byte [rsi], ':'
+    jne .pc_scan
+    ; Check for :nick, :gnick, :abbrev
+    push rsi
+    inc rsi                  ; skip ':'
+    lea rdi, [.pc_str_nick]
+    call .pc_prefix_check
+    test rax, rax
+    jnz .pc_no_split
+    lea rdi, [.pc_str_gnick]
+    call .pc_prefix_check
+    test rax, rax
+    jnz .pc_no_split
+    lea rdi, [.pc_str_abbrev]
+    call .pc_prefix_check
+    test rax, rax
+    jnz .pc_no_split
+    pop rsi
+    jmp .pc_scan
+
+.pc_no_split:
+    pop rsi
+    ; Treat entire line as one command
+    mov qword [chain_count], 1
+    pop r12
+    pop rbx
+    ret
+
+.pc_prefix_check:
+    ; rsi = source (after ':'), rdi = target string
+    ; Returns rax=1 if prefix matches followed by space/null, rax=0 otherwise
+    push rsi
+.pc_pc_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .pc_pc_end
+    movzx ebx, byte [rsi]
+    cmp al, bl
+    jne .pc_pc_fail
+    inc rsi
+    inc rdi
+    jmp .pc_pc_loop
+.pc_pc_end:
+    ; Check that next char is space or null (word boundary)
+    movzx eax, byte [rsi]
+    cmp al, ' '
+    je .pc_pc_yes
+    test al, al
+    jz .pc_pc_yes
+.pc_pc_fail:
+    pop rsi
+    xor eax, eax
+    ret
+.pc_pc_yes:
+    pop rsi
+    mov eax, 1
+    ret
+
+.pc_str_nick: db "nick", 0
+.pc_str_gnick: db "gnick", 0
+.pc_str_abbrev: db "abbrev", 0
 
 .pc_scan:
     movzx eax, byte [rsi]
@@ -8466,6 +8531,19 @@ handle_info:
     mov qword [last_status], 0
     ret
 
+; :save
+handle_save:
+    call save_config
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hs_msg]
+    mov rdx, .hs_msg_len
+    syscall
+    mov qword [last_status], 0
+    ret
+.hs_msg: db "Config saved", 10
+.hs_msg_len equ $ - .hs_msg
+
 handle_version:
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -12501,6 +12579,8 @@ show_rprompt:
     jz .rp_done
     cmp qword [term_width], 0
     je .rp_done
+    cmp qword [term_width], 60
+    jl .rp_done              ; skip rprompt in narrow terminals
 
     ; Calculate duration
     mov rax, [cmd_end_time]
