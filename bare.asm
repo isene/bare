@@ -6411,6 +6411,7 @@ add_history:
     ret
 
 load_history:
+    xor ecx, ecx             ; init count to 0 (rcx clobbered by syscall)
     ; Open history file
     mov rax, SYS_OPEN
     lea rdi, [hist_path]
