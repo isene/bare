@@ -2,9 +2,9 @@
 
 <img src="img/bare.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-8%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.2.3-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-9%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
-Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, 126KB. **8 microsecond startup.**
+Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, 126KB. **9 microsecond startup.**
 
 Pure syscalls, zero overhead. No interpreter, no runtime, no garbage collector. Just your keystrokes and the kernel.
 
@@ -32,8 +32,8 @@ yay -S bare-shell
 ### Debian/Ubuntu
 
 ```bash
-curl -LO https://github.com/isene/bare/releases/latest/download/bare_0.1.0_amd64.deb
-sudo dpkg -i bare_0.1.0_amd64.deb
+curl -LO https://github.com/isene/bare/releases/latest/download/bare_0.2.3-1_amd64.deb
+sudo dpkg -i bare_0.2.3-1_amd64.deb
 ```
 
 ### Set as default shell
@@ -65,7 +65,7 @@ EOF
 
 ```
 $ ./bare --bench
-bare startup: 8 microseconds
+bare startup: 9 microseconds
 
 $ time ./bare -c exit
 ./bare -c exit  0.00s user 0.00s system 94% cpu 0.003 total
@@ -113,7 +113,7 @@ $ time ./bare -c exit
 - Prefix history search: type text, press Up/Down to filter
 - Alt-F / Alt-B: word movement forward/backward
 - Ctrl-G edit in `$EDITOR`, Ctrl-Y copy to clipboard
-- Syntax highlighting: commands, colon commands, switches, pipe segments
+- Syntax highlighting: valid commands (green), nicks (cyan), colon commands, switches
 - Multi-line editing: continuation on `\`, `|`, `&&`, `||`, unclosed quotes
 - Auto-pairing brackets and quotes (configurable)
 
@@ -158,7 +158,7 @@ The same shell, three languages:
 
 | Shell | Language | Startup | Suite |
 |-------|----------|---------|-------|
-| **[bare](https://github.com/isene/bare)** | **x86_64 Assembly** | **8us** | **CHasm** |
+| **[bare](https://github.com/isene/bare)** | **x86_64 Assembly** | **9us** | **CHasm** |
 | [rush](https://github.com/isene/rush) | Rust | ~26ms | Fe2O3 |
 | [rsh](https://github.com/isene/rsh) | Ruby | ~300ms | |
 
