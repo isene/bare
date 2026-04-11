@@ -195,6 +195,8 @@ str_del_sess:   db ":delete_session", 0
 str_record:     db ":record", 0
 str_replay:     db ":replay", 0
 str_save:       db ":save", 0
+str_backup:     db ":backup", 0
+str_restore:    db ":restore", 0
 str_version:    db ":version", 0
 str_info:       db ":info", 0
 str_help:       db ":help", 0
@@ -224,13 +226,15 @@ colon_dispatch_table:
     dq str_validate, handle_validate
     dq str_info, handle_info
     dq str_save, handle_save
+    dq str_backup, handle_backup
+    dq str_restore, handle_restore
     dq str_save_sess, handle_save_session
     dq str_load_sess, handle_load_session
     dq str_list_sess, handle_list_sessions
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.3", 10, 0
+version_str:    db "bare 0.2.4", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -578,6 +582,9 @@ valid_patterns: resq 32
 valid_actions:  resb 32                 ; 0=warn, 1=confirm, 2=block
 valid_count:    resq 1
 valid_storage:  resb 4096
+
+; Config save timestamp (to prevent overwriting newer config from another terminal)
+config_save_time: resq 1
 
 ; Executable cache for syntax highlighting
 exe_cache:      resb 65536              ; cached executable names (null-separated)
@@ -6419,6 +6426,9 @@ add_history:
     ret
 
 load_history:
+    push rbx
+    push r12
+    push r13
     ; Open history file
     mov rax, SYS_OPEN
     lea rdi, [hist_path]
@@ -6478,9 +6488,15 @@ load_history:
     xor ecx, ecx
 .lh_done:
     mov [hist_count], rcx
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 save_history:
+    push rbx
+    push r12
+    push r13
     ; Open history file for writing
     mov rax, SYS_OPEN
     lea rdi, [hist_path]
@@ -6528,6 +6544,9 @@ save_history:
     mov rdi, r12
     syscall
 .sh_done:
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
@@ -7119,6 +7138,15 @@ load_config:
     push r14
     push r15
 
+    ; Reset alias/bookmark counts (prevent duplicates on reload)
+    mov qword [nick_count], 0
+    mov qword [nick_storage_pos], 0
+    mov qword [gnick_count], 0
+    mov qword [gnick_storage_pos], 0
+    mov qword [abbrev_count], 0
+    mov qword [abbrev_storage_pos], 0
+    mov qword [bm_count], 0
+
     ; Open config file
     mov rax, SYS_OPEN
     lea rdi, [config_path]
@@ -7458,6 +7486,18 @@ load_config:
     jmp .lc_skip_to_nl
 
 .lc_done:
+    ; Record config file mtime as our baseline
+    sub rsp, 144
+    mov rax, SYS_STAT
+    lea rdi, [config_path]
+    mov rsi, rsp
+    syscall
+    test rax, rax
+    js .lc_no_stat
+    mov rax, [rsp + 88]
+    mov [config_save_time], rax
+.lc_no_stat:
+    add rsp, 144
     pop r15
     pop r14
     pop r13
@@ -8840,6 +8880,259 @@ handle_save:
     ret
 .hs_msg: db "Config saved", 10
 .hs_msg_len equ $ - .hs_msg
+
+; :backup [name] - backup ~/.barerc and ~/.bare_history
+; Default suffix is ".bak", with arg it's ".<name>"
+handle_backup:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi             ; argv array
+
+    ; Save config first
+    call save_config
+    call save_history
+
+    ; Get suffix: argv[1] or "bak"
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jnz .hb_have_name
+    lea rdi, [hbr_default_suffix]
+.hb_have_name:
+    mov r13, rdi             ; suffix
+
+    ; Copy config: config_path -> config_path.suffix
+    lea rdi, [config_path]
+    lea rsi, [path_buf]
+    call hbr_copy_path
+    lea rdi, [path_buf]
+    call hbr_append_suffix
+    lea rdi, [config_path]
+    lea rsi, [path_buf]
+    call hbr_copy_file
+    test rax, rax
+    js .hb_error
+
+    ; Copy history: hist_path -> hist_path.suffix
+    lea rdi, [hist_path]
+    lea rsi, [path_buf]
+    call hbr_copy_path
+    lea rdi, [path_buf]
+    call hbr_append_suffix
+    lea rdi, [hist_path]
+    lea rsi, [path_buf]
+    call hbr_copy_file
+    test rax, rax
+    js .hb_error
+
+    ; Print success
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [hb_ok_msg]
+    mov rdx, hb_ok_len
+    syscall
+    ; Print suffix name
+    mov rdi, r13
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    mov rsi, r13
+    syscall
+    call write_nl
+    mov qword [last_status], 0
+    jmp .hb_done
+.hb_error:
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [hb_err_msg]
+    mov rdx, hb_err_len
+    syscall
+    mov qword [last_status], 1
+.hb_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+hbr_default_suffix: db "bak", 0
+hb_ok_msg: db "Backed up to .", 0
+hb_ok_len equ $ - hb_ok_msg
+hb_err_msg: db "bare: backup failed", 10, 0
+hb_err_len equ 20
+
+; :restore [name] - restore ~/.barerc and ~/.bare_history from backup
+handle_restore:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi             ; argv array
+
+    ; Get suffix: argv[1] or "bak"
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jnz .hr_have_name
+    lea rdi, [hbr_default_suffix]
+.hr_have_name:
+    mov r13, rdi             ; suffix
+
+    ; Copy config: config_path.suffix -> config_path
+    lea rdi, [config_path]
+    lea rsi, [path_buf]
+    call hbr_copy_path
+    lea rdi, [path_buf]
+    call hbr_append_suffix
+    lea rdi, [path_buf]
+    lea rsi, [config_path]
+    call hbr_copy_file
+    test rax, rax
+    js .hr_error
+
+    ; Copy history: hist_path.suffix -> hist_path
+    lea rdi, [hist_path]
+    lea rsi, [path_buf]
+    call hbr_copy_path
+    lea rdi, [path_buf]
+    call hbr_append_suffix
+    lea rdi, [path_buf]
+    lea rsi, [hist_path]
+    call hbr_copy_file
+    test rax, rax
+    js .hr_error
+
+    ; Reload config and history
+    call load_config
+    call load_history
+
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hr_ok_msg]
+    mov rdx, .hr_ok_len
+    syscall
+    mov rdi, r13
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    mov rsi, r13
+    syscall
+    call write_nl
+    mov qword [last_status], 0
+    jmp .hr_done
+.hr_error:
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hr_err_msg]
+    mov rdx, .hr_err_len
+    syscall
+    mov qword [last_status], 1
+.hr_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.hr_ok_msg: db "Restored from .", 0
+.hr_ok_len equ $ - .hr_ok_msg
+.hr_err_msg: db "bare: restore failed (backup not found?)", 10, 0
+.hr_err_len equ 41
+
+; Helper: copy path string from [rdi] to [rsi]
+hbr_copy_path:
+    push rdi
+    mov rdi, rsi
+    mov rsi, [rsp]
+    call strcpy_rsi_rdi
+    pop rdi
+    ret
+
+; Helper: append ".suffix" to path at [rdi], using r13 as suffix
+hbr_append_suffix:
+    push rdi
+    call strlen
+    pop rdi
+    add rdi, rax
+    mov byte [rdi], '.'
+    inc rdi
+    mov rsi, r13
+.hbr_as_copy:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .hbr_as_done
+    inc rsi
+    inc rdi
+    jmp .hbr_as_copy
+.hbr_as_done:
+    ret
+
+; Helper: copy file [rdi] -> [rsi] using read/write loop
+; Returns rax=0 on success, rax=-1 on failure
+hbr_copy_file:
+    push rbx
+    push r14
+    push r15
+    mov r14, rdi             ; source path
+    mov r15, rsi             ; dest path
+
+    ; Open source
+    mov rax, SYS_OPEN
+    mov rdi, r14
+    xor esi, esi             ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .hbr_cf_fail
+    mov rbx, rax             ; source fd
+
+    ; Open dest (create/truncate)
+    mov rax, SYS_OPEN
+    mov rdi, r15
+    mov esi, O_WRONLY | O_CREAT | O_TRUNC
+    mov edx, 0o644
+    syscall
+    test rax, rax
+    js .hbr_cf_close_src
+    mov r14, rax             ; dest fd
+
+    ; Read/write loop using expand_buf
+.hbr_cf_loop:
+    mov rax, SYS_READ
+    mov rdi, rbx
+    lea rsi, [expand_buf]
+    mov rdx, 4096
+    syscall
+    test rax, rax
+    jle .hbr_cf_done
+
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r14
+    lea rsi, [expand_buf]
+    syscall
+    jmp .hbr_cf_loop
+
+.hbr_cf_done:
+    mov rax, SYS_CLOSE
+    mov rdi, r14
+    syscall
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+    xor eax, eax
+    pop r15
+    pop r14
+    pop rbx
+    ret
+
+.hbr_cf_close_src:
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+.hbr_cf_fail:
+    mov rax, -1
+    pop r15
+    pop r14
+    pop rbx
+    ret
 
 handle_version:
     mov rax, SYS_WRITE
@@ -11314,6 +11607,26 @@ save_config:
     push r12
     push r13
 
+    ; Check if config file on disk is newer than our last save
+    ; (another terminal may have saved a newer config)
+    sub rsp, 144
+    mov rax, SYS_STAT
+    lea rdi, [config_path]
+    mov rsi, rsp
+    syscall
+    test rax, rax
+    js .sc_no_stat            ; file doesn't exist yet, safe to write
+    mov rax, [rsp + 88]       ; file mtime
+    cmp rax, [config_save_time]
+    jle .sc_no_stat           ; file is older or same, safe to write
+    ; File is newer than our last save, skip to avoid overwriting
+    cmp qword [config_save_time], 0
+    je .sc_no_stat            ; first save (time=0), always write
+    add rsp, 144
+    jmp .sc_done
+.sc_no_stat:
+    add rsp, 144
+
     ; Open config file for writing
     mov rax, SYS_OPEN
     lea rdi, [config_path]
@@ -11681,6 +11994,23 @@ save_config:
     mov rax, SYS_CLOSE
     mov rdi, r12
     syscall
+    ; Record save time
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    add rsp, 16
+    ; Stat the file to get its mtime (filesystem time, not monotonic)
+    sub rsp, 144
+    mov rax, SYS_STAT
+    lea rdi, [config_path]
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp + 88]
+    mov [config_save_time], rax
+    add rsp, 144
 
 .sc_done:
     pop r13

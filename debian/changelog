@@ -1,3 +1,12 @@
+bare (0.2.4-1) unstable; urgency=low
+
+  * Add :backup and :restore commands for config/history snapshots
+  * Multi-terminal config safety: don't overwrite newer config on exit
+  * Fix save_history/load_history clobbering callee-saved registers
+  * Fix :restore duplicating nicks (clear before reload)
+
+ -- Geir Isene <g@isene.com>  Sat, 12 Apr 2026 00:00:00 +0000
+
 bare (0.2.3-1) unstable; urgency=low
 
   * Smart syntax highlighting: valid commands green, nicks cyan, unknown uncolored

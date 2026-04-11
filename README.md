@@ -2,7 +2,7 @@
 
 <img src="img/bare.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.2.3-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-9%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.2.4-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-9%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, 126KB. **9 microsecond startup.**
 
@@ -32,8 +32,8 @@ yay -S bare-shell
 ### Debian/Ubuntu
 
 ```bash
-curl -LO https://github.com/isene/bare/releases/latest/download/bare_0.2.3-1_amd64.deb
-sudo dpkg -i bare_0.2.3-1_amd64.deb
+curl -LO https://github.com/isene/bare/releases/latest/download/bare_0.2.4-1_amd64.deb
+sudo dpkg -i bare_0.2.4-1_amd64.deb
 ```
 
 ### Set as default shell
@@ -126,7 +126,7 @@ $ time ./bare -c exit
 - Companion TUI configurator: [bareconf](https://github.com/isene/bareconf)
 
 ### Configuration
-- `~/.barerc`: auto-saved on exit, line-based key=value format
+- `~/.barerc`: auto-saved on exit, line-based key=value format (multi-terminal safe)
 - `~/.bare_profile`: login profile (simple export lines)
 - `~/.bare_history`: capped at 1000 entries, smart deduplication
 - Runtime changes: `:config key value`
@@ -148,6 +148,7 @@ See [plugins/README.md](plugins/README.md) for setup and writing your own.
 ### Other Builtins
 - `cd`, `pwd`, `exit`, `export`, `unset`, `history`, `pushd`, `popd`, `time`
 - `:calc`, `:stats`, `:validate`, `:save_session`, `:load_session`
+- `:save`, `:backup [name]`, `:restore [name]` (config/history snapshots)
 - `:env`, `:rehash`, `:reload`, `:rmhistory`, `:info`, `:version`, `:help`
 - Auto-correct suggestions on command not found
 - Startup tips (configurable)
