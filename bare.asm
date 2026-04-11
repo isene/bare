@@ -579,6 +579,11 @@ valid_actions:  resb 32                 ; 0=warn, 1=confirm, 2=block
 valid_count:    resq 1
 valid_storage:  resb 4096
 
+; Executable cache for syntax highlighting
+exe_cache:      resb 65536              ; cached executable names (null-separated)
+exe_cache_pos:  resq 1                  ; current write position
+exe_cache_count: resq 1                 ; number of cached names
+
 ; Session buffer
 session_buf:    resb 16384
 
@@ -744,6 +749,9 @@ _start:
 
     ; Get initial working directory
     call update_cwd
+
+    ; Cache PATH executables for syntax highlighting
+    call init_exe_cache
 
     ; Initialize last_status
     mov qword [last_status], 0
@@ -6666,6 +6674,293 @@ itoa:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
+; Cache all executables in PATH for syntax highlighting
+; Scans each PATH directory and stores names in exe_cache
+; ══════════════════════════════════════════════════════════════════════
+init_exe_cache:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov qword [exe_cache_pos], 0
+    mov qword [exe_cache_count], 0
+
+    ; Get PATH
+    mov rdi, [envp]
+    call find_env_path
+    test rax, rax
+    jnz .iec_have_path
+    lea rax, [default_path]
+.iec_have_path:
+    mov r14, rax             ; PATH string
+
+.iec_next_dir:
+    cmp byte [r14], 0
+    je .iec_done
+
+    ; Extract next directory from PATH
+    lea rdi, [path_buf]
+    mov rsi, r14
+.iec_copy_dir:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .iec_dir_end
+    cmp al, ':'
+    je .iec_dir_end
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .iec_copy_dir
+.iec_dir_end:
+    mov byte [rdi], 0
+    mov r14, rsi
+    cmp byte [r14], ':'
+    jne .iec_scan_dir
+    inc r14
+
+.iec_scan_dir:
+    mov rax, SYS_OPEN
+    lea rdi, [path_buf]
+    mov rsi, O_RDONLY | O_DIRECTORY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .iec_next_dir
+    mov r15, rax             ; fd
+
+.iec_read_entries:
+    mov rax, SYS_GETDENTS64
+    mov rdi, r15
+    lea rsi, [tab_dir_buf]
+    mov rdx, 4096
+    syscall
+    test rax, rax
+    jle .iec_close_dir
+
+    xor r12, r12
+.iec_entry_loop:
+    cmp r12, rax
+    jge .iec_read_entries
+
+    lea rsi, [tab_dir_buf + r12]
+    movzx edx, word [rsi + DIRENT64_D_RECLEN]
+    lea rdi, [rsi + DIRENT64_D_NAME]
+
+    ; Skip . and ..
+    cmp byte [rdi], '.'
+    jne .iec_not_dot
+    cmp byte [rdi + 1], 0
+    je .iec_skip
+    cmp byte [rdi + 1], '.'
+    jne .iec_not_dot
+    cmp byte [rdi + 2], 0
+    je .iec_skip
+.iec_not_dot:
+    ; Check buffer space
+    mov rcx, [exe_cache_pos]
+    cmp rcx, 64000
+    jge .iec_close_dir       ; cache full
+
+    ; Check for duplicates
+    push rax
+    push rdx
+    push rdi
+    call .iec_is_dup
+    test rax, rax
+    pop rdi
+    pop rdx
+    pop rax
+    jnz .iec_skip            ; duplicate, skip
+
+    ; Copy name to cache
+    push rax
+    push rdx
+    mov rcx, [exe_cache_pos]
+    lea r13, [exe_cache + rcx]
+    mov rsi, rdi
+.iec_copy_name:
+    movzx ebx, byte [rsi]
+    mov [r13], bl
+    test bl, bl
+    jz .iec_name_done
+    inc rsi
+    inc r13
+    jmp .iec_copy_name
+.iec_name_done:
+    mov byte [r13], 0
+    inc r13
+    sub r13, exe_cache
+    mov [exe_cache_pos], r13
+    inc qword [exe_cache_count]
+    pop rdx
+    pop rax
+
+.iec_skip:
+    add r12, rdx
+    jmp .iec_entry_loop
+
+.iec_close_dir:
+    push r14
+    mov rax, SYS_CLOSE
+    mov rdi, r15
+    syscall
+    pop r14
+    jmp .iec_next_dir
+
+.iec_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Check if name (rdi) is already in exe_cache. Returns rax=1 if dup, 0 if not.
+.iec_is_dup:
+    push rbx
+    push rcx
+    push rsi
+    lea rsi, [exe_cache]
+    mov rcx, [exe_cache_pos]
+    test rcx, rcx
+    jz .iec_dup_no
+    lea rbx, [exe_cache + rcx]  ; end of cache
+.iec_dup_scan:
+    cmp rsi, rbx
+    jge .iec_dup_no
+    ; Compare rdi with rsi
+    push rdi
+    push rsi
+.iec_dup_cmp:
+    movzx eax, byte [rdi]
+    movzx ecx, byte [rsi]
+    cmp al, cl
+    jne .iec_dup_next
+    test al, al
+    jz .iec_dup_yes
+    inc rdi
+    inc rsi
+    jmp .iec_dup_cmp
+.iec_dup_next:
+    pop rsi
+    pop rdi
+    ; Advance rsi to next null
+.iec_dup_skip:
+    cmp byte [rsi], 0
+    je .iec_dup_adv
+    inc rsi
+    jmp .iec_dup_skip
+.iec_dup_adv:
+    inc rsi                  ; skip null
+    jmp .iec_dup_scan
+.iec_dup_yes:
+    pop rsi
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    mov eax, 1
+    ret
+.iec_dup_no:
+    pop rsi
+    pop rcx
+    pop rbx
+    xor eax, eax
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Check if a null-terminated word is a cached executable
+; rdi = word to check. Returns rax=1 if found, 0 if not.
+; ══════════════════════════════════════════════════════════════════════
+is_exe_cached:
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    lea rsi, [exe_cache]
+    mov rcx, [exe_cache_pos]
+    test rcx, rcx
+    jz .ixc_no
+    lea rbx, [exe_cache + rcx]
+.ixc_scan:
+    cmp rsi, rbx
+    jge .ixc_no
+    mov rdi, [rsp]           ; reload original word
+.ixc_cmp:
+    movzx eax, byte [rdi]
+    movzx ecx, byte [rsi]
+    cmp al, cl
+    jne .ixc_next
+    test al, al
+    jz .ixc_yes
+    inc rdi
+    inc rsi
+    jmp .ixc_cmp
+.ixc_next:
+    ; Advance rsi past current entry
+.ixc_skip:
+    cmp byte [rsi], 0
+    je .ixc_adv
+    inc rsi
+    jmp .ixc_skip
+.ixc_adv:
+    inc rsi
+    jmp .ixc_scan
+.ixc_yes:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    mov eax, 1
+    ret
+.ixc_no:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    xor eax, eax
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Check if a null-terminated word is a nick name
+; rdi = word. Returns rax=1 if found, 0 if not.
+; ══════════════════════════════════════════════════════════════════════
+is_nick_name:
+    push rbx
+    push rcx
+    push rdi
+    xor ecx, ecx
+.inn_loop:
+    cmp rcx, [nick_count]
+    jge .inn_no
+    mov rsi, [nick_names + rcx*8]
+    test rsi, rsi
+    jz .inn_next
+    mov rdi, [rsp]           ; reload word
+    push rcx
+    call strcmp
+    pop rcx
+    test rax, rax
+    jz .inn_yes
+.inn_next:
+    inc rcx
+    jmp .inn_loop
+.inn_yes:
+    pop rdi
+    pop rcx
+    pop rbx
+    mov eax, 1
+    ret
+.inn_no:
+    pop rdi
+    pop rcx
+    pop rbx
+    xor eax, eax
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
 ; Initialize default color settings
 ; ══════════════════════════════════════════════════════════════════════
 init_default_colors:
@@ -11654,19 +11949,69 @@ syntax_highlight_line:
 .shl_cmd_color:
     ; rcx = word end, r14 = word start
     push rcx
-    ; Pick color based on first char
-    movzx eax, byte [color_settings + C_CMD]
+    ; Determine command color by type
+    ; First, copy the word to num_buf for null-terminated lookup
+    push rcx
+    mov rdx, r14
+    lea rdi, [num_buf]
+.shl_cmd_extract:
+    cmp rdx, [rsp]
+    jge .shl_cmd_null
+    movzx eax, byte [line_buf + rdx]
+    mov [rdi], al
+    inc rdi
+    inc rdx
+    jmp .shl_cmd_extract
+.shl_cmd_null:
+    mov byte [rdi], 0
+    pop rcx
+
+    ; Check type: colon command, nick, builtin, executable, or unknown
     cmp byte [line_buf + r14], ':'
-    jne .shl_cmd_def
+    je .shl_cmd_is_colon
+
+    ; Check if it's a nick
+    push rcx
+    lea rdi, [num_buf]
+    call is_nick_name
+    pop rcx
+    test rax, rax
+    jnz .shl_cmd_is_nick
+
+    ; Check if it's a builtin (cd, exit, pwd, export, unset, history, time, pushd, popd)
+    push rcx
+    lea rdi, [num_buf]
+    call .shl_is_builtin
+    pop rcx
+    test rax, rax
+    jnz .shl_cmd_is_exe
+
+    ; Check if it's in exe cache
+    push rcx
+    lea rdi, [num_buf]
+    call is_exe_cached
+    pop rcx
+    test rax, rax
+    jnz .shl_cmd_is_exe
+
+    ; Unknown command: copy without color
+    jmp .shl_cmd_no_color
+
+.shl_cmd_is_colon:
     movzx eax, byte [color_settings + C_COLON]
-.shl_cmd_def:
-    ; Write color
+    jmp .shl_cmd_apply_color
+.shl_cmd_is_nick:
+    movzx eax, byte [color_settings + C_NICK]
+    jmp .shl_cmd_apply_color
+.shl_cmd_is_exe:
+    movzx eax, byte [color_settings + C_CMD]
+
+.shl_cmd_apply_color:
     push rax
     lea rdi, [suggestion_buf + rbx]
     call write_fg_color
     add rbx, rax
     pop rax
-    ; Copy word
     lea rdi, [suggestion_buf]
     pop rcx
     push rcx
@@ -11680,15 +12025,79 @@ syntax_highlight_line:
     inc rdx
     jmp .shl_cmd_copy
 .shl_cmd_reset:
-    ; Reset color
     mov byte [rdi + rbx], 27
     mov byte [rdi + rbx + 1], '['
     mov byte [rdi + rbx + 2], '0'
     mov byte [rdi + rbx + 3], 'm'
     add rbx, 4
     pop rcx
-    mov r15, 0               ; no longer in command position
+    mov r15, 0
     jmp .shl_char
+
+.shl_cmd_no_color:
+    lea rdi, [suggestion_buf]
+    pop rcx
+    push rcx
+    mov rdx, r14
+.shl_plain_copy:
+    cmp rdx, rcx
+    jge .shl_plain_done
+    movzx eax, byte [line_buf + rdx]
+    mov [rdi + rbx], al
+    inc rbx
+    inc rdx
+    jmp .shl_plain_copy
+.shl_plain_done:
+    pop rcx
+    mov r15, 0
+    jmp .shl_char
+
+; Check if num_buf is a builtin command. rdi = word. Returns rax=1/0.
+.shl_is_builtin:
+    push rsi
+    lea rsi, [str_cd]
+    call strcmp
+    test rax, rax
+    jz .shl_bi_yes
+    lea rsi, [str_exit]
+    call strcmp
+    test rax, rax
+    jz .shl_bi_yes
+    lea rsi, [str_pwd]
+    call strcmp
+    test rax, rax
+    jz .shl_bi_yes
+    lea rsi, [str_export]
+    call strcmp
+    test rax, rax
+    jz .shl_bi_yes
+    lea rsi, [str_unset]
+    call strcmp
+    test rax, rax
+    jz .shl_bi_yes
+    lea rsi, [str_history]
+    call strcmp
+    test rax, rax
+    jz .shl_bi_yes
+    lea rsi, [str_time]
+    call strcmp
+    test rax, rax
+    jz .shl_bi_yes
+    lea rsi, [str_pushd]
+    call strcmp
+    test rax, rax
+    jz .shl_bi_yes
+    lea rsi, [str_popd]
+    call strcmp
+    test rax, rax
+    jz .shl_bi_yes
+    pop rsi
+    xor eax, eax
+    ret
+.shl_bi_yes:
+    pop rsi
+    mov eax, 1
+    ret
 
 .shl_not_cmd:
     ; Switch coloring (-x or --x)
