@@ -779,7 +779,10 @@ _start:
     jmp .cmd_copy
 .cmd_exec:
     mov [line_len], rcx
+    call expand_cmd_subst
     call expand_line
+    call expand_braces
+    call expand_gnicks
     mov rdi, line_buf
     call execute_chained_line
     mov rdi, [last_status]
