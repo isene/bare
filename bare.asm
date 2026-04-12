@@ -2484,16 +2484,14 @@ read_line:
     mov rdx, .tab_color_link_len
     syscall
 .tab_cycle_name:
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [tab_results + rcx*8]
     mov rdi, rsi
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [tab_results + rcx*8]
     syscall
     ; Reset color
@@ -4689,8 +4687,7 @@ check_builtin:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [env_array + rcx*8]
     syscall
     call write_nl
@@ -4748,8 +4745,7 @@ check_builtin:
     mov rdx, 1
     syscall
     ; Print history line
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [hist_lines + rcx*8]
     test rsi, rsi
     jz .hist_skip_entry
@@ -4758,8 +4754,7 @@ check_builtin:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [hist_lines + rcx*8]
     syscall
 .hist_skip_entry:
@@ -5299,13 +5294,14 @@ glob_expand_single:
     je .ges_just_name
 
     ; Copy "dir/" + name to glob_buf
-    lea rbx, [glob_buf]          ; reusing rbx temporarily is bad, save fd
-    push rbx                      ; save fd on stack
-    mov rbx, [glob_buf_pos]
-    lea rdi, [glob_buf + rbx]
+    push rbx                 ; save fd
+    push rdi                 ; save d_name pointer
+    mov rcx, [glob_buf_pos]
+    lea rbx, [glob_buf + rcx]
+    mov rdi, rbx             ; dest = glob_buf write position
     ; Copy directory prefix
     mov rsi, r12
-    mov rcx, r13             ; includes the trailing slash
+    mov rcx, r13
 .ges_copy_prefix:
     test rcx, rcx
     jz .ges_prefix_done
@@ -5313,20 +5309,34 @@ glob_expand_single:
     mov [rdi], al
     inc rsi
     inc rdi
-    inc rbx
     dec rcx
     jmp .ges_copy_prefix
 .ges_prefix_done:
-    ; Copy name
-    pop rax                  ; restore fd to rax
-    push rax                 ; keep it on stack
-    lea rsi, [glob_dir_buf]
-    ; We need to reconstruct the pointer to d_name
-    ; Actually, we already have the entry pointer on the stack... let's just recalculate
-    ; Get the current entry offset from the outer stack
-    ; This is getting messy, let's use a simpler approach
+    ; Copy entry name after prefix
+    pop rsi                  ; restore d_name as source
+    xor rcx, rcx
+.ges_copy_prefixed_name:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .ges_prefixed_done
+    inc rcx
+    cmp rcx, 255
+    jge .ges_prefixed_done
+    jmp .ges_copy_prefixed_name
+.ges_prefixed_done:
+    mov byte [rdi + rcx], 0
+    ; Calculate total length: prefix + name + null
+    add rcx, r13
+    inc rcx
+    ; Record in glob_results
+    mov rax, [glob_count]
+    mov [glob_results + rax*8], rbx
+    inc qword [glob_count]
+    add rcx, [glob_buf_pos]
+    mov [glob_buf_pos], rcx
     pop rbx                  ; restore fd
-    jmp .ges_skip_entry      ; bail out of the complex path case for now
+    jmp .ges_skip_entry
 
 .ges_just_name:
     ; Copy just the name to glob_buf
@@ -8555,8 +8565,7 @@ handle_nick:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [nick_names + rcx*8]
     syscall
     ; Print " = "
@@ -8566,16 +8575,14 @@ handle_nick:
     mov rdx, 3
     syscall
     ; Print value
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [nick_values + rcx*8]
     mov rdi, rsi
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [nick_values + rcx*8]
     syscall
     ; Newline
@@ -8691,8 +8698,7 @@ handle_gnick:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [gnick_names + rcx*8]
     syscall
     mov rax, SYS_WRITE
@@ -8700,16 +8706,14 @@ handle_gnick:
     lea rsi, [nick_arrow]
     mov rdx, 3
     syscall
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [gnick_values + rcx*8]
     mov rdi, rsi
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [gnick_values + rcx*8]
     syscall
     call write_nl
@@ -8819,8 +8823,7 @@ handle_abbrev:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [abbrev_names + rcx*8]
     syscall
     mov rax, SYS_WRITE
@@ -8828,16 +8831,14 @@ handle_abbrev:
     lea rsi, [nick_arrow]
     mov rdx, 3
     syscall
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [abbrev_values + rcx*8]
     mov rdi, rsi
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [abbrev_values + rcx*8]
     syscall
     call write_nl
@@ -9288,8 +9289,7 @@ handle_bm:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [bm_names + rcx*8]
     syscall
     ; Print " -> "
@@ -9299,21 +9299,18 @@ handle_bm:
     mov rdx, 3
     syscall
     ; Print path
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [bm_paths + rcx*8]
     mov rdi, rsi
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [bm_paths + rcx*8]
     syscall
     ; Print tags if any
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [bm_tags + rcx*8]
     test rsi, rsi
     jz .hbm_no_tags
@@ -9332,12 +9329,10 @@ handle_bm:
     pop rdx
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [bm_tags + rcx*8]
     syscall
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
 .hbm_no_tags:
     call write_nl
     pop rcx
@@ -9409,16 +9404,14 @@ handle_dirs:
     mov rdx, 1
     syscall
     ; Print path
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [dir_history + rcx*8]
     mov rdi, rsi
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [dir_history + rcx*8]
     syscall
     call write_nl
@@ -10782,9 +10775,9 @@ add_job:
     mov rdi, [job_cmds + rax*8 - 8]
     push rax
     call strlen
-    pop rax
     add rdi, rax
     inc rdi
+    pop rax
 .aj_store:
     mov [job_cmds + rax*8], rdi
     ; Copy command string
@@ -10826,8 +10819,7 @@ handle_jobs:
     lea rsi, [.hj_bracket_open]
     mov rdx, 1
     syscall
-    pop r12
-    push r12
+    mov r12, [rsp]
     mov rax, r12
     inc rax
     lea rdi, [num_buf]
@@ -10843,8 +10835,7 @@ handle_jobs:
     mov rdx, 2
     syscall
     ; Status
-    pop r12
-    push r12
+    mov r12, [rsp]
     cmp qword [job_status + r12*8], 1
     je .hj_stopped
     mov rax, SYS_WRITE
@@ -10861,8 +10852,7 @@ handle_jobs:
     syscall
 .hj_pid:
     ; Print PID
-    pop r12
-    push r12
+    mov r12, [rsp]
     mov rax, [job_pids + r12*8]
     lea rdi, [num_buf]
     call itoa
@@ -10878,16 +10868,14 @@ handle_jobs:
     mov rdx, 3
     syscall
     ; Print command
-    pop r12
-    push r12
+    mov r12, [rsp]
     mov rsi, [job_cmds + r12*8]
     mov rdi, rsi
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop r12
-    push r12
+    mov r12, [rsp]
     mov rsi, [job_cmds + r12*8]
     syscall
     call write_nl
@@ -11138,8 +11126,7 @@ handle_theme:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [r13 + rcx*8]
     syscall
     mov rax, SYS_WRITE
@@ -11276,8 +11263,7 @@ handle_env:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [env_array + rcx*8]
     syscall
     call write_nl
@@ -11492,8 +11478,7 @@ handle_config:
     lea rsi, [.hcfg_c_prefix]
     mov rdx, 4
     syscall
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     ; Get color name string
     mov rsi, [rbx + rcx*8]
     mov rdi, rsi
@@ -11501,8 +11486,7 @@ handle_config:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [rbx + rcx*8]
     syscall
     ; " = "
@@ -11512,8 +11496,7 @@ handle_config:
     mov rdx, 3
     syscall
     ; Print color value
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     movzx eax, byte [color_settings + rcx]
     lea rdi, [num_buf]
     call itoa
@@ -11523,8 +11506,7 @@ handle_config:
     lea rsi, [num_buf]
     syscall
     ; Print color preview: colored block
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     movzx eax, byte [color_settings + rcx]
     lea rdi, [tmp_buf]
     call write_fg_color
@@ -11807,8 +11789,7 @@ save_config:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, r12
-    pop r13
-    push r13
+    mov r13, [rsp]
     mov rsi, [rbx + r13*8]
     syscall
     ; " = "
@@ -11818,8 +11799,7 @@ save_config:
     mov rdx, 3
     syscall
     ; Write value
-    pop r13
-    push r13
+    mov r13, [rsp]
     movzx eax, byte [color_settings + r13]
     lea rdi, [num_buf]
     call itoa
@@ -12343,8 +12323,7 @@ syntax_highlight_line:
     add rbx, rax
     pop rax
     lea rdi, [suggestion_buf]
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rdx, r14
 .shl_cmd_copy:
     cmp rdx, rcx
@@ -12366,8 +12345,7 @@ syntax_highlight_line:
 
 .shl_cmd_no_color:
     lea rdi, [suggestion_buf]
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rdx, r14
 .shl_plain_copy:
     cmp rdx, rcx
@@ -12654,8 +12632,7 @@ check_subcommand_completion:
 .csc_match:
     cmp qword [tab_count], MAX_TAB_RESULTS - 1
     jge .csc_skip
-    pop rsi
-    push rsi
+    mov rsi, [rsp]
     mov rax, [tab_buf_pos]
     lea rbx, [tab_buf + rax]
     mov rcx, [tab_count]
@@ -12916,9 +12893,9 @@ handle_stats:
     mov rdi, [cmd_freq_names + r13*8 - 8]
     push rax
     call strlen
-    pop rax
     add rdi, rax
     inc rdi
+    pop rax
 .hs_store:
     mov [cmd_freq_names + r13*8], rdi
     lea rsi, [search_buf]
@@ -12969,16 +12946,14 @@ handle_stats:
     lea rsi, [.hs_sp]
     mov rdx, 2
     syscall
-    pop rbx
-    push rbx
+    mov rbx, [rsp]
     mov rsi, [cmd_freq_names + rbx*8]
     mov rdi, rsi
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rbx
-    push rbx
+    mov rbx, [rsp]
     mov rsi, [cmd_freq_names + rbx*8]
     syscall
     call write_nl
@@ -13050,9 +13025,9 @@ handle_validate:
     mov rdi, [valid_patterns + rax*8 - 8]
     push rax
     call strlen
-    pop rax
     add rdi, rax
     inc rdi
+    pop rax
 .hv_sp:
     mov [valid_patterns + rax*8], rdi
     push rsi
@@ -13129,16 +13104,14 @@ handle_validate:
     lea rsi, [.hv_dot]
     mov rdx, 2
     syscall
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [valid_patterns + rcx*8]
     mov rdi, rsi
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [valid_patterns + rcx*8]
     syscall
     mov rax, SYS_WRITE
@@ -13146,8 +13119,7 @@ handle_validate:
     lea rsi, [nick_arrow]
     mov rdx, 3
     syscall
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     movzx eax, byte [valid_actions + rcx]
     lea rsi, [.hv_w]
     test al, al
@@ -13162,8 +13134,7 @@ handle_validate:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     syscall
     call write_nl
     pop rcx
@@ -13561,8 +13532,7 @@ suggest_correction:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 2
-    pop rsi
-    push rsi
+    mov rsi, [rsp]
     syscall
     mov rax, SYS_WRITE
     mov rdi, 2
@@ -13702,8 +13672,7 @@ handle_save_session:
     lea rsi, [.hss_hist_tag]
     mov rdx, 5
     syscall
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [hist_lines + rcx*8]
     test rsi, rsi
     jz .hss_hist_next
@@ -13712,8 +13681,7 @@ handle_save_session:
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, rbx
-    pop rcx
-    push rcx
+    mov rcx, [rsp]
     mov rsi, [hist_lines + rcx*8]
     syscall
     mov rax, SYS_WRITE
