@@ -586,6 +586,11 @@ valid_storage:  resb 4096
 ; Config save timestamp (to prevent overwriting newer config from another terminal)
 config_save_time: resq 1
 
+; Switch completion buffers
+switch_cmd_buf:  resb 256               ; command name extracted from line
+switch_help_buf: resb 16384             ; captured --help output
+switch_tmp_buf:  resb 64                ; temp buffer for switch dedup
+
 ; Executable cache for syntax highlighting
 exe_cache:      resb 65536              ; cached executable names (null-separated)
 exe_cache_pos:  resq 1                  ; current write position
@@ -2351,6 +2356,14 @@ read_line:
     cmp byte [tab_word_buf], 0x24
     je .tab_var_completion
 
+    ; Check for switch completion (-<TAB> or --<TAB>)
+    cmp byte [tab_word_buf], '-'
+    jne .tab_not_switch
+    call tab_complete_switch
+    cmp qword [tab_count], 0
+    jnz .tab_process_results
+.tab_not_switch:
+
     ; Check for subcommand completion (git, apt, cargo, etc.)
     call check_subcommand_completion
     test rax, rax
@@ -2405,6 +2418,15 @@ read_line:
     test rcx, rcx
     jz .tab_add_space
     movzx eax, byte [rsi]
+    ; Escape spaces with backslash
+    cmp al, ' '
+    jne .tab_no_escape
+    cmp r12, 16380
+    jge .tab_add_space
+    mov byte [line_buf + r12], '\'
+    inc r12
+    inc qword [line_len]
+.tab_no_escape:
     mov [line_buf + r12], al
     inc r12
     inc qword [line_len]
@@ -2413,10 +2435,45 @@ read_line:
     jmp .tab_insert_loop
 
 .tab_add_space:
+    ; Check if match is a directory: add '/' instead of ' '
+    movzx eax, byte [tab_types]
+    cmp al, 4
+    je .tab_add_slash
+    ; d_type unknown (0) or symlink (10): stat to check if directory
+    cmp al, 10
+    je .tab_stat_check
+    test al, al
+    jnz .tab_add_sp
+.tab_stat_check:
+    ; Stat the completed word to see if it's a directory
+    mov byte [line_buf + r12], 0  ; null-terminate temporarily
+    sub rsp, 144
+    mov rax, SYS_STAT
+    lea rdi, [line_buf + r14]     ; full word from word start
+    mov rsi, rsp
+    syscall
+    test rax, rax
+    js .tab_stat_fail
+    mov eax, [rsp + 24]          ; st_mode
+    and eax, 0o170000            ; S_IFMT mask
+    cmp eax, 0o040000            ; S_IFDIR
+    je .tab_stat_dir
+.tab_stat_fail:
+    add rsp, 144
+    jmp .tab_add_sp
+.tab_stat_dir:
+    add rsp, 144
+.tab_add_slash:
+    mov byte [line_buf + r12], '/'
+    inc r12
+    inc qword [line_len]
+    jmp .tab_space_done
+.tab_add_sp:
     ; Add a trailing space
     mov byte [line_buf + r12], ' '
     inc r12
     inc qword [line_len]
+.tab_space_done:
     ; Null-terminate and redraw with highlighting
     mov rcx, [line_len]
     mov byte [line_buf + rcx], 0
@@ -2629,9 +2686,41 @@ read_line:
     jmp .tab_cycle_cleanup
 
 .tab_cycle_accept_space:
-    ; Accept and add trailing space
+    ; Accept and add trailing space (or / for directories)
     call .tab_apply_selection
+    ; Check d_type of selected match
+    movzx eax, byte [tab_types + r15]
+    cmp al, 4                ; DT_DIR
+    je .tab_cycle_add_slash
+    ; If d_type unknown (0) or symlink (10), stat to check
+    cmp al, 10
+    je .tab_cyc_stat_check
+    test al, al
+    jnz .tab_cycle_add_sp
+.tab_cyc_stat_check:
+    mov byte [line_buf + r12], 0
+    sub rsp, 144
+    mov rax, SYS_STAT
+    lea rdi, [line_buf + r14]
+    mov rsi, rsp
+    syscall
+    test rax, rax
+    js .tab_cyc_stat_fail
+    mov eax, [rsp + 24]
+    and eax, 0o170000
+    cmp eax, 0o040000
+    je .tab_cyc_stat_dir
+.tab_cyc_stat_fail:
+    add rsp, 144
+    jmp .tab_cycle_add_sp
+.tab_cyc_stat_dir:
+    add rsp, 144
+.tab_cycle_add_slash:
+    mov byte [line_buf + r12], '/'
+    jmp .tab_cycle_sp_done
+.tab_cycle_add_sp:
     mov byte [line_buf + r12], ' '
+.tab_cycle_sp_done:
     inc r12
     inc qword [line_len]
     mov byte [line_buf + r12], 0  ; null-terminate
@@ -2707,6 +2796,12 @@ read_line:
     movzx edx, byte [rsi + rcx]
     test dl, dl
     jz .tps_match_done
+    ; Escape spaces with backslash
+    cmp dl, ' '
+    jne .tps_no_esc
+    mov byte [rdi + rax], '\'
+    inc rax
+.tps_no_esc:
     mov [rdi + rax], dl
     inc rax
     inc rcx
@@ -4344,21 +4439,53 @@ parse_argv:
     ; Unquoted arg
     mov [argv_ptrs + rcx*8], rdi
     inc ecx
+    ; Use rbx as write pointer (for in-place backslash removal)
+    mov rbx, rdi
 .pa_unquoted:
     cmp byte [rdi], 0
-    je .pa_done
+    je .pa_done_compact
     cmp byte [rdi], 10
-    je .pa_term
-    cmp byte [rdi], ' '
-    je .pa_term
-    cmp byte [rdi], 9
-    je .pa_term
-    cmp byte [rdi], '>'
-    je .pa_term_nordi
-    cmp byte [rdi], '<'
-    je .pa_term_nordi
+    je .pa_term_compact
+    ; Backslash escape: '\' followed by space means literal space
+    cmp byte [rdi], '\'
+    jne .pa_not_escape
+    cmp byte [rdi + 1], ' '
+    jne .pa_not_escape
+    ; Skip the backslash, copy the space
     inc rdi
+    mov al, [rdi]
+    mov [rbx], al
+    inc rdi
+    inc rbx
     jmp .pa_unquoted
+.pa_not_escape:
+    cmp byte [rdi], ' '
+    je .pa_term_compact
+    cmp byte [rdi], 9
+    je .pa_term_compact
+    cmp byte [rdi], '>'
+    je .pa_term_compact_nordi
+    cmp byte [rdi], '<'
+    je .pa_term_compact_nordi
+    ; Copy char (may be same position if no escapes removed)
+    mov al, [rdi]
+    mov [rbx], al
+    inc rdi
+    inc rbx
+    jmp .pa_unquoted
+
+.pa_term_compact:
+    mov byte [rbx], 0
+    inc rdi
+    jmp .pa_skip
+
+.pa_done_compact:
+    mov byte [rbx], 0
+    jmp .pa_done
+
+.pa_term_compact_nordi:
+    mov byte [rbx], 0
+    jmp .pa_check              ; re-check for redirect without advancing
 
 .pa_term:
     mov byte [rdi], 0
@@ -5903,7 +6030,7 @@ tab_complete_file:
     push rdx
     push rdi
 
-    ; Skip . and ..
+    ; Skip . and .. (but allow .. if prefix is "..")
     cmp byte [rdi], '.'
     jne .tcf_check_prefix
     cmp byte [rdi + 1], 0
@@ -5911,7 +6038,13 @@ tab_complete_file:
     cmp byte [rdi + 1], '.'
     jne .tcf_check_dot_prefix
     cmp byte [rdi + 2], 0
-    je .tcf_no_match_f
+    jne .tcf_check_dot_prefix
+    ; Entry is ".." - allow it if prefix starts with ".."
+    cmp byte [r15], '.'
+    jne .tcf_no_match_f
+    cmp byte [r15 + 1], '.'
+    jne .tcf_no_match_f
+    jmp .tcf_check_prefix    ; allow ".." to be matched
 .tcf_check_dot_prefix:
     ; Only show dot files if prefix starts with dot
     cmp byte [r15], '.'
@@ -8431,6 +8564,12 @@ expand_nicks:
     mov al, [rsi]
     test al, al
     jz .en_arg_done
+    ; Re-escape spaces with backslash
+    cmp al, ' '
+    jne .en_no_esc
+    mov byte [rdi], '\'
+    inc rdi
+.en_no_esc:
     mov [rdi], al
     inc rsi
     inc rdi
@@ -12477,6 +12616,372 @@ syntax_highlight_line:
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Tab complete $VAR from environment
+; ══════════════════════════════════════════════════════════════════════
+; Tab complete switches by running "command --help" and parsing output
+; Reads first word from line_buf as the command name.
+; Matches switches starting with tab_word_buf prefix.
+; ══════════════════════════════════════════════════════════════════════
+tab_complete_switch:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov qword [tab_count], 0
+    mov qword [tab_buf_pos], 0
+
+    ; Extract command name (first word of line_buf)
+    lea rsi, [line_buf]
+    lea rdi, [switch_cmd_buf]
+    xor ecx, ecx
+.tcs_copy_cmd:
+    movzx eax, byte [rsi + rcx]
+    test al, al
+    jz .tcs_cmd_done
+    cmp al, ' '
+    je .tcs_cmd_done
+    mov [rdi + rcx], al
+    inc rcx
+    cmp rcx, 250
+    jge .tcs_cmd_done
+    jmp .tcs_copy_cmd
+.tcs_cmd_done:
+    mov byte [rdi + rcx], 0
+    test rcx, rcx
+    jz .tcs_done
+
+    ; Get prefix length
+    lea rdi, [tab_word_buf]
+    call strlen
+    mov r13, rax             ; prefix length
+
+    ; Create pipe
+    mov rax, SYS_PIPE
+    lea rdi, [pipe_fds]
+    syscall
+    test rax, rax
+    jnz .tcs_done
+
+    ; Fork
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    jz .tcs_child
+    js .tcs_close_pipe
+
+    ; Parent: close write end, read output
+    mov r15, rax             ; child pid
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+
+    ; Read help output into switch_help_buf
+    xor r12, r12             ; total bytes read
+.tcs_read_loop:
+    mov rax, SYS_READ
+    mov edi, [pipe_fds]
+    lea rsi, [switch_help_buf + r12]
+    mov rdx, 4096
+    mov rcx, 16384
+    sub rcx, r12
+    cmp rdx, rcx
+    jle .tcs_read_ok
+    mov rdx, rcx
+    test rdx, rdx
+    jle .tcs_read_done
+.tcs_read_ok:
+    syscall
+    test rax, rax
+    jle .tcs_read_done
+    add r12, rax
+    jmp .tcs_read_loop
+.tcs_read_done:
+    mov byte [switch_help_buf + r12], 0
+
+    ; Close read end
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+
+    ; Wait for child
+    sub rsp, 16
+    mov rax, SYS_WAIT4
+    mov rdi, r15
+    lea rsi, [rsp]
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    add rsp, 16
+
+    ; Parse help output for switches
+    lea rsi, [switch_help_buf]
+    mov r14, r12             ; total bytes
+.tcs_parse:
+    ; Find next '-' that follows whitespace or start-of-line
+    cmp rsi, switch_help_buf
+    jl .tcs_done
+    lea rax, [switch_help_buf + r14]
+    cmp rsi, rax
+    jge .tcs_done
+.tcs_scan_dash:
+    lea rax, [switch_help_buf + r14]
+    cmp rsi, rax
+    jge .tcs_done
+    cmp byte [rsi], '-'
+    jne .tcs_scan_next
+    ; Check previous char is whitespace or start
+    cmp rsi, switch_help_buf
+    je .tcs_found_switch
+    movzx eax, byte [rsi - 1]
+    cmp al, ' '
+    je .tcs_found_switch
+    cmp al, 9
+    je .tcs_found_switch
+    cmp al, 10
+    je .tcs_found_switch
+    cmp al, ','
+    je .tcs_found_switch
+    cmp al, '['
+    je .tcs_found_switch
+    cmp al, '('
+    je .tcs_found_switch
+.tcs_scan_next:
+    inc rsi
+    jmp .tcs_scan_dash
+
+.tcs_found_switch:
+    ; Validate: char after initial dash(es) must be a letter
+    ; Skip leading dashes
+    push rsi
+    mov rdi, rsi
+    xor ecx, ecx
+    cmp byte [rdi], '-'
+    jne .tcs_sw_invalid
+    inc ecx
+    cmp byte [rdi + 1], '-'
+    jne .tcs_sw_check_alpha
+    inc ecx
+.tcs_sw_check_alpha:
+    movzx eax, byte [rdi + rcx]
+    ; Must be a letter after the dashes
+    cmp al, 'a'
+    jb .tcs_sw_check_upper
+    cmp al, 'z'
+    jbe .tcs_sw_valid
+.tcs_sw_check_upper:
+    cmp al, 'A'
+    jb .tcs_sw_invalid
+    cmp al, 'Z'
+    jbe .tcs_sw_valid
+.tcs_sw_invalid:
+    pop rsi
+    inc rsi
+    jmp .tcs_parse
+.tcs_sw_valid:
+    pop rsi
+    ; Extract switch word (until space, comma, =, ], ), <, newline, or null)
+    push rsi                 ; save start
+    mov rdi, rsi
+    xor ecx, ecx
+.tcs_sw_len:
+    movzx eax, byte [rdi + rcx]
+    test al, al
+    jz .tcs_sw_end
+    cmp al, ' '
+    je .tcs_sw_end
+    cmp al, ','
+    je .tcs_sw_end
+    cmp al, '='
+    je .tcs_sw_end
+    cmp al, '['
+    je .tcs_sw_end
+    cmp al, ']'
+    je .tcs_sw_end
+    cmp al, '('
+    je .tcs_sw_end
+    cmp al, ')'
+    je .tcs_sw_end
+    cmp al, '<'
+    je .tcs_sw_end
+    cmp al, 10
+    je .tcs_sw_end
+    cmp al, 9
+    je .tcs_sw_end
+    inc rcx
+    cmp rcx, 60
+    jge .tcs_sw_end
+    jmp .tcs_sw_len
+.tcs_sw_end:
+    ; rcx = switch length, rdi = switch start
+    pop rsi                  ; restore scan position
+    test rcx, rcx
+    jz .tcs_sw_skip
+    cmp rcx, 1
+    jle .tcs_sw_skip         ; just "-" alone, skip
+
+    ; Check if it matches our prefix
+    push rcx
+    push rsi
+    xor ebx, ebx
+.tcs_prefix_cmp:
+    cmp rbx, r13
+    jge .tcs_prefix_match
+    cmp rbx, rcx
+    jge .tcs_prefix_no
+    movzx eax, byte [tab_word_buf + rbx]
+    cmp al, [rdi + rbx]
+    jne .tcs_prefix_no
+    inc rbx
+    jmp .tcs_prefix_cmp
+
+.tcs_prefix_match:
+    ; Check for duplicates
+    push rdi
+    push rcx
+    ; Null-terminate switch in a temp buffer
+    lea rdi, [switch_tmp_buf]
+    pop r12                  ; rcx = length
+    push r12
+    mov rsi, [rsp + 16]      ; original rdi (switch start, from stack)
+    ; Actually, let me simplify: copy to temp, null-terminate
+    xor ebx, ebx
+.tcs_cp_sw:
+    cmp rbx, r12
+    jge .tcs_cp_sw_done
+    movzx eax, byte [rsi + rbx]
+    mov [rdi + rbx], al
+    inc rbx
+    jmp .tcs_cp_sw
+.tcs_cp_sw_done:
+    mov byte [rdi + rbx], 0
+    ; Check dedup
+    lea rdi, [switch_tmp_buf]
+    xor ebx, ebx
+.tcs_dedup_loop:
+    cmp rbx, [tab_count]
+    jge .tcs_dedup_ok
+    push rbx
+    push rdi
+    mov rsi, [tab_results + rbx*8]
+    call strcmp
+    pop rdi
+    pop rbx
+    test rax, rax
+    jz .tcs_dedup_skip
+    inc rbx
+    jmp .tcs_dedup_loop
+
+.tcs_dedup_ok:
+    ; Add to results
+    cmp qword [tab_count], MAX_TAB_RESULTS - 1
+    jge .tcs_dedup_skip
+    mov rcx, [tab_buf_pos]
+    lea rbx, [tab_buf + rcx]
+    lea rsi, [switch_tmp_buf]
+    mov rdi, rbx
+.tcs_store_copy:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .tcs_store_done
+    inc rsi
+    inc rdi
+    jmp .tcs_store_copy
+.tcs_store_done:
+    mov byte [rdi], 0
+    ; Calculate new buf_pos
+    lea rdi, [switch_tmp_buf]
+    call strlen
+    inc rax
+    add rax, [tab_buf_pos]
+    mov [tab_buf_pos], rax
+    mov rax, [tab_count]
+    mov [tab_results + rax*8], rbx
+    mov byte [tab_types + rax], 0    ; no d_type for switches
+    inc qword [tab_count]
+
+.tcs_dedup_skip:
+    pop rcx
+    pop rdi
+    pop rsi
+    pop rcx
+    jmp .tcs_sw_advance
+
+.tcs_prefix_no:
+    pop rsi
+    pop rcx
+
+.tcs_sw_skip:
+.tcs_sw_advance:
+    add rsi, rcx
+    test rcx, rcx
+    jz .tcs_sw_inc1
+    jmp .tcs_parse
+.tcs_sw_inc1:
+    inc rsi
+    jmp .tcs_parse
+
+.tcs_close_pipe:
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+.tcs_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.tcs_child:
+    ; Child: redirect stdout and stderr to write end of pipe
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]      ; close read end
+    syscall
+    ; dup2(write_fd, 1)
+    mov rax, SYS_DUP2
+    mov edi, [pipe_fds + 4]
+    mov esi, 1
+    syscall
+    ; dup2(write_fd, 2) - merge stderr
+    mov rax, SYS_DUP2
+    mov edi, [pipe_fds + 4]
+    mov esi, 2
+    syscall
+    ; close original write fd
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+    ; exec command with --help
+    ; Build argv: [cmd_path, "--help", NULL]
+    lea rdi, [switch_cmd_buf]
+    call find_in_path
+    test rax, rax
+    jz .tcs_child_exit
+    ; Path is in exec_path buffer
+    ; argv on stack
+    sub rsp, 32
+    lea rax, [exec_path]
+    mov [rsp], rax           ; argv[0] = full path
+    lea rax, [.tcs_help_str]
+    mov [rsp + 8], rax       ; argv[1] = "--help"
+    mov qword [rsp + 16], 0  ; argv[2] = NULL
+    ; execve
+    mov rdi, [rsp]           ; path
+    mov rsi, rsp             ; argv
+    mov rdx, [envp]          ; envp
+    mov rax, SYS_EXECVE
+    syscall
+.tcs_child_exit:
+    mov rdi, 1
+    mov rax, SYS_EXIT
+    syscall
+.tcs_help_str: db "--help", 0
+
 ; rdi = word starting with $
 ; ══════════════════════════════════════════════════════════════════════
 ; Tab complete $VAR: search env_array for vars matching prefix
