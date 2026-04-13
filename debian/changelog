@@ -1,3 +1,12 @@
+bare (0.2.7-1) unstable; urgency=low
+
+  * Tab complete switches from command --help output
+  * Directory tab completions add trailing /
+  * Backslash-space escaping for filenames with spaces
+  * Handle symlinks to directories in tab completion
+
+ -- Geir Isene <g@isene.com>  Sun, 13 Apr 2026 00:00:00 +0000
+
 bare (0.2.6-1) unstable; urgency=low
 
   * Fix -c mode: run all expansion stages (cmd subst, braces, gnicks)
