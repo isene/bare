@@ -212,6 +212,7 @@ colon_dispatch_table:
     dq str_bm, handle_bm
     dq str_dirs, handle_dirs
     dq str_rmhistory, handle_rmhistory
+    dq str_rehash, handle_rehash
     dq str_reload, handle_reload
     dq str_version, handle_version
     dq str_help, handle_help
@@ -9012,6 +9013,19 @@ handle_info:
     ret
 
 ; :save
+; :rehash - rebuild PATH executable cache
+handle_rehash:
+    call init_exe_cache
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.hr_msg]
+    mov rdx, .hr_msg_len
+    syscall
+    mov qword [last_status], 0
+    ret
+.hr_msg: db "PATH cache rebuilt", 10
+.hr_msg_len equ $ - .hr_msg
+
 handle_save:
     call save_config
     mov rax, SYS_WRITE
