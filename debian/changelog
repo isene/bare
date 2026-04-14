@@ -1,3 +1,9 @@
+bare (0.2.8-1) unstable; urgency=low
+
+  * Add :rehash command to rebuild PATH executable cache
+
+ -- Geir Isene <g@isene.com>  Mon, 14 Apr 2026 00:00:00 +0000
+
 bare (0.2.7-1) unstable; urgency=low
 
   * Tab complete switches from command --help output
