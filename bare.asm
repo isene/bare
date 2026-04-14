@@ -1868,11 +1868,17 @@ read_line:
     jle .read_char
     cmp byte [tmp_buf], '['
     je .esc_bracket
-    ; Alt+key: ESC followed by a letter (not [)
+    ; ESC O = application mode cursor keys (same as ESC [)
+    cmp byte [tmp_buf], 'O'
+    je .esc_bracket
+    ; Alt+key: ESC followed by a letter (not [ or O)
     cmp byte [tmp_buf], 'f'
     je .word_forward
     cmp byte [tmp_buf], 'b'
     je .word_backward
+    cmp byte [tmp_buf], 'd'
+    je .read_char             ; Alt-d: ignore (kitty split)
+    ; Unknown ESC sequence: discard
     jmp .read_char
 
 .esc_bracket:
@@ -1899,7 +1905,24 @@ read_line:
     je .end_of_line
     cmp byte [tmp_buf], '3'    ; Delete key (need one more byte)
     je .delete_key
-    jmp .read_char
+    ; Unknown CSI sequence: drain remaining bytes (digits, ;, until alpha)
+    cmp byte [tmp_buf], '0'
+    jb .read_char
+    cmp byte [tmp_buf], '9'
+    ja .read_char
+    ; Numeric param: drain until final letter
+.esc_drain:
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    test rax, rax
+    jle .read_char
+    movzx eax, byte [tmp_buf]
+    cmp al, '@'
+    jge .read_char            ; letter or higher = end of sequence
+    jmp .esc_drain
 
 .cursor_right:
     cmp r12, [line_len]
@@ -6370,6 +6393,22 @@ restore_termios:
 enable_raw_mode:
     cmp qword [is_tty], 0
     je .erm_ret
+    ; Re-read current termios (child may have changed terminal state)
+    call save_termios
+    ; Reset application cursor keys mode (SSH/tmux may set DECCKM)
+    push rax
+    push rdi
+    push rsi
+    push rdx
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.erm_reset_ckm]
+    mov rdx, 5
+    syscall
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
     ; Copy orig to raw
     lea rsi, [orig_termios]
     lea rdi, [raw_termios]
@@ -6390,6 +6429,7 @@ enable_raw_mode:
     syscall
 .erm_ret:
     ret
+.erm_reset_ckm: db 27, "[?1l"   ; Reset DECCKM (normal cursor keys)
 
 ; Enable cooked mode with ISIG for child process execution
 ; Takes orig_termios and ensures ICANON, ECHO, ISIG are set
