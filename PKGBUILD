@@ -1,6 +1,6 @@
 # Maintainer: Geir Isene <g@isene.com>
 pkgname=bare-shell
-pkgver=0.2.8
+pkgver=0.2.9
 pkgrel=1
 pkgdesc="Interactive shell in x86_64 Linux assembly. No libc, pure syscalls. 8us startup."
 arch=('x86_64')
