@@ -606,6 +606,7 @@ render_buf:     resb 16384
 render_pos:     resq 1
 render_to_buf:  resq 1              ; flag: 1 = write prompt to render_buf
 sigwinch_flag:  resq 1              ; set by SIGWINCH handler
+tz_offset:      resq 1              ; timezone offset in seconds from UTC
 shl_output_len: resq 1              ; syntax_highlight_line output length
 
 ; Session buffer
@@ -744,6 +745,7 @@ _start:
     ; Initialize username and hostname for prompt
     call init_username
     call init_hostname
+    call init_timezone
 
     ; Check if stdin is a TTY (ioctl TCGETS succeeds only on ttys)
     mov rax, SYS_IOCTL
@@ -7693,6 +7695,130 @@ init_username:
 ; ══════════════════════════════════════════════════════════════════════
 ; Initialize hostname from /etc/hostname
 ; ══════════════════════════════════════════════════════════════════════
+; Detect timezone offset by running "date +%z" and parsing output
+init_timezone:
+    push rbx
+    push r12
+    mov qword [tz_offset], 0
+
+    ; Create pipe
+    mov rax, SYS_PIPE
+    lea rdi, [pipe_fds]
+    syscall
+    test rax, rax
+    jnz .itz_done
+
+    ; Fork
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    jz .itz_child
+    js .itz_close
+
+    ; Parent: read output
+    mov r12, rax             ; child pid
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]  ; close write end
+    syscall
+
+    sub rsp, 16
+    mov rax, SYS_READ
+    mov edi, [pipe_fds]
+    mov rsi, rsp
+    mov rdx, 10
+    syscall
+    mov rbx, rax             ; bytes read
+
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+
+    ; Wait for child
+    sub rsp, 16
+    mov rax, SYS_WAIT4
+    mov rdi, r12
+    mov rsi, rsp
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    add rsp, 16
+
+    ; Parse "+HHMM" or "-HHMM" from stack
+    cmp rbx, 5
+    jl .itz_parse_done
+    movzx eax, byte [rsp]   ; sign
+    mov r12, 1               ; positive
+    cmp al, '-'
+    jne .itz_pos
+    mov r12, -1
+.itz_pos:
+    ; Parse HH
+    movzx eax, byte [rsp + 1]
+    sub al, '0'
+    imul eax, 10
+    movzx ecx, byte [rsp + 2]
+    sub cl, '0'
+    add eax, ecx
+    imul eax, 3600           ; hours to seconds
+    mov rbx, rax
+    ; Parse MM
+    movzx eax, byte [rsp + 3]
+    sub al, '0'
+    imul eax, 10
+    movzx ecx, byte [rsp + 4]
+    sub cl, '0'
+    add eax, ecx
+    imul eax, 60             ; minutes to seconds
+    add rbx, rax
+    imul rbx, r12            ; apply sign
+    mov [tz_offset], rbx
+.itz_parse_done:
+    add rsp, 16
+.itz_done:
+    pop r12
+    pop rbx
+    ret
+
+.itz_close:
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+    jmp .itz_done
+
+.itz_child:
+    ; Close read end
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+    ; Dup write end to stdout
+    mov rax, SYS_DUP2
+    mov edi, [pipe_fds + 4]
+    mov esi, 1
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+    ; exec date +%z
+    sub rsp, 32
+    lea rax, [.itz_date]
+    mov [rsp], rax
+    lea rax, [.itz_fmt]
+    mov [rsp + 8], rax
+    mov qword [rsp + 16], 0
+    mov rdi, [rsp]
+    mov rsi, rsp
+    mov rdx, [envp]
+    mov rax, SYS_EXECVE
+    syscall
+    mov rdi, 1
+    mov rax, SYS_EXIT
+    syscall
+.itz_date: db "/usr/bin/date", 0
+.itz_fmt: db "+%z", 0
+
 init_hostname:
     push rbx
     mov rax, SYS_OPEN
@@ -14304,6 +14430,7 @@ source_file:
 show_rprompt:
     push rbx
     push r12
+    push r13
 
     cmp qword [is_tty], 0
     je .rp_done
@@ -14312,71 +14439,212 @@ show_rprompt:
     cmp qword [term_width], 0
     je .rp_done
     cmp qword [term_width], 60
-    jl .rp_done              ; skip rprompt in narrow terminals
+    jl .rp_done
 
-    ; Calculate duration
+    ; Get current time (epoch seconds)
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    xor edi, edi             ; CLOCK_REALTIME = 0
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]           ; epoch seconds
+    add rsp, 16
+
+    ; Convert to HH:MM (UTC+local via TZ offset)
+    ; Get timezone offset from TZ or default to UTC
+    ; Simple approach: use /etc/localtime via libc... too complex
+    ; Instead: read the current offset from the file system
+    ; Simpler: compute UTC time, users can set TZ
+    ; Actually, just compute hours and minutes from epoch
+    ; seconds_today = epoch % 86400
+    xor edx, edx
+    mov rcx, 86400
+    div rcx                  ; rdx = seconds since midnight UTC
+    mov rax, rdx
+
+    ; Apply local timezone offset (check TZ env var for offset)
+    ; For simplicity, check for a cached tz_offset
+    add rax, [tz_offset]
+    ; Handle negative/overflow
+    cmp rax, 86400
+    jl .rp_tz_ok
+    sub rax, 86400
+.rp_tz_ok:
+    test rax, rax
+    jns .rp_tz_pos
+    add rax, 86400
+.rp_tz_pos:
+
+    ; hours = secs / 3600, minutes = (secs % 3600) / 60
+    xor edx, edx
+    mov rcx, 3600
+    div rcx                  ; rax = hours, rdx = remaining seconds
+    mov r12, rax             ; hours
+    mov rax, rdx
+    xor edx, edx
+    mov rcx, 60
+    div rcx                  ; rax = minutes
+    mov r13, rax             ; minutes
+
+    ; Build rprompt string in rprompt_buf
+    lea rdi, [rprompt_buf]
+    xor rbx, rbx             ; output position
+
+    ; HH:MM
+    mov rax, r12
+    cmp rax, 10
+    jge .rp_h2
+    mov byte [rdi + rbx], '0'
+    inc rbx
+.rp_h2:
+    push rdi
+    lea rdi, [num_buf]
+    call itoa
+    pop rdi
+    lea rsi, [num_buf]
+    xor ecx, ecx
+.rp_cp_h:
+    cmp ecx, eax
+    jge .rp_cp_h_done
+    movzx edx, byte [rsi + rcx]
+    mov [rdi + rbx], dl
+    inc rbx
+    inc ecx
+    jmp .rp_cp_h
+.rp_cp_h_done:
+    mov byte [rdi + rbx], ':'
+    inc rbx
+    mov rax, r13
+    cmp rax, 10
+    jge .rp_m2
+    mov byte [rdi + rbx], '0'
+    inc rbx
+.rp_m2:
+    push rdi
+    lea rdi, [num_buf]
+    call itoa
+    pop rdi
+    lea rsi, [num_buf]
+    xor ecx, ecx
+.rp_cp_m:
+    cmp ecx, eax
+    jge .rp_cp_m_done
+    movzx edx, byte [rsi + rcx]
+    mov [rdi + rbx], dl
+    inc rbx
+    inc ecx
+    jmp .rp_cp_m
+.rp_cp_m_done:
+
+    ; Add duration if command took > 1 second
     mov rax, [cmd_end_time]
     sub rax, [cmd_start_time]
-    test rax, rax
-    jz .rp_done              ; zero seconds, skip
     cmp rax, 1
-    jl .rp_done              ; less than 1 second, skip
-
-    mov r12, rax             ; duration in seconds
-
-    ; Build duration string
-    lea rdi, [num_buf]
+    jl .rp_display
+    mov r12, rax
+    ; Add space + duration
+    mov byte [rdi + rbx], ' '
+    inc rbx
     cmp r12, 60
-    jl .rp_seconds
+    jl .rp_dur_secs
     ; Minutes + seconds
     mov rax, r12
     xor edx, edx
     mov rcx, 60
-    div rcx                  ; rax = minutes, rdx = seconds
+    div rcx
     push rdx
+    push rdi
+    lea rdi, [num_buf]
     call itoa
-    mov rbx, rax             ; digits written
-    mov byte [num_buf + rbx], 'm'
+    pop rdi
+    lea rsi, [num_buf]
+    xor ecx, ecx
+.rp_cp_dm:
+    cmp ecx, eax
+    jge .rp_cp_dm_done
+    movzx edx, byte [rsi + rcx]
+    mov [rdi + rbx], dl
     inc rbx
-    pop rax                  ; seconds
-    lea rdi, [num_buf + rbx]
+    inc ecx
+    jmp .rp_cp_dm
+.rp_cp_dm_done:
+    mov byte [rdi + rbx], 'm'
+    inc rbx
+    pop rax
+    push rdi
+    lea rdi, [num_buf]
     call itoa
-    add rbx, rax
-    mov byte [num_buf + rbx], 's'
+    pop rdi
+    lea rsi, [num_buf]
+    xor ecx, ecx
+.rp_cp_ds:
+    cmp ecx, eax
+    jge .rp_cp_ds_done
+    movzx edx, byte [rsi + rcx]
+    mov [rdi + rbx], dl
+    inc rbx
+    inc ecx
+    jmp .rp_cp_ds
+.rp_cp_ds_done:
+    mov byte [rdi + rbx], 's'
     inc rbx
     jmp .rp_display
-.rp_seconds:
+.rp_dur_secs:
     mov rax, r12
+    push rdi
+    lea rdi, [num_buf]
     call itoa
-    mov rbx, rax
-    mov byte [num_buf + rbx], 's'
+    pop rdi
+    lea rsi, [num_buf]
+    xor ecx, ecx
+.rp_cp_s:
+    cmp ecx, eax
+    jge .rp_cp_s_done
+    movzx edx, byte [rsi + rcx]
+    mov [rdi + rbx], dl
+    inc rbx
+    inc ecx
+    jmp .rp_cp_s
+.rp_cp_s_done:
+    mov byte [rdi + rbx], 's'
     inc rbx
 
 .rp_display:
-    ; Position cursor at right side: ESC[<row>;<col>H
-    ; Save cursor, move to right
+    ; Save cursor
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.rp_save]
-    mov rdx, 3
+    mov rdx, 2
     syscall
-    ; Move to column (term_width - rbx - 1)
+    ; Build positioning + color + text + reset + restore in rprompt_buf area
+    ; Move content to after the positioning escape
+    ; First, calculate column: term_width - rbx
     mov rax, [term_width]
     sub rax, rbx
-    sub rax, 1
-    push rbx
-    lea rdi, [rprompt_buf]
+    ; Build ESC[{col}G + color + content + reset + restore
+    lea rdi, [rprompt_buf + 128] ; use second half as final output
     mov byte [rdi], 27
-    mov byte [rdi+1], '['
+    mov byte [rdi + 1], '['
+    add rdi, 2
+    push rbx
     push rdi
-    lea rdi, [rprompt_buf + 2]
+    lea rdi, [num_buf]
     call itoa
     pop rdi
+    lea rsi, [num_buf]
+    xor ecx, ecx
+.rp_cp_col:
+    cmp ecx, eax
+    jge .rp_cp_col_done
+    movzx edx, byte [rsi + rcx]
+    mov [rdi + rcx], dl
+    inc ecx
+    jmp .rp_cp_col
+.rp_cp_col_done:
     add rdi, rax
-    add rdi, 2
     mov byte [rdi], 'G'
     inc rdi
-    ; Write gray color
+    ; Gray color
     mov byte [rdi], 27
     mov byte [rdi+1], '['
     mov byte [rdi+2], '3'
@@ -14389,19 +14657,19 @@ show_rprompt:
     mov byte [rdi+9], '5'
     mov byte [rdi+10], 'm'
     add rdi, 11
-    ; Copy duration
+    ; Copy rprompt text
     pop rbx
-    lea rsi, [num_buf]
+    lea rsi, [rprompt_buf]
     xor rcx, rcx
-.rp_copy_dur:
+.rp_copy_text:
     cmp rcx, rbx
-    jge .rp_reset
+    jge .rp_copy_text_done
     movzx eax, byte [rsi + rcx]
     mov [rdi], al
     inc rdi
     inc rcx
-    jmp .rp_copy_dur
-.rp_reset:
+    jmp .rp_copy_text
+.rp_copy_text_done:
     ; Reset + restore cursor
     mov byte [rdi], 27
     mov byte [rdi+1], '['
@@ -14413,18 +14681,19 @@ show_rprompt:
     add rdi, 2
     ; Write it all
     mov rdx, rdi
-    sub rdx, rprompt_buf
+    lea rsi, [rprompt_buf + 128]
+    sub rdx, rsi
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [rprompt_buf]
     syscall
 
 .rp_done:
+    pop r13
     pop r12
     pop rbx
     ret
 
-.rp_save: db 27, '7', 0     ; ESC 7 = save cursor
+.rp_save: db 27, '7'        ; ESC 7 = save cursor
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Auto-correct: suggest similar commands on "command not found"
