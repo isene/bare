@@ -597,6 +597,12 @@ exe_cache:      resb 65536              ; cached executable names (null-separate
 exe_cache_pos:  resq 1                  ; current write position
 exe_cache_count: resq 1                 ; number of cached names
 
+; Render buffer for batched screen output (single write per redraw)
+render_buf:     resb 16384
+render_pos:     resq 1
+render_to_buf:  resq 1              ; flag: 1 = write prompt to render_buf
+shl_output_len: resq 1              ; syntax_highlight_line output length
+
 ; Session buffer
 session_buf:    resb 16384
 
@@ -2210,26 +2216,14 @@ read_line:
     ret
 
 .cancel_line:
-    ; Clear current line and redraw prompt
-    ; Move to start of line, clear it
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [.ctrlc_cr]
-    mov rdx, 1
-    syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [clr_eol_global]
-    mov rdx, clr_eol_len
-    syscall
+    ; Leave cancelled text visible, print newline, fresh prompt
+    call write_nl
     xor r12, r12
     mov qword [line_len], 0
     mov byte [line_buf], 0
     mov qword [suggestion_len], 0
-    ; Print fresh prompt and continue reading
     call print_prompt
     jmp .read_char
-.ctrlc_cr: db 13
 
 .read_done:
     ; Strip trailing \r if present, then null-terminate
@@ -2970,39 +2964,197 @@ reposition_cursor:
 ; Full redraw: CR, print prompt, print line, clear rest
 full_redraw:
     push r12
-    ; CR
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [reposition_cursor.cr]
-    mov rdx, 1
-    syscall
-    ; Clear line
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [.clr]
-    mov rdx, 4
-    syscall
-    ; Print prompt
+    push rbx
+
+    ; Initialize render buffer
+    mov qword [render_pos], 0
+
+    ; 1. Restore cursor to prompt start (saved by print_prompt), then clear below
+    mov byte [render_buf], 27      ; ESC
+    mov byte [render_buf + 1], '8' ; restore cursor (ESC 8)
+    mov byte [render_buf + 2], 27  ; ESC
+    mov byte [render_buf + 3], '[' ; [
+    mov byte [render_buf + 4], 'J' ; clear to end of screen
+    mov qword [render_pos], 5
+
+    ; Set batching flag for all sub-calls
+    mov qword [render_to_buf], 1
+
+    ; 2. Print prompt into render buffer
     call print_prompt
-    ; Print line content with syntax highlighting
+
+    ; 3. Syntax highlighted line content
     mov rcx, [line_len]
     test rcx, rcx
     jz .fd_repos
     cmp qword [is_tty], 0
-    je .fd_plain
+    je .fd_plain_buf
+    ; syntax_highlight_line writes to suggestion_buf (skips write when render_to_buf=1)
     call syntax_highlight_line
+    ; Copy suggestion_buf output into render_buf
+    mov rcx, [shl_output_len]
+    test rcx, rcx
+    jz .fd_repos
+    lea rsi, [suggestion_buf]
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    xor rax, rax
+.fd_copy_hl:
+    cmp rax, rcx
+    jge .fd_copy_done
+    movzx edx, byte [rsi + rax]
+    mov [rdi + rax], dl
+    inc rax
+    jmp .fd_copy_hl
+.fd_copy_done:
+    add [render_pos], rcx
     jmp .fd_repos
-.fd_plain:
+
+.fd_plain_buf:
+    ; Copy plain line_buf into render_buf
+    mov rcx, [line_len]
+    lea rsi, [line_buf]
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    xor rax, rax
+.fd_plain_copy:
+    cmp rax, rcx
+    jge .fd_plain_done
+    movzx edx, byte [rsi + rax]
+    mov [rdi + rax], dl
+    inc rax
+    jmp .fd_plain_copy
+.fd_plain_done:
+    add [render_pos], rcx
+
+.fd_repos:
+    ; 4. Reposition cursor for wrapped lines
+    ; After writing all content, cursor is at prompt_width + line_len
+    ; We want it at prompt_width + r12
+    ; Calculate rows/cols for both positions
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+
+    ; Current position (end of content)
+    mov rax, [prompt_visible_width]
+    add rax, [line_len]
+    xor edx, edx
+    mov rcx, [term_width]
+    test rcx, rcx
+    jz .fd_repos_simple
+    cmp rcx, 1
+    jle .fd_repos_simple
+    push rax
+    div rcx                    ; rax = end_row, edx = end_col
+    mov rbx, rax               ; rbx = end_row
+
+    ; Target position (cursor)
+    mov rax, [prompt_visible_width]
+    add rax, r12
+    xor edx, edx
+    mov rcx, [term_width]
+    div rcx                    ; rax = target_row, edx = target_col
+    pop rcx                    ; discard saved end position
+
+    ; Move up (end_row - target_row) rows
+    sub rbx, rax               ; rows to move up
+    test rbx, rbx
+    jz .fd_repos_col
+    mov byte [rdi], 27
+    mov byte [rdi + 1], '['
+    add rdi, 2
+    mov rax, rbx
+    push rdi
+    lea rdi, [num_buf]
+    call itoa
+    pop rdi
+    lea rsi, [num_buf]
+    xor ecx, ecx
+.fd_cp_up2:
+    cmp ecx, eax
+    jge .fd_cp_up2_done
+    movzx ebx, byte [rsi + rcx]
+    mov [rdi + rcx], bl
+    inc ecx
+    jmp .fd_cp_up2
+.fd_cp_up2_done:
+    add rdi, rax
+    mov byte [rdi], 'A'
+    inc rdi
+
+.fd_repos_col:
+    ; Set column: ESC[{col+1}G
+    mov byte [rdi], 13         ; CR first
+    inc rdi
+    inc edx                    ; 1-indexed column
+    test edx, edx
+    jz .fd_repos_done
+    mov byte [rdi], 27
+    mov byte [rdi + 1], '['
+    add rdi, 2
+    mov rax, rdx
+    push rdi
+    lea rdi, [num_buf]
+    call itoa
+    pop rdi
+    lea rsi, [num_buf]
+    xor ecx, ecx
+.fd_cp_col2:
+    cmp ecx, eax
+    jge .fd_cp_col2_done
+    movzx ebx, byte [rsi + rcx]
+    mov [rdi + rcx], bl
+    inc ecx
+    jmp .fd_cp_col2
+.fd_cp_col2_done:
+    add rdi, rax
+    mov byte [rdi], 'G'
+    inc rdi
+    jmp .fd_repos_done
+
+.fd_repos_simple:
+    ; No term_width, fallback to simple CR + col
+    mov byte [rdi], 13
+    mov byte [rdi + 1], 27
+    mov byte [rdi + 2], '['
+    add rdi, 3
+    mov rax, r12
+    add rax, [prompt_visible_width]
+    inc rax
+    push rdi
+    lea rdi, [num_buf]
+    call itoa
+    pop rdi
+    lea rsi, [num_buf]
+    xor ecx, ecx
+.fd_cp_simple:
+    cmp ecx, eax
+    jge .fd_cp_simple_done
+    movzx ebx, byte [rsi + rcx]
+    mov [rdi + rcx], bl
+    inc ecx
+    jmp .fd_cp_simple
+.fd_cp_simple_done:
+    add rdi, rax
+    mov byte [rdi], 'G'
+    inc rdi
+
+.fd_repos_done:
+    ; Update render_pos
+    sub rdi, render_buf
+    mov [render_pos], rdi
+
+    ; 5. Clear batching flag and single write of entire render buffer
+    mov qword [render_to_buf], 0
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [line_buf]
-    mov rdx, [line_len]
+    lea rsi, [render_buf]
+    mov rdx, [render_pos]
     syscall
-.fd_repos:
-    call reposition_cursor
+
+    pop rbx
     pop r12
     ret
-.clr: db 27, '[', '2', 'K'
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Tilde expansion + Environment variable expansion
@@ -8027,6 +8179,17 @@ print_prompt_dynamic:
     push rbx
     push r12
 
+    ; Save cursor position for full_redraw (ESC 7)
+    ; Only when printing fresh prompt, not during batched redraw
+    cmp qword [render_to_buf], 0
+    jnz .ppd_skip_save
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.ppd_save_cur]
+    mov rdx, 2
+    syscall
+.ppd_skip_save:
+
     ; Get terminal width
     sub rsp, 8
     mov rax, SYS_IOCTL
@@ -8364,17 +8527,38 @@ print_prompt_dynamic:
 .ppd_vis_done:
     mov [prompt_visible_width], rbx
 
-    ; Write the full prompt
+    ; Write or buffer the prompt
+    cmp qword [render_to_buf], 0
+    jne .ppd_to_buf
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [tmp_buf]
     mov rdx, r12
     syscall
+    jmp .ppd_write_done
+.ppd_to_buf:
+    ; Copy prompt from tmp_buf into render_buf
+    lea rsi, [tmp_buf]
+    mov rcx, r12
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    xor rax, rax
+.ppd_buf_copy:
+    cmp rax, rcx
+    jge .ppd_buf_done
+    movzx edx, byte [rsi + rax]
+    mov [rdi + rax], dl
+    inc rax
+    jmp .ppd_buf_copy
+.ppd_buf_done:
+    add [render_pos], rcx
+.ppd_write_done:
 
     pop r12
     pop rbx
     ret
 
+.ppd_save_cur: db 27, '7'      ; ESC 7 = save cursor position
 .ppd_osc: db 27, "]2;"         ; OSC set title
 .ppd_bel: db 7                  ; BEL (end OSC)
 .ppd_osc7: db 27, "]7;file://" ; OSC 7 cwd notification
@@ -12653,7 +12837,11 @@ syntax_highlight_line:
     mov byte [rdi + rbx + 2], '0'
     mov byte [rdi + rbx + 3], 'm'
     add rbx, 4
-    ; Write
+    ; Save output length for batched callers
+    mov [shl_output_len], rbx
+    ; Write (unless caller will batch)
+    cmp qword [render_to_buf], 0
+    jnz .shl_done
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [suggestion_buf]
