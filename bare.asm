@@ -1094,15 +1094,16 @@ read_line:
     cmp qword [sigwinch_flag], 0
     je .read_char            ; spurious EINTR, retry
     mov qword [sigwinch_flag], 0
-    ; Re-save cursor position, re-read term width, full redraw
+    ; Terminal resized: clear screen, home, save cursor, redraw
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [.winch_save]
-    mov rdx, 2
+    lea rsi, [.winch_seq]
+    mov rdx, .winch_seq_len
     syscall
     call full_redraw
     jmp .read_char
-.winch_save: db 27, '7'     ; ESC 7 = save cursor at new position
+.winch_seq: db 27, "[2J", 27, "[H", 27, "7" ; clear screen + home + save cursor
+.winch_seq_len equ $ - .winch_seq
 .not_eintr:
     test rax, rax
     jle .read_eof
@@ -3036,6 +3037,28 @@ redraw_from_cursor:
     pop r12
     ret
 
+; Calculate display width of line_buf[0..r12] (skipping UTF-8 continuation bytes)
+; Returns display width in rax
+cursor_display_width:
+    push rbx
+    xor eax, eax             ; display width
+    xor ebx, ebx             ; byte index
+.cdw_loop:
+    cmp rbx, r12
+    jge .cdw_done
+    movzx ecx, byte [line_buf + rbx]
+    inc rbx
+    ; Skip continuation bytes (10xxxxxx = 0x80-0xBF)
+    mov edx, ecx
+    and edx, 0xC0
+    cmp edx, 0x80
+    je .cdw_loop              ; continuation byte, don't count
+    inc eax                   ; leading byte or ASCII, count as 1 column
+    jmp .cdw_loop
+.cdw_done:
+    pop rbx
+    ret
+
 ; Reposition cursor (move to start of input, then forward r12 positions)
 reposition_cursor:
     push r12
@@ -3147,9 +3170,13 @@ full_redraw:
     mov rdi, [render_pos]
     lea rdi, [render_buf + rdi]
 
-    ; Current position (end of content)
-    mov rax, [prompt_visible_width]
-    add rax, [line_len]
+    ; Current position (end of content) using display width
+    ; Save r12, temporarily set it to line_len for display width calc
+    push r12
+    mov r12, [line_len]
+    call cursor_display_width  ; rax = display width of entire line
+    pop r12
+    add rax, [prompt_visible_width]
     xor edx, edx
     mov rcx, [term_width]
     test rcx, rcx
@@ -3160,9 +3187,9 @@ full_redraw:
     div rcx                    ; rax = end_row, edx = end_col
     mov rbx, rax               ; rbx = end_row
 
-    ; Target position (cursor)
-    mov rax, [prompt_visible_width]
-    add rax, r12
+    ; Target position (cursor) using display width
+    call cursor_display_width  ; rax = display width of line_buf[0..r12]
+    add rax, [prompt_visible_width]
     xor edx, edx
     mov rcx, [term_width]
     div rcx                    ; rax = target_row, edx = target_col
@@ -3230,7 +3257,7 @@ full_redraw:
     mov byte [rdi + 1], 27
     mov byte [rdi + 2], '['
     add rdi, 3
-    mov rax, r12
+    call cursor_display_width  ; rax = display width of line_buf[0..r12]
     add rax, [prompt_visible_width]
     inc rax
     push rdi
