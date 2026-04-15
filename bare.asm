@@ -394,6 +394,7 @@ num_buf:        resb 32
 ; Redirect filenames
 redir_out:      resq 1          ; pointer to output redirect filename
 redir_in:       resq 1          ; pointer to input redirect filename
+redir_herestring: resq 1       ; pointer to here-string content (<<<)
 redir_append:   resq 1          ; 1 if >>, 0 if >
 
 ; Signal handling
@@ -4402,6 +4403,7 @@ parse_and_exec_simple:
     ; Reset redirects
     mov qword [redir_out], 0
     mov qword [redir_in], 0
+    mov qword [redir_herestring], 0
     mov qword [redir_append], 0
 
     ; Parse into argv
@@ -4425,6 +4427,7 @@ parse_and_exec_simple:
     ; Nick was expanded, re-parse argv from updated line_buf
     mov qword [redir_out], 0
     mov qword [redir_in], 0
+    mov qword [redir_herestring], 0
     mov qword [redir_append], 0
     lea rsi, [line_buf]
     call parse_argv
@@ -4591,6 +4594,7 @@ parse_and_exec_child:
     push rbx
     mov qword [redir_out], 0
     mov qword [redir_in], 0
+    mov qword [redir_herestring], 0
     mov qword [redir_append], 0
     mov rsi, rdi
     call parse_argv
@@ -4645,6 +4649,43 @@ parse_and_exec_child_argv:
     mov rax, SYS_CLOSE
     syscall
 .no_redir_in:
+    ; Handle here-string (<<<)
+    cmp qword [redir_herestring], 0
+    je .no_herestring
+    ; Create pipe, write string to it, dup2 read end to stdin
+    mov rax, SYS_PIPE
+    lea rdi, [pipe_fds]
+    syscall
+    test rax, rax
+    jnz .no_herestring
+    ; Write string + newline to write end
+    mov rdi, [redir_herestring]
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov edi, [pipe_fds + 4]  ; write end
+    mov rsi, [redir_herestring]
+    syscall
+    ; Write newline
+    mov rax, SYS_WRITE
+    mov edi, [pipe_fds + 4]
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    ; Close write end
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+    ; Dup read end to stdin
+    mov rax, SYS_DUP2
+    mov edi, [pipe_fds]
+    xor esi, esi             ; stdin = 0
+    syscall
+    ; Close original read end
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+.no_herestring:
 
     ; Use expanded_argv if available, otherwise argv_ptrs
     lea rbx, [expanded_argv]
@@ -4875,6 +4916,69 @@ parse_argv:
 
 .pa_redir_in:
     inc rdi
+    ; Check for <<< (here-string)
+    cmp byte [rdi], '<'
+    jne .pa_ri_skip
+    inc rdi
+    cmp byte [rdi], '<'
+    jne .pa_ri_skip           ; just << (here-doc, treat as regular)
+    inc rdi                   ; skip third <
+    ; Skip spaces after <<<
+.pa_hs_skip:
+    cmp byte [rdi], ' '
+    jne .pa_hs_set
+    inc rdi
+    jmp .pa_hs_skip
+.pa_hs_set:
+    mov [redir_herestring], rdi
+    ; Handle quoted or unquoted string
+    cmp byte [rdi], '"'
+    je .pa_hs_dquote
+    cmp byte [rdi], 0x27
+    je .pa_hs_squote
+    ; Unquoted: read until space/null/newline
+.pa_hs_scan:
+    cmp byte [rdi], 0
+    je .pa_done
+    cmp byte [rdi], ' '
+    je .pa_hs_term
+    cmp byte [rdi], 10
+    je .pa_hs_term
+    inc rdi
+    jmp .pa_hs_scan
+.pa_hs_term:
+    mov byte [rdi], 0
+    inc rdi
+    jmp .pa_skip
+.pa_hs_dquote:
+    inc rdi
+    mov [redir_herestring], rdi
+.pa_hs_dq_scan:
+    cmp byte [rdi], 0
+    je .pa_done
+    cmp byte [rdi], '"'
+    je .pa_hs_dq_end
+    inc rdi
+    jmp .pa_hs_dq_scan
+.pa_hs_dq_end:
+    mov byte [rdi], 0
+    inc rdi
+    jmp .pa_skip
+.pa_hs_squote:
+    inc rdi
+    mov [redir_herestring], rdi
+.pa_hs_sq_scan:
+    cmp byte [rdi], 0
+    je .pa_done
+    cmp byte [rdi], 0x27
+    je .pa_hs_sq_end
+    inc rdi
+    jmp .pa_hs_sq_scan
+.pa_hs_sq_end:
+    mov byte [rdi], 0
+    inc rdi
+    jmp .pa_skip
+
 .pa_ri_skip:
     cmp byte [rdi], ' '
     jne .pa_ri_set
