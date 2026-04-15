@@ -867,6 +867,19 @@ _start:
     ; Print prompt (tty only)
     cmp qword [is_tty], 0
     je .no_prompt
+    ; Check if stdin has buffered data (multiline paste detection)
+    ; If data is waiting, skip prompt to avoid clutter during paste
+    sub rsp, 8
+    mov qword [rsp], 0
+    mov rax, SYS_IOCTL
+    xor edi, edi             ; stdin
+    mov esi, 0x541B          ; FIONREAD
+    mov rdx, rsp
+    syscall
+    mov rax, [rsp]
+    add rsp, 8
+    test rax, rax
+    jnz .no_prompt           ; data waiting = paste in progress, skip prompt
     call print_prompt
 .no_prompt:
 
