@@ -64,6 +64,9 @@ DEFAULT REL
 ; signal constants
 %define SIGINT  2
 %define SIGQUIT 3
+%define SIGWINCH 28
+%define SA_RESTORER 0x04000000
+%define SYS_RT_SIGRETURN 15
 %define SIGCONT 18
 %define SIGTSTP 20
 %define SIGTTIN 21
@@ -601,6 +604,7 @@ exe_cache_count: resq 1                 ; number of cached names
 render_buf:     resb 16384
 render_pos:     resq 1
 render_to_buf:  resq 1              ; flag: 1 = write prompt to render_buf
+sigwinch_flag:  resq 1              ; set by SIGWINCH handler
 shl_output_len: resq 1              ; syntax_highlight_line output length
 
 ; Session buffer
@@ -1084,6 +1088,22 @@ read_line:
     lea rsi, [tmp_buf]
     mov rdx, 1
     syscall
+    ; Check for EINTR from SIGWINCH
+    cmp rax, -4              ; EINTR
+    jne .not_eintr
+    cmp qword [sigwinch_flag], 0
+    je .read_char            ; spurious EINTR, retry
+    mov qword [sigwinch_flag], 0
+    ; Re-save cursor position, re-read term width, full redraw
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.winch_save]
+    mov rdx, 2
+    syscall
+    call full_redraw
+    jmp .read_char
+.winch_save: db 27, '7'     ; ESC 7 = save cursor at new position
+.not_eintr:
     test rax, rax
     jle .read_eof
 
@@ -6654,8 +6674,35 @@ setup_signals:
     xor edx, edx
     mov r10, 8
     syscall
+
+    ; Handle SIGWINCH (terminal resize)
+    ; Zero struct again for a fresh sigaction
+    xor eax, eax
+    mov rdi, rsp
+    mov rcx, 160
+    rep stosb
+    mov qword [rsp], sigwinch_handler    ; sa_handler
+    mov qword [rsp + 8], SA_RESTORER     ; sa_flags
+    mov qword [rsp + 16], sigwinch_restorer ; sa_restorer (offset 16 for x86_64)
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGWINCH
+    mov rsi, rsp
+    xor edx, edx
+    mov r10, 8
+    syscall
+
     add rsp, 160
     ret
+
+; SIGWINCH signal handler (async-signal-safe: only sets a flag)
+sigwinch_handler:
+    mov qword [sigwinch_flag], 1
+    ret
+
+; Signal restorer trampoline (required by kernel for sa_restorer)
+sigwinch_restorer:
+    mov rax, SYS_RT_SIGRETURN
+    syscall
 
 ; ══════════════════════════════════════════════════════════════════════
 ; History management
