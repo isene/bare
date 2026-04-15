@@ -1931,11 +1931,66 @@ read_line:
     je .end_of_line
     cmp byte [tmp_buf], '3'    ; Delete key (need one more byte)
     je .delete_key
+    cmp byte [tmp_buf], '1'    ; Modified key (ESC[1;5C = Ctrl-Right, etc.)
+    je .esc_modified_key
     ; Unknown CSI sequence: drain remaining bytes (digits, ;, until alpha)
     cmp byte [tmp_buf], '0'
     jb .read_char
     cmp byte [tmp_buf], '9'
     ja .read_char
+.esc_modified_key:
+    ; Read ';'
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    test rax, rax
+    jle .read_char
+    cmp byte [tmp_buf], ';'
+    jne .esc_drain           ; not ';', drain the rest
+    ; Read modifier digit (2=Shift, 3=Alt, 5=Ctrl, etc.)
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    test rax, rax
+    jle .read_char
+    push qword 0
+    movzx eax, byte [tmp_buf]
+    mov [rsp], rax           ; save modifier
+    ; Read final letter
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    pop rbx                  ; rbx = modifier
+    test rax, rax
+    jle .read_char
+    movzx eax, byte [tmp_buf]
+    ; Ctrl+Right (modifier '5', letter 'C') = word forward
+    cmp bl, '5'
+    jne .esc_mod_not_ctrl
+    cmp al, 'C'
+    je .word_forward
+    cmp al, 'D'
+    je .word_backward
+    cmp al, 'A'
+    je .hist_prev
+    cmp al, 'B'
+    je .hist_next
+.esc_mod_not_ctrl:
+    ; Shift+Right/Left (modifier '2')
+    cmp bl, '2'
+    jne .read_char
+    cmp al, 'C'
+    je .cursor_right
+    cmp al, 'D'
+    je .cursor_left
+    jmp .read_char
+
     ; Numeric param: drain until final letter
 .esc_drain:
     mov rax, SYS_READ
@@ -2012,7 +2067,7 @@ read_line:
 .left_seq: db 27, '[', 'D'
 
 .word_forward:
-    ; Alt-F: move cursor forward to end of next word
+    ; Alt-F / Ctrl-Right: move cursor forward to end of next word
 .wf_skip_spaces:
     cmp r12, [line_len]
     jge .wf_done
@@ -2026,32 +2081,69 @@ read_line:
     cmp byte [line_buf + r12], ' '
     je .wf_done
     inc r12
-    jmp .wf_word
+    ; Skip UTF-8 continuation bytes (10xxxxxx = 0x80-0xBF)
+.wf_utf8:
+    cmp r12, [line_len]
+    jge .wf_done
+    movzx eax, byte [line_buf + r12]
+    and al, 0xC0
+    cmp al, 0x80
+    jne .wf_word
+    inc r12
+    jmp .wf_utf8
 .wf_done:
-    call reposition_cursor
+    call full_redraw
     jmp .read_char
 
 .word_backward:
-    ; Alt-B: move cursor backward to start of previous word
+    ; Alt-B / Ctrl-Left: move cursor backward to start of previous word
     test r12, r12
     jz .read_char
     dec r12
+    ; Skip back past UTF-8 continuation bytes
+.wb_utf8_back:
+    test r12, r12
+    jz .wb_skip_spaces
+    movzx eax, byte [line_buf + r12]
+    and al, 0xC0
+    cmp al, 0x80
+    jne .wb_skip_spaces
+    dec r12
+    jmp .wb_utf8_back
 .wb_skip_spaces:
     test r12, r12
     jz .wb_done
     cmp byte [line_buf + r12 - 1], ' '
     jne .wb_word
     dec r12
-    jmp .wb_skip_spaces
+    ; Skip back past continuation bytes after space skip
+.wb_sp_utf8:
+    test r12, r12
+    jz .wb_done
+    movzx eax, byte [line_buf + r12]
+    and al, 0xC0
+    cmp al, 0x80
+    jne .wb_skip_spaces
+    dec r12
+    jmp .wb_sp_utf8
 .wb_word:
     test r12, r12
     jz .wb_done
     cmp byte [line_buf + r12 - 1], ' '
     je .wb_done
     dec r12
-    jmp .wb_word
+    ; Skip back past continuation bytes
+.wb_wd_utf8:
+    test r12, r12
+    jz .wb_done
+    movzx eax, byte [line_buf + r12]
+    and al, 0xC0
+    cmp al, 0x80
+    jne .wb_word
+    dec r12
+    jmp .wb_wd_utf8
 .wb_done:
-    call reposition_cursor
+    call full_redraw
     jmp .read_char
 
 .delete_key:
