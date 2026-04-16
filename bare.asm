@@ -5881,8 +5881,8 @@ glob_recursive:
 .gr_cp_result:
     cmp rax, rcx
     jge .gr_cp_result_done
-    movzx ebx, byte [rsi + rax]
-    mov [rdi + rax], bl
+    movzx r8d, byte [rsi + rax]  ; use r8 (caller-saved), NOT rbx (holds dir fd!)
+    mov [rdi + rax], r8b
     inc rax
     jmp .gr_cp_result
 .gr_cp_result_done:
