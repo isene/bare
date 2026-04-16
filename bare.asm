@@ -2515,6 +2515,17 @@ read_line:
     ; Check for :command completion
     cmp byte [tab_word_buf], ':'
     je .tab_colon_completion
+    ; If word contains '/', use file completion (./cmd, ../dir, /path)
+    lea rsi, [tab_word_buf]
+.tab_cmd_slash_check:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .tab_cmd_no_slash
+    cmp al, '/'
+    je .tab_file_completion
+    inc rsi
+    jmp .tab_cmd_slash_check
+.tab_cmd_no_slash:
     ; Search PATH directories for matches
     lea rdi, [tab_word_buf]
     call tab_complete_command
@@ -13401,6 +13412,37 @@ syntax_highlight_line:
     pop rcx
     test rax, rax
     jnz .shl_cmd_is_exe
+
+    ; If path contains '/', check if file is executable via stat
+    lea rsi, [num_buf]
+.shl_check_path_slash:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .shl_cmd_no_color         ; no slash, unknown command
+    cmp al, '/'
+    je .shl_check_stat
+    inc rsi
+    jmp .shl_check_path_slash
+.shl_check_stat:
+    ; stat the file to check if it exists and is executable
+    push rcx
+    sub rsp, 144                 ; struct stat
+    mov rax, SYS_STAT
+    lea rdi, [num_buf]
+    mov rsi, rsp
+    syscall
+    test rax, rax
+    js .shl_stat_fail
+    ; Check mode for executable bit (st_mode at offset 24, check user exec bit 0100)
+    mov eax, [rsp + 24]
+    test eax, 0o100              ; S_IXUSR
+    jz .shl_stat_fail
+    add rsp, 144
+    pop rcx
+    jmp .shl_cmd_is_exe
+.shl_stat_fail:
+    add rsp, 144
+    pop rcx
 
     ; Unknown command: copy without color
     jmp .shl_cmd_no_color
