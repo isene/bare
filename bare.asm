@@ -158,6 +158,10 @@ err_fork:       db "bare: fork failed", 10
 err_fork_len    equ $ - err_fork
 err_exec:       db "bare: command not found: "
 err_exec_len    equ $ - err_exec
+err_usage_bare:
+    db "Usage: bare [-l|--login] [-c command] [--bench] [--help]", 10
+    db "Interactive shell in x86_64 Linux assembly. No libc, pure syscalls.", 10
+err_usage_bare_len equ $ - err_usage_bare
 err_cd:         db "bare: cd: no such directory", 10
 err_cd_len      equ $ - err_cd
 err_pipe:       db "bare: pipe failed", 10
@@ -665,9 +669,22 @@ _start:
     je .set_login
 .check_login_long:
     cmp dword [rax], '--lo'
-    jne .check_bench
+    jne .check_help
     mov qword [login_flag], 1
     jmp .no_args
+.check_help:
+    cmp dword [rax], '--he'
+    jne .check_bench
+    ; Print help text and exit (no config save)
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [err_usage_bare]
+    mov rdx, err_usage_bare_len
+    syscall
+    xor edi, edi
+    mov rax, SYS_EXIT
+    syscall
+
 .check_bench:
     cmp dword [rax], '--be'
     jne .check_c_flag
@@ -1128,7 +1145,7 @@ read_line:
     syscall
     call full_redraw
     jmp .read_char
-.winch_seq: db 27, "[2J", 27, "[H", 27, "7" ; clear screen + home + save cursor
+.winch_seq: db 27, "[2J", 27, "[H" ; clear screen + home
 .winch_seq_len equ $ - .winch_seq
 .not_eintr:
     test rax, rax
@@ -2646,7 +2663,7 @@ read_line:
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_save_cur]
-    mov rdx, 2
+    mov rdx, 3
     syscall
     call write_nl
     xor rcx, rcx
@@ -2742,7 +2759,7 @@ read_line:
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_restore_cur]
-    mov rdx, 2
+    mov rdx, 3
     syscall
     ; Show current selection in the command line
     ; Replace word at r14..r12 with selected match
@@ -2801,7 +2818,7 @@ read_line:
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_restore_cur]
-    mov rdx, 2
+    mov rdx, 3
     syscall
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -2816,14 +2833,34 @@ read_line:
     jmp .tab_cycle_redraw
 
 .tab_cycle_esc:
-    ; Read next byte to check for Shift-TAB (ESC[Z)
+    ; Check for Shift-TAB (ESC[Z) with timeout
+    ; Set VMIN=0 VTIME=1 for non-blocking read (100ms timeout)
+    mov byte [raw_termios + 17 + VMIN], 0
+    mov byte [raw_termios + 17 + VTIME], 1
+    mov rax, SYS_IOCTL
+    xor edi, edi
+    mov esi, TCSETSW
+    lea rdx, [raw_termios]
+    syscall
+    ; Try to read next byte
     mov rax, SYS_READ
     xor edi, edi
     lea rsi, [tmp_buf]
     mov rdx, 1
     syscall
+    ; Restore VMIN=1 VTIME=0
+    mov byte [raw_termios + 17 + VMIN], 1
+    mov byte [raw_termios + 17 + VTIME], 0
+    push rax
+    mov rax, SYS_IOCTL
+    xor edi, edi
+    mov esi, TCSETSW
+    lea rdx, [raw_termios]
+    syscall
+    pop rax
+    ; Check result
     test rax, rax
-    jle .tab_cycle_cancel
+    jle .tab_cycle_cancel     ; timeout or error = bare ESC = cancel
     cmp byte [tmp_buf], '['
     jne .tab_cycle_cancel
     mov rax, SYS_READ
@@ -2899,7 +2936,7 @@ read_line:
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_restore_cur]
-    mov rdx, 2
+    mov rdx, 3
     syscall
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -2917,8 +2954,8 @@ read_line:
 
 .tab_up_cr: db 27, "[A", 13        ; cursor up + carriage return
 .tab_cr: db 13
-.tab_save_cur: db 27, '7'          ; save cursor position
-.tab_restore_cur: db 27, '8'       ; restore cursor position
+.tab_save_cur: db 27, '[', 's'     ; save cursor (ANSI, separate from ESC7)
+.tab_restore_cur: db 27, '[', 'u'  ; restore cursor (ANSI)
 .tab_clr_below: db 13, 27, "[J"   ; CR + clear from cursor to end of screen
 .tab_clr_below_len equ $ - .tab_clr_below
 
@@ -3122,7 +3159,8 @@ reposition_cursor:
     ret
 .cr: db 13
 
-; Full redraw: CR, print prompt, print line, clear rest
+; Full redraw: CR, clear line, print prompt, print line
+; All output batched into render_buf for single write (no flicker)
 full_redraw:
     push r12
     push rbx
@@ -3130,12 +3168,12 @@ full_redraw:
     ; Initialize render buffer
     mov qword [render_pos], 0
 
-    ; 1. Restore cursor to prompt start (saved by print_prompt), then clear below
-    mov byte [render_buf], 27      ; ESC
-    mov byte [render_buf + 1], '8' ; restore cursor (ESC 8)
-    mov byte [render_buf + 2], 27  ; ESC
-    mov byte [render_buf + 3], '[' ; [
-    mov byte [render_buf + 4], 'J' ; clear to end of screen
+    ; 1. CR + clear entire line
+    mov byte [render_buf], 13          ; CR
+    mov byte [render_buf + 1], 27      ; ESC
+    mov byte [render_buf + 2], '['
+    mov byte [render_buf + 3], '2'
+    mov byte [render_buf + 4], 'K'     ; clear entire line
     mov qword [render_pos], 5
 
     ; Set batching flag for all sub-calls
@@ -4568,12 +4606,14 @@ parse_and_exec_simple:
     and eax, 0xFF
     mov [last_status], rax
     add rsp, 16
+    call post_child_restore
     call enable_raw_mode
     jmp .paes_done
 
 .paes_stopped:
     ; Child was stopped by Ctrl-Z, add to job table
     add rsp, 16
+    call post_child_restore
     call enable_raw_mode
     mov rdi, r13             ; pid
     lea rsi, [line_buf]      ; command string
@@ -7073,25 +7113,27 @@ restore_termios:
 .rt_ret:
     ret
 
-enable_raw_mode:
+; Call after child process exit to restore terminal state
+; before re-enabling raw mode
+post_child_restore:
     cmp qword [is_tty], 0
-    je .erm_ret
+    je .pcr_ret
     ; Re-read current termios (child may have changed terminal state)
     call save_termios
     ; Reset application cursor keys mode (SSH/tmux may set DECCKM)
-    push rax
-    push rdi
-    push rsi
-    push rdx
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [.erm_reset_ckm]
+    lea rsi, [reset_ckm_seq]
     mov rdx, 5
     syscall
-    pop rdx
-    pop rsi
-    pop rdi
-    pop rax
+.pcr_ret:
+    ret
+
+reset_ckm_seq: db 27, "[?1l"    ; Reset DECCKM (normal cursor keys)
+
+enable_raw_mode:
+    cmp qword [is_tty], 0
+    je .erm_ret
     ; Copy orig to raw
     lea rsi, [orig_termios]
     lea rdi, [raw_termios]
@@ -7112,7 +7154,6 @@ enable_raw_mode:
     syscall
 .erm_ret:
     ret
-.erm_reset_ckm: db 27, "[?1l"   ; Reset DECCKM (normal cursor keys)
 
 ; Enable cooked mode with ISIG for child process execution
 ; Takes orig_termios and ensures ICANON, ECHO, ISIG are set
@@ -8861,17 +8902,6 @@ print_prompt_dynamic:
     push rbx
     push r12
 
-    ; Save cursor position for full_redraw (ESC 7)
-    ; Only when printing fresh prompt, not during batched redraw
-    cmp qword [render_to_buf], 0
-    jnz .ppd_skip_save
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [.ppd_save_cur]
-    mov rdx, 2
-    syscall
-.ppd_skip_save:
-
     ; Get terminal width
     sub rsp, 8
     mov rax, SYS_IOCTL
@@ -9240,7 +9270,6 @@ print_prompt_dynamic:
     pop rbx
     ret
 
-.ppd_save_cur: db 27, '7'      ; ESC 7 = save cursor position
 .ppd_osc: db 27, "]2;"         ; OSC set title
 .ppd_bel: db 7                  ; BEL (end OSC)
 .ppd_osc7: db 27, "]7;file://" ; OSC 7 cwd notification
@@ -13870,6 +13899,23 @@ tab_complete_switch:
 
 .tcs_child:
     ; Child: redirect stdout and stderr to write end of pipe
+    ; Close stdin so commands without --help exit immediately
+    mov rax, SYS_OPEN
+    lea rdi, [.tcs_devnull]
+    xor esi, esi             ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .tcs_child_skip_stdin
+    mov rbx, rax             ; save /dev/null fd
+    mov rax, SYS_DUP2
+    mov edi, ebx
+    xor esi, esi             ; stdin = 0
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, ebx             ; close original /dev/null fd
+    syscall
+.tcs_child_skip_stdin:
     mov rax, SYS_CLOSE
     mov edi, [pipe_fds]      ; close read end
     syscall
@@ -13912,6 +13958,7 @@ tab_complete_switch:
     mov rax, SYS_EXIT
     syscall
 .tcs_help_str: db "--help", 0
+.tcs_devnull: db "/dev/null", 0
 
 ; rdi = word starting with $
 ; ══════════════════════════════════════════════════════════════════════
@@ -14907,7 +14954,7 @@ show_rprompt:
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.rp_save]
-    mov rdx, 2
+    mov rdx, 3                   ; ESC[s = 3 bytes
     syscall
     ; Build positioning + color + text + reset + restore in rprompt_buf area
     ; Move content to after the positioning escape
@@ -14937,7 +14984,7 @@ show_rprompt:
     add rdi, rax
     mov byte [rdi], 'G'
     inc rdi
-    ; Gray color
+    ; Stamp color from settings
     mov byte [rdi], 27
     mov byte [rdi+1], '['
     mov byte [rdi+2], '3'
@@ -14945,11 +14992,15 @@ show_rprompt:
     mov byte [rdi+4], ';'
     mov byte [rdi+5], '5'
     mov byte [rdi+6], ';'
-    mov byte [rdi+7], '2'
-    mov byte [rdi+8], '4'
-    mov byte [rdi+9], '5'
-    mov byte [rdi+10], 'm'
-    add rdi, 11
+    add rdi, 7
+    ; Convert color_settings[C_STAMP] to digits
+    movzx eax, byte [color_settings + C_STAMP]
+    push rdi
+    call itoa
+    pop rdi
+    add rdi, rax
+    mov byte [rdi], 'm'
+    inc rdi
     ; Copy rprompt text
     pop rbx
     lea rsi, [rprompt_buf]
@@ -14963,15 +15014,16 @@ show_rprompt:
     inc rcx
     jmp .rp_copy_text
 .rp_copy_text_done:
-    ; Reset + restore cursor
+    ; Reset + restore cursor (ESC[u, not ESC8, to avoid clobbering prompt save)
     mov byte [rdi], 27
     mov byte [rdi+1], '['
     mov byte [rdi+2], '0'
     mov byte [rdi+3], 'm'
     add rdi, 4
     mov byte [rdi], 27
-    mov byte [rdi+1], '8'
-    add rdi, 2
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], 'u'
+    add rdi, 3
     ; Write it all
     mov rdx, rdi
     lea rsi, [rprompt_buf + 128]
@@ -14986,7 +15038,7 @@ show_rprompt:
     pop rbx
     ret
 
-.rp_save: db 27, '7'        ; ESC 7 = save cursor
+.rp_save: db 27, '[', 's'   ; ESC[s = save cursor (ANSI, separate from ESC7)
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Auto-correct: suggest similar commands on "command not found"
@@ -15636,6 +15688,7 @@ try_run_plugin:
     and eax, 0xFF
     mov [last_status], rax
     add rsp, 16
+    call post_child_restore
     call enable_raw_mode
     mov rax, 1
     pop r14
