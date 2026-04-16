@@ -422,6 +422,9 @@ glob_buf:       resb MAX_GLOB_BUF      ; storage for matched filenames
 glob_buf_pos:   resq 1
 glob_dir_buf:   resb 4096              ; buffer for getdents64
 glob_path_buf:  resb 4096              ; temp for building paths
+glob_queue:     resb 32768             ; BFS queue for ** glob (null-separated dir paths)
+glob_queue_wpos: resq 1               ; write position in queue
+glob_queue_rpos: resq 1               ; read position in queue
 
 ; Expanded argv (after glob expansion)
 expanded_argv:  resq 512               ; expanded argv array
@@ -5707,7 +5710,7 @@ glob_expand_argv:
 ; rsi = string
 ; Returns: rax = 1 if has glob chars, 0 if not
 ; ══════════════════════════════════════════════════════════════════════
-; Recursive glob: handle ** patterns
+; Recursive glob using BFS queue: handle ** patterns
 ; rdi = full pattern (e.g., "**/*.txt" or "src/**/*.rs")
 ; Results added to glob_results/glob_count
 ; ══════════════════════════════════════════════════════════════════════
@@ -5717,267 +5720,236 @@ glob_recursive:
     push r13
     push r14
     push r15
-    sub rsp, 4096            ; dir path buffer on stack
 
     mov r12, rdi             ; save full pattern
 
-    ; Find ** position and extract prefix dir and suffix pattern
-    ; e.g., "src/**/*.rs" -> prefix="src", suffix="*.rs"
-    ; e.g., "**/*.txt" -> prefix=".", suffix="*.txt"
+    ; Find ** position, extract prefix dir and suffix pattern
     mov rsi, r12
-    xor r13, r13             ; position of **
 .gr_find_dstar:
     cmp byte [rsi], 0
-    je .gr_done              ; no ** found (shouldn't happen)
-    cmp word [rsi], '**'
+    je .gr_done
+    cmp word [rsi], 0x2A2A
     je .gr_found_dstar
     inc rsi
     jmp .gr_find_dstar
 .gr_found_dstar:
     mov r13, rsi             ; r13 points to **
-    ; Get suffix (after ** and optional /)
-    lea r14, [r13 + 2]       ; skip **
+    ; Suffix: skip ** and optional /
+    lea r14, [r13 + 2]
     cmp byte [r14], '/'
     jne .gr_have_suffix
-    inc r14                   ; skip /
+    inc r14
 .gr_have_suffix:
-    ; r14 = suffix pattern (e.g., "*.txt")
+    ; r14 = suffix pattern (e.g., "*.txt"), store in glob_path_buf+3072
+    lea rdi, [glob_path_buf + 3072]
+    mov rsi, r14
+    call strcpy_rsi_rdi
 
-    ; Get prefix directory
+    ; Build starting directory in glob_queue
+    mov qword [glob_queue_wpos], 0
+    mov qword [glob_queue_rpos], 0
     cmp r13, r12
-    je .gr_prefix_dot         ; ** at start, use "."
-    ; Copy prefix (chars before **)
+    je .gr_prefix_dot
+    ; Copy prefix (before **)
+    lea rdi, [glob_queue]
     mov rsi, r12
-    mov rdi, rsp              ; use stack buffer for dir
     mov rcx, r13
     sub rcx, r12
-    ; Remove trailing / from prefix
     cmp byte [r12 + rcx - 1], '/'
-    jne .gr_cp_prefix
+    jne .gr_cp_pre
     dec rcx
-.gr_cp_prefix:
+.gr_cp_pre:
     test rcx, rcx
     jz .gr_prefix_dot
     xor rax, rax
-.gr_cp_loop:
+.gr_cp_pre_loop:
     cmp rax, rcx
-    jge .gr_cp_done
+    jge .gr_cp_pre_done
     movzx edx, byte [rsi + rax]
     mov [rdi + rax], dl
     inc rax
-    jmp .gr_cp_loop
-.gr_cp_done:
+    jmp .gr_cp_pre_loop
+.gr_cp_pre_done:
     mov byte [rdi + rax], 0
-    jmp .gr_start_walk
+    inc rax
+    mov [glob_queue_wpos], rax
+    jmp .gr_bfs_loop
 
 .gr_prefix_dot:
-    mov byte [rsp], '.'
-    mov byte [rsp + 1], 0
+    mov byte [glob_queue], '.'
+    mov byte [glob_queue + 1], 0
+    mov qword [glob_queue_wpos], 2
 
-.gr_start_walk:
-    ; r14 = suffix pattern, rsp = starting directory
-    ; Walk directory tree recursively
-    mov rdi, rsp             ; start dir
-    mov rsi, r14             ; file pattern
-    call glob_walk_dir
+.gr_bfs_loop:
+    ; Process directories from queue until empty
+    mov rax, [glob_queue_rpos]
+    cmp rax, [glob_queue_wpos]
+    jge .gr_done
 
-.gr_done:
-    add rsp, 4096
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
+    ; Get current directory path from queue
+    lea r15, [glob_queue + rax]  ; r15 = current dir path
+    ; Advance rpos past this entry
+    mov rdi, r15
+    call strlen
+    inc rax                  ; skip null
+    add [glob_queue_rpos], rax
 
-; Walk a directory and its subdirectories, matching files against pattern
-; rdi = directory path, rsi = pattern to match filenames
-glob_walk_dir:
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    sub rsp, 4096            ; getdents buffer
-
-    mov r12, rdi             ; directory path
-    mov r13, rsi             ; file pattern
-    mov qword [glob_dir_buf + 4080], 0  ; use as temp for path building
-
-    ; Open directory
+    ; Scan this directory
     mov rax, SYS_OPEN
-    mov rdi, r12
+    mov rdi, r15
     mov rsi, O_RDONLY | O_DIRECTORY
     xor edx, edx
     syscall
     test rax, rax
-    js .gwd_done
-    mov r14, rax             ; fd
+    js .gr_bfs_loop          ; can't open, skip
+    mov rbx, rax             ; fd
 
-.gwd_read:
+.gr_scan:
     mov rax, SYS_GETDENTS64
-    mov rdi, r14
-    mov rsi, rsp
+    mov rdi, rbx
+    lea rsi, [glob_dir_buf]
     mov rdx, 4096
     syscall
     test rax, rax
-    jle .gwd_close
-    mov r15, rax             ; bytes read
+    jle .gr_close
 
-    xor rbx, rbx             ; offset
-.gwd_entry:
-    cmp rbx, r15
-    jge .gwd_read
+    xor rcx, rcx
+.gr_entry:
+    cmp rcx, rax
+    jge .gr_scan
 
-    lea rsi, [rsp + rbx]
-    movzx ecx, word [rsi + DIRENT64_D_RECLEN]
-    push rcx                 ; save reclen
+    push rax                 ; save bytes_read
+    push rcx                 ; save offset
+
+    lea rsi, [glob_dir_buf + rcx]
+    movzx edx, word [rsi + DIRENT64_D_RECLEN]
+    push rdx                 ; save reclen
     lea rdi, [rsi + DIRENT64_D_NAME]
-    movzx eax, byte [rsi + DIRENT64_D_TYPE]
+    movzx r13d, byte [rsi + DIRENT64_D_TYPE]
 
     ; Skip . and ..
     cmp byte [rdi], '.'
-    jne .gwd_not_dot
+    jne .gr_not_dot
     cmp byte [rdi + 1], 0
-    je .gwd_skip
+    je .gr_skip_entry
     cmp byte [rdi + 1], '.'
-    jne .gwd_check_hidden
+    jne .gr_check_hidden
     cmp byte [rdi + 2], 0
-    je .gwd_skip
-.gwd_check_hidden:
-    ; Skip hidden files (starting with .) unless pattern starts with .
-    cmp byte [r13], '.'
-    je .gwd_not_dot
-    jmp .gwd_skip
-.gwd_not_dot:
+    je .gr_skip_entry
+.gr_check_hidden:
+    ; Skip hidden unless pattern starts with .
+    lea rsi, [glob_path_buf + 3072]
+    cmp byte [rsi], '.'
+    je .gr_not_dot
+    jmp .gr_skip_entry
+.gr_not_dot:
+    push rdi                 ; save d_name
 
-    push rax                 ; save d_type
-    push rdi                 ; save d_name pointer
-
-    ; Check if this entry matches the file pattern
-    push r13
-    mov rsi, r13
+    ; Check if entry matches suffix pattern
+    lea rsi, [glob_path_buf + 3072]  ; suffix pattern
     call glob_match
-    pop r13
-    pop rdi
-    pop rcx                  ; d_type
-
     test rax, rax
-    jz .gwd_no_match
+    jz .gr_no_file_match
 
-    ; Match! Add full path to results
+    ; Match! Build full path: dir/name -> glob_buf
     cmp qword [glob_count], MAX_GLOB_RESULTS - 1
-    jge .gwd_skip
-
-    ; Build full path: dir/name
+    jge .gr_no_file_match
+    mov rdi, [rsp]           ; d_name
+    ; Build path in glob_path_buf
     push rdi
-    mov rcx, [glob_buf_pos]
-    lea rbx, [glob_buf + rcx]
-    ; Copy dir
-    mov rsi, r12
-    mov rdi, rbx
-.gwd_cp_dir:
-    mov al, [rsi]
-    test al, al
-    jz .gwd_cp_slash
-    mov [rdi], al
-    inc rsi
-    inc rdi
-    jmp .gwd_cp_dir
-.gwd_cp_slash:
-    cmp byte [rdi - 1], '/'
-    je .gwd_cp_name
+    lea rdi, [glob_path_buf]
+    mov rsi, r15             ; dir path
+    call strcpy_rsi_rdi
+    lea rdi, [glob_path_buf + rax]
     mov byte [rdi], '/'
     inc rdi
-.gwd_cp_name:
     pop rsi                  ; d_name
-    push rdi                 ; save write pos
-.gwd_cp_nm:
-    mov al, [rsi]
-    mov [rdi], al
-    test al, al
-    jz .gwd_cp_nm_done
-    inc rsi
-    inc rdi
-    jmp .gwd_cp_nm
-.gwd_cp_nm_done:
-    pop rcx                  ; discard saved write pos
-    ; Record result
+    call strcpy_rsi_rdi
+    ; Copy to glob_buf
+    lea rsi, [glob_path_buf]
+    mov rdi, rsi
+    call strlen
+    mov rcx, rax
+    inc rcx                  ; include null
+    mov rdx, [glob_buf_pos]
+    cmp rdx, MAX_GLOB_BUF - 256
+    jge .gr_no_file_match
+    lea rdi, [glob_buf + rdx]
+    lea rsi, [glob_path_buf]
+    push rcx
+    xor rax, rax
+.gr_cp_result:
+    cmp rax, rcx
+    jge .gr_cp_result_done
+    movzx ebx, byte [rsi + rax]
+    mov [rdi + rax], bl
+    inc rax
+    jmp .gr_cp_result
+.gr_cp_result_done:
+    pop rcx
     mov rax, [glob_count]
-    mov [glob_results + rax*8], rbx
+    lea rdi, [glob_buf + rdx]
+    mov [glob_results + rax*8], rdi
     inc qword [glob_count]
-    ; Update buf_pos
-    sub rdi, glob_buf
-    inc rdi                  ; include null
-    mov [glob_buf_pos], rdi
-    jmp .gwd_skip
+    add rdx, rcx
+    mov [glob_buf_pos], rdx
 
-.gwd_no_match:
-    ; If this is a directory, recurse into it
-    pop rcx                  ; reclen (from earlier push)
-    lea rsi, [rsp + rbx]
-    movzx eax, byte [rsi + DIRENT64_D_TYPE]
-    cmp al, 4                ; DT_DIR
-    jne .gwd_skip2
-    lea rdi, [rsi + DIRENT64_D_NAME]
+.gr_no_file_match:
+    pop rdi                  ; d_name
 
-    ; Build subdir path on a temp buffer
-    push rbx
-    push r15
-    sub rsp, 512
-    mov rdi, rsp
-    mov rsi, r12
-.gwd_sub_cp_dir:
-    mov al, [rsi]
-    test al, al
-    jz .gwd_sub_slash
-    mov [rdi], al
-    inc rsi
-    inc rdi
-    jmp .gwd_sub_cp_dir
-.gwd_sub_slash:
-    cmp byte [rdi - 1], '/'
-    je .gwd_sub_cp_name
+    ; If directory, add to BFS queue
+    cmp r13d, 4              ; DT_DIR
+    jne .gr_skip_entry
+    ; Build subdir path: dir/name
+    lea rdi, [glob_path_buf]
+    mov rsi, r15
+    call strcpy_rsi_rdi
+    lea rdi, [glob_path_buf + rax]
     mov byte [rdi], '/'
     inc rdi
-.gwd_sub_cp_name:
-    ; Get entry name again from getdents buffer
-    lea rsi, [rsp + 512 + rbx]  ; original entry in getdents buf (offset by our sub rsp 512)
-    ; Actually, the stack shifted. Let me recalculate.
-    ; rsp was shifted by 512, rbx indexes into the getdents buf which is at rsp+512
-    add rsi, DIRENT64_D_NAME
-.gwd_sub_nm:
-    mov al, [rsi]
-    mov [rdi], al
-    test al, al
-    jz .gwd_sub_recurse
-    inc rsi
-    inc rdi
-    jmp .gwd_sub_nm
-.gwd_sub_recurse:
-    ; Recurse
-    mov rdi, rsp             ; subdir path
-    mov rsi, r13             ; same pattern
-    call glob_walk_dir
-    add rsp, 512
-    pop r15
-    pop rbx
-    push rcx                 ; re-push reclen for skip
-    jmp .gwd_skip
+    ; rdi = after slash, now copy entry name from d_name
+    ; We need d_name again, reconstruct from stack
+    mov rcx, [rsp + 8]      ; offset (second item on stack)
+    lea rsi, [glob_dir_buf + rcx + DIRENT64_D_NAME]
+    call strcpy_rsi_rdi
+    ; Add to queue if space
+    lea rdi, [glob_path_buf]
+    call strlen
+    inc rax                  ; include null
+    mov rcx, [glob_queue_wpos]
+    add rcx, rax
+    cmp rcx, 32000
+    jge .gr_skip_entry       ; queue full
+    lea rdi, [glob_queue]
+    add rdi, [glob_queue_wpos]
+    lea rsi, [glob_path_buf]
+    push rax
+    xor rcx, rcx
+.gr_cp_queue:
+    cmp rcx, rax
+    jge .gr_cp_queue_done
+    movzx edx, byte [rsi + rcx]
+    mov [rdi + rcx], dl
+    inc rcx
+    jmp .gr_cp_queue
+.gr_cp_queue_done:
+    pop rax
+    add [glob_queue_wpos], rax
 
-.gwd_skip2:
-    push rcx                 ; re-push reclen
-.gwd_skip:
-    pop rcx                  ; reclen
-    add rbx, rcx
-    jmp .gwd_entry
+.gr_skip_entry:
+    pop rdx                  ; reclen
+    pop rcx                  ; offset
+    pop rax                  ; bytes_read
+    add rcx, rdx
+    jmp .gr_entry
 
-.gwd_close:
+.gr_close:
     mov rax, SYS_CLOSE
-    mov rdi, r14
+    mov rdi, rbx
     syscall
-.gwd_done:
-    add rsp, 4096
+    jmp .gr_bfs_loop
+
+.gr_done:
     pop r15
     pop r14
     pop r13
@@ -6017,6 +5989,21 @@ glob_expand_single:
 
     mov r12, rdi             ; save pattern
     mov qword [glob_count], 0
+
+    ; Check for ** (recursive glob)
+    mov rsi, rdi
+.ges_check_dstar:
+    cmp byte [rsi], 0
+    je .ges_no_dstar
+    cmp word [rsi], 0x2A2A   ; '**' as little-endian word
+    je .ges_do_recursive
+    inc rsi
+    jmp .ges_check_dstar
+.ges_do_recursive:
+    mov rdi, r12
+    call glob_recursive
+    jmp .ges_done
+.ges_no_dstar:
 
     ; Split into directory and pattern parts
     ; Find last '/' in pattern
