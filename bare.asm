@@ -238,7 +238,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.9", 10, 0
+version_str:    db "bare 0.2.10", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -300,16 +300,23 @@ theme_data:
 
 ; :info text
 info_text:
-    db "bare - Interactive shell in x86_64 Linux assembly", 10
-    db "No libc, no runtime, pure syscalls.", 10, 10
-    db "Features: dynamic prompt, git branch, multi-pipe, command", 10
-    db "substitution, brace/history expansion, nick/gnick/abbrev", 10
-    db "aliases, bookmarks, tab cycling, Ctrl-R search, inline", 10
-    db "suggestions, job control, 6 color themes, syntax", 10
-    db "highlighting, auto-pair, multi-line editing, calculator,", 10
-    db "validation rules, config persistence, and more.", 10, 10
-    db "Config: ~/.barerc    History: ~/.bare_history", 10
-    db "Companion: bareconf (TUI configurator)", 10
+    db 27, "[38;5;48m"
+    db "  _                       ", 10
+    db " | |__   __ _ _ __ ___    ", 10
+    db " | '_ \ / _` | '__/ _ \   ", 10
+    db " | |_) | (_| | | |  __/   ", 10
+    db " |_.__/ \__,_|_|  \___|   ", 10
+    db 27, "[0m", 10
+    db "  Interactive shell in x86_64 Linux assembly", 10
+    db "  No libc, no runtime, pure syscalls. Part of CHasm.", 10, 10
+    db "  Features: dynamic prompt with git dirty indicator, multi-pipe, command substitution,", 10
+    db "  brace/history/glob expansion (including **), nick/gnick/abbrev aliases, bookmarks,", 10
+    db "  interactive tab cycling with LS_COLORS, switch completion from --help, Ctrl-R search,", 10
+    db "  inline suggestions, job control, 6 color themes, syntax highlighting, here-strings,", 10
+    db "  auto-pair brackets, multi-line editing, calculator, backslash-space file escaping,", 10
+    db "  SIGWINCH resize handling, UTF-8 cursor movement, config persistence, and more.", 10, 10
+    db "  Config: ~/.barerc    History: ~/.bare_history    Plugins: ~/.bare/plugins/", 10
+    db "  Companion: bareconf (TUI configurator)    Website: https://isene.org", 10, 10
 info_text_len equ $ - info_text
 
 ; Startup tips
@@ -10210,24 +10217,31 @@ handle_help:
     ret
 .help_text:
     db "bare shell commands:", 10
-    db "  :nick [name = val | -name]    Aliases", 10
-    db "  :gnick [name = val | -name]   Global aliases", 10
-    db "  :abbrev [name = val | -name]  Abbreviations", 10
-    db "  :bm [name [path] [#tags]]     Bookmarks", 10
-    db "  :dirs                         Directory history", 10
-    db "  :history                      Command history", 10
-    db "  :rmhistory                    Clear history", 10
-    db "  :rehash                       Rebuild PATH cache", 10
-    db "  :reload                       Reload ~/.barerc", 10
-    db "  :theme [name]                 Color themes", 10
-    db "  :config [key [value]]         View/set config", 10
-    db "  :version                      Show version", 10
-    db "  :help                         This help", 10
+    db "  :nick [name = val | -name]      Aliases", 10
+    db "  :gnick [name = val | -name]     Global aliases", 10
+    db "  :abbrev [name = val | -name]    Abbreviations", 10
+    db "  :bm [name [path] [#tags]]       Bookmarks (:bm ?tag to search)", 10
+    db "  :dirs                           Directory history (cd N to jump)", 10
+    db "  :theme [name]                   Color themes (6 built-in)", 10
+    db "  :config [key [value]]           View/set config", 10
+    db "  :save                           Save config now", 10
+    db "  :backup [name] / :restore       Backup/restore config+history", 10
+    db "  :rehash                         Rebuild PATH cache", 10
+    db "  :reload                         Reload ~/.barerc", 10
+    db "  :calc expr                      Calculator (+, -, *, /, %)", 10
+    db "  :stats                          Command frequency stats", 10
+    db "  :validate pattern = action      Safety rules (warn/confirm/block)", 10
+    db "  :save_session / :load_session   Session management", 10
+    db "  :jobs / :fg [N] / :bg [N]       Job control", 10
+    db "  :env [VAR]                      Environment variables", 10
+    db "  :info / :version / :help        Shell information", 10
     db 10
-    db "  cd, pwd, exit, export, unset, history, pushd, popd", 10
+    db "  Builtins: cd, pwd, exit, export, unset, history, pushd, popd, time", 10
+    db "  Expansion: ~, $VAR, $(cmd), {a,b,c}, **, !!, <<<", 10
     db 10
-    db "  Ctrl-L=clear  Ctrl-R=search  Ctrl-A/E=home/end", 10
-    db "  Ctrl-K=kill   Ctrl-U=clear   Ctrl-W=del-word", 10
+    db "  Ctrl-R=search  Ctrl-L=clear  Ctrl-A/E=home/end  Ctrl-C=cancel", 10
+    db "  Ctrl-K=kill    Ctrl-U=clear  Ctrl-W=del-word    Ctrl-Z=suspend", 10
+    db "  Ctrl-G=editor  Ctrl-Y=copy   Alt-F/B=word-jump  Ctrl-Left/Right", 10
     db 10
 .help_text_len equ $ - .help_text
 

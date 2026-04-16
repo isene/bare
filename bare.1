@@ -1,4 +1,4 @@
-.TH BARE 1 "April 2026" "bare 0.1.0" "User Commands"
+.TH BARE 1 "April 2026" "bare 0.2.10" "User Commands"
 .SH NAME
 bare \- interactive shell in x86_64 Linux assembly
 .SH SYNOPSIS
@@ -34,8 +34,8 @@ Reverse incremental history search.
 .B Up / Down
 History navigation. With typed prefix, filters matching entries.
 .TP
-.B Alt\-F / Alt\-B
-Move cursor forward/backward by word.
+.B Alt\-F / Alt\-B / Ctrl\-Right / Ctrl\-Left
+Move cursor forward/backward by word (UTF\-8 aware).
 .TP
 .B Ctrl\-A / Ctrl\-E
 Move to beginning/end of line.
@@ -101,6 +101,15 @@ Job control.
 .B :env \fR[\fIVAR\fR | set \fIVAR val\fR | unset \fIVAR\fR]
 Environment management.
 .TP
+.B :save
+Save configuration immediately.
+.TP
+.B :backup \fR[\fIname\fR] / :restore \fR[\fIname\fR]
+Backup/restore config and history. Default suffix: .bak.
+.TP
+.B :rehash
+Rebuild PATH executable cache.
+.TP
 .B :reload
 Reload ~/.barerc configuration.
 .TP
@@ -125,6 +134,25 @@ Plugin directory.
 .TP
 .I ~/.bare/sessions/
 Saved sessions.
+.SH EXPANSION
+.TP
+.B Tilde, variables
+\fB~\fR, \fB$VAR\fR, \fB${VAR}\fR, \fB$?\fR, \fB$$\fR
+.TP
+.B Command substitution
+\fB$(cmd)\fR with nesting
+.TP
+.B Brace expansion
+\fBfile.{txt,md,rs}\fR
+.TP
+.B Glob expansion
+\fB*\fR, \fB?\fR, \fB[a\-z]\fR, and \fB**\fR for recursive matching
+.TP
+.B History expansion
+\fB!!\fR (last command), \fB!N\fR (by number), \fB!\-N\fR (relative)
+.TP
+.B Here\-strings
+\fBcommand <<< "string"\fR feeds string as stdin
 .SH CONFIGURATION
 Settings in ~/.barerc use \fIkey = value\fR format:
 .PP
