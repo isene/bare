@@ -13433,9 +13433,13 @@ syntax_highlight_line:
     syscall
     test rax, rax
     js .shl_stat_fail
-    ; Check mode for executable bit (st_mode at offset 24, check user exec bit 0100)
-    mov eax, [rsp + 24]
-    test eax, 0o100              ; S_IXUSR
+    ; Check it's a regular file (not directory) and executable
+    mov eax, [rsp + 24]         ; st_mode
+    mov ecx, eax
+    and ecx, 0xF000             ; S_IFMT mask
+    cmp ecx, 0x8000             ; S_IFREG (regular file)
+    jne .shl_stat_fail
+    test eax, 0o100             ; S_IXUSR
     jz .shl_stat_fail
     add rsp, 144
     pop rcx
