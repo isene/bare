@@ -242,7 +242,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.11", 10, 0
+version_str:    db "bare 0.2.12", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -4612,6 +4612,14 @@ parse_and_exec_simple:
     and ecx, 0xFF
     cmp ecx, 0x7F
     je .paes_stopped
+    ; If WIFSIGNALED (low 7 bits 1..0x7e), print newline so next prompt
+    ; starts on a fresh line after kernel-echoed ^C / ^\
+    test cl, 0x7F
+    jz .paes_norm_exit
+    push rax
+    call write_nl
+    pop rax
+.paes_norm_exit:
     ; Normal exit: extract status
     shr eax, 8
     and eax, 0xFF
