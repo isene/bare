@@ -33,6 +33,7 @@ DEFAULT REL
 %define SYS_GETUID    102
 %define SYS_GETGID    104
 %define SYS_SETPGID   109
+%define SYS_GETPGID   121
 %define SYS_GETPPID   110
 %define SYS_TCSETPGRP 0  ; via ioctl
 %define SYS_RT_SIGACTION 13
@@ -243,7 +244,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.15", 10, 0
+version_str:    db "bare 0.2.16", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -352,6 +353,7 @@ hist_suffix:    db "/.bare_history", 0
 ; Background job message
 bg_open:        db "[", 0
 bg_close:       db "]", 10, 0
+bg_jobsep:      db "] ", 0
 
 ; Dot and dotdot for filtering directory entries
 dot_name:       db ".", 0
@@ -449,6 +451,8 @@ tab_count:      resq 1
 tab_buf:        resb 8192              ; storage for tab matches
 tab_buf_pos:    resq 1
 tab_word_buf:   resb 256               ; current word being completed
+csi_params:     resb 32                ; collected CSI parameter bytes
+csi_param_len:  resq 1                 ; live count (rcx is clobbered by syscall)
 tab_saved_dtype: resb 1               ; d_type from last file match
 tab_dir_buf:    resb 4096              ; directory listing buffer
 
@@ -1949,11 +1953,50 @@ read_line:
     je .word_backward
     cmp byte [tmp_buf], 'd'
     je .read_char             ; Alt-d: ignore (kitty split)
+    ; OSC / DCS / SOS / PM / APC: drain until ESC \ (ST) or BEL (0x07).
+    ; Background commands like vim emit OSC titles whose payload would
+    ; otherwise leak into the line buffer.
+    cmp byte [tmp_buf], ']'
+    je .esc_drain_st
+    cmp byte [tmp_buf], 'P'
+    je .esc_drain_st
+    cmp byte [tmp_buf], 'X'
+    je .esc_drain_st
+    cmp byte [tmp_buf], '^'
+    je .esc_drain_st
+    cmp byte [tmp_buf], '_'
+    je .esc_drain_st
     ; Unknown ESC sequence: discard
     jmp .read_char
 
+.esc_drain_st:
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    test rax, rax
+    jle .read_char
+    cmp byte [tmp_buf], 0x07          ; BEL also terminates OSC
+    je .read_char
+    cmp byte [tmp_buf], 27            ; ESC \ (ST)?
+    jne .esc_drain_st
+    ; Saw ESC inside the payload; consume the following byte ('\\' or other)
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    jmp .read_char
+
 .esc_bracket:
-
+    ; Read first byte after ESC[. If it is a final byte (0x40..0x7E),
+    ; the sequence is parameter-less (e.g. plain arrows). Otherwise it
+    ; is a parameter byte and we must collect until a final byte arrives,
+    ; then dispatch on the params + final byte. This is required so that
+    ; multi-digit responses from background commands (cursor position
+    ; reports, Device Attributes, etc.) are fully drained instead of
+    ; spilling the tail into the line buffer.
     mov rax, SYS_READ
     xor edi, edi
     lea rsi, [tmp_buf]
@@ -1962,62 +2005,100 @@ read_line:
     test rax, rax
     jle .read_char
 
-    cmp byte [tmp_buf], 'A'    ; Up arrow = history prev
+    movzx eax, byte [tmp_buf]
+    cmp al, 0x40
+    jb .esc_collect_params       ; param/intermediate byte
+    ; Final byte with no params
+    mov qword [csi_param_len], 0
+    jmp .esc_dispatch
+
+.esc_collect_params:
+    ; First param byte is in tmp_buf; copy it and read until final byte.
+    ; Track length in memory because syscall clobbers rcx.
+    mov [csi_params], al
+    mov qword [csi_param_len], 1
+.esc_collect_loop:
+    mov rax, [csi_param_len]
+    cmp rax, 31
+    jge .esc_collect_oversized
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    test rax, rax
+    jle .read_char
+    mov rcx, [csi_param_len]
+    movzx eax, byte [tmp_buf]
+    mov [csi_params + rcx], al
+    inc rcx
+    mov [csi_param_len], rcx
+    cmp al, 0x40
+    jb .esc_collect_loop
+    ; Final byte landed in csi_params[csi_param_len-1]; dispatch
+    jmp .esc_dispatch
+
+.esc_collect_oversized:
+    ; Too many params; consume until final byte and bail.
+.esc_collect_drain:
+    mov rax, SYS_READ
+    xor edi, edi
+    lea rsi, [tmp_buf]
+    mov rdx, 1
+    syscall
+    test rax, rax
+    jle .read_char
+    cmp byte [tmp_buf], 0x40
+    jb .esc_collect_drain
+    jmp .read_char
+
+.esc_dispatch:
+    mov rcx, [csi_param_len]
+    test rcx, rcx
+    jnz .esc_dispatch_have_final
+    ; No params: tmp_buf still holds the final byte
+    movzx eax, byte [tmp_buf]
+    jmp .esc_final_check
+.esc_dispatch_have_final:
+    movzx eax, byte [csi_params + rcx - 1]
+.esc_final_check:
+    cmp rcx, 0
+    jne .esc_check_modified
+    cmp al, 'A'
     je .hist_prev
-    cmp byte [tmp_buf], 'B'    ; Down arrow = history next
+    cmp al, 'B'
     je .hist_next
-    cmp byte [tmp_buf], 'C'    ; Right arrow
+    cmp al, 'C'
     je .cursor_right
-    cmp byte [tmp_buf], 'D'    ; Left arrow
+    cmp al, 'D'
     je .cursor_left
-    cmp byte [tmp_buf], 'H'    ; Home
+    cmp al, 'H'
     je .home
-    cmp byte [tmp_buf], 'F'    ; End
+    cmp al, 'F'
     je .end_of_line
-    cmp byte [tmp_buf], '3'    ; Delete key (need one more byte)
-    je .delete_key
-    cmp byte [tmp_buf], '1'    ; Modified key (ESC[1;5C = Ctrl-Right, etc.)
-    je .esc_modified_key
-    ; Unknown CSI sequence: drain remaining bytes (digits, ;, until alpha)
-    cmp byte [tmp_buf], '0'
-    jb .read_char
-    cmp byte [tmp_buf], '9'
-    ja .read_char
-.esc_modified_key:
-    ; Read ';'
-    mov rax, SYS_READ
-    xor edi, edi
-    lea rsi, [tmp_buf]
-    mov rdx, 1
-    syscall
-    test rax, rax
-    jle .read_char
-    cmp byte [tmp_buf], ';'
-    jne .esc_drain           ; not ';', drain the rest
-    ; Read modifier digit (2=Shift, 3=Alt, 5=Ctrl, etc.)
-    mov rax, SYS_READ
-    xor edi, edi
-    lea rsi, [tmp_buf]
-    mov rdx, 1
-    syscall
-    test rax, rax
-    jle .read_char
-    push qword 0
-    movzx eax, byte [tmp_buf]
-    mov [rsp], rax           ; save modifier
-    ; Read final letter
-    mov rax, SYS_READ
-    xor edi, edi
-    lea rsi, [tmp_buf]
-    mov rdx, 1
-    syscall
-    pop rbx                  ; rbx = modifier
-    test rax, rax
-    jle .read_char
-    movzx eax, byte [tmp_buf]
-    ; Ctrl+Right (modifier '5', letter 'C') = word forward
-    cmp bl, '5'
-    jne .esc_mod_not_ctrl
+    jmp .read_char
+
+.esc_check_modified:
+    ; ESC[3~ (Delete key) — params="3~"
+    cmp al, '~'
+    jne .esc_check_arrow_mod
+    cmp byte [csi_params], '3'
+    je .delete_key_dispatch
+    jmp .read_char
+
+.esc_check_arrow_mod:
+    ; ESC[1;Mx where M is modifier digit and x is C/D/A/B.
+    cmp byte [csi_params], '1'
+    jne .read_char
+    cmp byte [csi_params + 1], ';'
+    jne .read_char
+    movzx ebx, byte [csi_params + 2]
+    cmp bl, '5'                   ; Ctrl
+    je .esc_mod_ctrl
+    cmp bl, '2'                   ; Shift
+    je .esc_mod_shift
+    jmp .read_char
+.esc_mod_ctrl:
     cmp al, 'C'
     je .word_forward
     cmp al, 'D'
@@ -2026,29 +2107,16 @@ read_line:
     je .hist_prev
     cmp al, 'B'
     je .hist_next
-.esc_mod_not_ctrl:
-    ; Shift+Right/Left (modifier '2')
-    cmp bl, '2'
-    jne .read_char
+    jmp .read_char
+.esc_mod_shift:
     cmp al, 'C'
     je .cursor_right
     cmp al, 'D'
     je .cursor_left
     jmp .read_char
 
-    ; Numeric param: drain until final letter
-.esc_drain:
-    mov rax, SYS_READ
-    xor edi, edi
-    lea rsi, [tmp_buf]
-    mov rdx, 1
-    syscall
-    test rax, rax
-    jle .read_char
-    movzx eax, byte [tmp_buf]
-    cmp al, '@'
-    jge .read_char            ; letter or higher = end of sequence
-    jmp .esc_drain
+.delete_key_dispatch:
+    jmp .delete_key_action
 
 .cursor_right:
     cmp r12, [line_len]
@@ -2192,12 +2260,7 @@ read_line:
     jmp .read_char
 
 .delete_key:
-    ; Read the ~ after [3
-    mov rax, SYS_READ
-    xor edi, edi
-    lea rsi, [tmp_buf]
-    mov rdx, 1
-    syscall
+.delete_key_action:
     ; Delete char at cursor (like forward-delete)
     mov rcx, [line_len]
     cmp r12, rcx
@@ -4103,15 +4166,34 @@ execute_line_bg:
     jz .bg_child
     js .bg_fork_err
 
-    ; Parent: print [pid]
+    ; Parent: register the bg job and print "[N] PID" like bash.
     mov r12, rax             ; save pid
-    ; Print "[pid]\n"
+    mov rdi, r12
+    mov rsi, r15             ; command string
+    call add_bg_job          ; returns rax = job number (1-based), 0 on overflow
+    mov r13, rax             ; save job num
+    ; Print "["
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [bg_open]
     mov rdx, 1
     syscall
-    ; Convert pid to string
+    ; Print job number
+    mov rax, r13
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [num_buf]
+    syscall
+    ; Print "] "
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [bg_jobsep]
+    mov rdx, 2
+    syscall
+    ; Print pid
     mov rax, r12
     lea rdi, [num_buf]
     call itoa
@@ -4120,50 +4202,47 @@ execute_line_bg:
     mov rdi, 1
     lea rsi, [num_buf]
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [bg_close]
-    mov rdx, 2
-    syscall
+    ; Print newline
+    call write_nl
 
     mov qword [last_status], 0
     jmp .bg_done
 
 .bg_child:
     ; Child process: execute the command.
+    ; Move the bg child into its own process group so that any tty I/O
+    ; the command attempts (e.g. vim opening /dev/tty) raises
+    ; SIGTTIN/SIGTTOU. The kernel suspends the offender instead of
+    ; letting it race bare for keystrokes.
+    mov rax, SYS_SETPGID
+    xor edi, edi             ; pid 0 = self
+    xor esi, esi             ; pgid 0 = use own pid
+    syscall
     ; Pretend we're not on a TTY so enable_cooked_mode / enable_raw_mode
     ; in execute_line don't reach behind the parent's back and reset
     ; bare's own termios while it is reading the next line.
     mov qword [is_tty], 0
-    ; Detach stdin from the terminal so background commands can't steal
-    ; keystrokes meant for bare.
-    mov rax, SYS_OPEN
-    lea rdi, [.dev_null]
-    xor esi, esi             ; O_RDONLY
-    xor edx, edx
-    syscall
-    test rax, rax
-    js .bg_child_run
-    mov rsi, rax             ; new fd
-    mov rdi, rsi
-    push rsi
-    mov rax, SYS_DUP2
-    mov rdi, rsi
-    xor esi, esi             ; stdin
-    syscall
-    pop rsi
-    mov rax, SYS_CLOSE
-    mov rdi, rsi
-    syscall
-.bg_child_run:
     ; Restore default signal handling
     call restore_child_signals
     mov rdi, r15
     call execute_line
+    ; If the inner child suspended (SIGTTIN etc.), execute_line returned
+    ; without reaping it. Keep blocking on wait4(-1) so bg_child does
+    ; NOT exit while a stopped child is alive — otherwise the kernel
+    ; orphans the stopped child's pgrp and delivers SIGHUP + SIGCONT,
+    ; which vim treats as fatal.
+.bg_wait_remaining:
+    mov rax, SYS_WAIT4
+    mov rdi, -1
+    xor esi, esi
+    xor edx, edx             ; no WUNTRACED -> only return on real exit
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    jg .bg_wait_remaining
     mov rax, SYS_EXIT
     mov rdi, [last_status]
     syscall
-.dev_null: db "/dev/null", 0
 
 .bg_fork_err:
     mov rax, SYS_WRITE
@@ -4207,6 +4286,22 @@ restore_child_signals:
     ; Restore SIGQUIT to default
     mov rax, SYS_RT_SIGACTION
     mov edi, SIGQUIT
+    mov rsi, rsp
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ; Restore SIGTTIN to default so background readers stop instead of
+    ; getting EIO (vim & must suspend, not die).
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGTTIN
+    mov rsi, rsp
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ; Restore SIGTTOU to default for the same reason on output to tty
+    ; from a background pgrp under TOSTOP.
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGTTOU
     mov rsi, rsp
     xor edx, edx
     mov r10, 8
@@ -11907,6 +12002,69 @@ show_cmd_duration:
 
 ; Add a stopped/background job to the job table
 ; rdi = pid, rsi = command string
+; Register a running background job. rdi=pid, rsi=command string.
+; Returns 1-based job number in rax (0 if table is full).
+add_bg_job:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi             ; pid
+    mov r13, rsi             ; command string
+    mov rax, [job_count]
+    cmp rax, MAX_JOBS
+    jge .abj_full
+    mov [job_pids + rax*8], r12
+    mov qword [job_status + rax*8], 0       ; 0 = running
+    ; Allocate command storage just like add_job does
+    lea rdi, [job_cmd_storage]
+    test rax, rax
+    jz .abj_store
+    mov rdi, [job_cmds + rax*8 - 8]
+    push rax
+    call strlen
+    add rdi, rax
+    inc rdi
+    pop rax
+.abj_store:
+    mov [job_cmds + rax*8], rdi
+    mov rsi, r13
+.abj_copy:
+    mov cl, [rsi]
+    mov [rdi], cl
+    test cl, cl
+    jz .abj_copied
+    inc rsi
+    inc rdi
+    jmp .abj_copy
+.abj_copied:
+    inc qword [job_count]
+    mov rax, [job_count]     ; 1-based job number
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.abj_full:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tty_set_fg_pgrp: ioctl(0, TIOCSPGRP, &pgid). rdi = pgid.
+; SIGTTOU is already ignored by bare so this won't suspend us.
+tty_set_fg_pgrp:
+    cmp qword [is_tty], 0
+    je .tsfp_ret
+    push rdi
+    mov rax, SYS_IOCTL
+    xor edi, edi             ; stdin
+    mov esi, TIOCSPGRP
+    mov rdx, rsp             ; pointer to pgid on stack
+    syscall
+    pop rdi
+.tsfp_ret:
+    ret
+
 add_job:
     push rbx
     push r12
@@ -12075,14 +12233,23 @@ handle_fg:
     je .hfg_no_job            ; job already done
 
     mov rbx, rax              ; job index
-    mov rdi, [job_pids + rbx*8]
 
-    ; Send SIGCONT
+    ; Send SIGCONT to the whole process group of the job (negative pid).
+    ; Bg children were placed in their own pgrp via setpgid(0,0), so the
+    ; pgid equals the wrapper's pid. Signaling the pgrp wakes the actual
+    ; payload (vim, etc.), not just the wrapper that is stuck in wait4.
+    mov rdi, [job_pids + rbx*8]
+    neg rdi
     mov rax, SYS_KILL
     mov rsi, SIGCONT
     syscall
 
-    ; Wait for the process (with WUNTRACED)
+    ; Hand the controlling terminal to the job's pgrp so it can read
+    ; keystrokes without re-tripping SIGTTIN.
+    mov rdi, [job_pids + rbx*8]
+    call tty_set_fg_pgrp
+
+    ; Wait for the wrapper (with WUNTRACED so we still see suspends)
     sub rsp, 16
     mov rdi, [job_pids + rbx*8]
     lea rsi, [rsp]
@@ -12090,6 +12257,17 @@ handle_fg:
     xor r10d, r10d
     mov rax, SYS_WAIT4
     syscall
+
+    ; Take the terminal back regardless of how the wait ended.
+    push rax
+    push rcx
+    mov rax, SYS_GETPGID
+    xor edi, edi
+    syscall
+    mov rdi, rax
+    call tty_set_fg_pgrp
+    pop rcx
+    pop rax
     ; Check if stopped again
     mov eax, [rsp]
     mov ecx, eax
