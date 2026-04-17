@@ -242,7 +242,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.13", 10, 0
+version_str:    db "bare 0.2.14", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -4123,7 +4123,32 @@ execute_line_bg:
     jmp .bg_done
 
 .bg_child:
-    ; Child process: execute the command
+    ; Child process: execute the command.
+    ; Pretend we're not on a TTY so enable_cooked_mode / enable_raw_mode
+    ; in execute_line don't reach behind the parent's back and reset
+    ; bare's own termios while it is reading the next line.
+    mov qword [is_tty], 0
+    ; Detach stdin from the terminal so background commands can't steal
+    ; keystrokes meant for bare.
+    mov rax, SYS_OPEN
+    lea rdi, [.dev_null]
+    xor esi, esi             ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .bg_child_run
+    mov rsi, rax             ; new fd
+    mov rdi, rsi
+    push rsi
+    mov rax, SYS_DUP2
+    mov rdi, rsi
+    xor esi, esi             ; stdin
+    syscall
+    pop rsi
+    mov rax, SYS_CLOSE
+    mov rdi, rsi
+    syscall
+.bg_child_run:
     ; Restore default signal handling
     call restore_child_signals
     mov rdi, r15
@@ -4131,6 +4156,7 @@ execute_line_bg:
     mov rax, SYS_EXIT
     mov rdi, [last_status]
     syscall
+.dev_null: db "/dev/null", 0
 
 .bg_fork_err:
     mov rax, SYS_WRITE
