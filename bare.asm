@@ -242,7 +242,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.12", 10, 0
+version_str:    db "bare 0.2.13", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -4425,12 +4425,15 @@ execute_line:
 .mp_wait_loop:
     cmp r13, r14
     jge .mp_wait_done
+.mp_wait_retry:
     mov rax, SYS_WAIT4
     mov rdi, [pipe_child_pids + r13*8]
     lea rsi, [rsp]
     xor edx, edx
     xor r10d, r10d
     syscall
+    cmp rax, -4              ; EINTR (e.g. SIGWINCH while child owns terminal)
+    je .mp_wait_retry
     inc r13
     jmp .mp_wait_loop
 .mp_wait_done:
@@ -4599,12 +4602,15 @@ parse_and_exec_simple:
     call enable_cooked_mode  ; ICANON + ECHO + ISIG for child
     sub rsp, 16
     ; Blocking wait with WUNTRACED (detect Ctrl-Z via ISIG)
+.paes_wait_retry:
     mov rdi, r13
     lea rsi, [rsp]
     mov edx, WUNTRACED
     xor r10d, r10d
     mov rax, SYS_WAIT4
     syscall
+    cmp rax, -4              ; EINTR (e.g. SIGWINCH while child owns terminal)
+    je .paes_wait_retry
 
     ; Check if child was stopped (WIFSTOPPED: status & 0xFF == 0x7F)
     mov eax, [rsp]
@@ -4612,14 +4618,6 @@ parse_and_exec_simple:
     and ecx, 0xFF
     cmp ecx, 0x7F
     je .paes_stopped
-    ; If WIFSIGNALED (low 7 bits 1..0x7e), print newline so next prompt
-    ; starts on a fresh line after kernel-echoed ^C / ^\
-    test cl, 0x7F
-    jz .paes_norm_exit
-    push rax
-    call write_nl
-    pop rax
-.paes_norm_exit:
     ; Normal exit: extract status
     shr eax, 8
     and eax, 0xFF
