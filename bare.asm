@@ -46,9 +46,10 @@ DEFAULT REL
 %define TIOCGPGRP  0x5411
 
 ; termios flags
-%define ICANON 0x2
-%define ECHO   0x8
-%define ISIG   0x1
+%define ICANON  0x2
+%define ECHO    0x8
+%define ISIG    0x1
+%define ECHOCTL 0x200
 %define VMIN   6
 %define VTIME  5
 
@@ -242,7 +243,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.14", 10, 0
+version_str:    db "bare 0.2.15", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -2529,6 +2530,12 @@ read_line:
     ; Search PATH directories for matches
     lea rdi, [tab_word_buf]
     call tab_complete_command
+    ; If PATH yielded nothing, fall back to cwd entries so things like
+    ; "Main<TAB>" work when there is a Main/ directory in the cwd.
+    cmp qword [tab_count], 0
+    jne .tab_process_results
+    lea rdi, [tab_word_buf]
+    call tab_complete_file
     jmp .tab_process_results
 
 .tab_colon_completion:
@@ -6848,8 +6855,8 @@ tab_complete_file:
     jz .tcf_match_f
 .tcf_cmp:
     movzx eax, byte [rsi]
-    movzx ebx, byte [rdi]
-    cmp al, bl
+    movzx r8d, byte [rdi]      ; do NOT clobber rbx (it holds the dir fd)
+    cmp al, r8b
     jne .tcf_no_match_f
     inc rsi
     inc rdi
@@ -6864,9 +6871,10 @@ tab_complete_file:
     cmp qword [tab_count], MAX_TAB_RESULTS - 1
     jge .tcf_skip_f
 
-    ; Copy name to tab_buf
+    ; Copy name to tab_buf. Use r9 (not rbx) as the destination cursor:
+    ; rbx holds the directory fd, needed for the next getdents64 call.
     mov rcx, [tab_buf_pos]
-    lea rbx, [tab_buf + rcx]
+    lea r9, [tab_buf + rcx]
     ; If there's a directory prefix, include it
     test r14, r14
     jz .tcf_copy_name_only
@@ -6874,7 +6882,7 @@ tab_complete_file:
     ; Copy dir prefix first
     push rdi
     mov rsi, r12
-    mov rdi, rbx
+    mov rdi, r9
     mov rcx, r14
 .tcf_copy_dir_prefix:
     mov al, [rsi]
@@ -6883,7 +6891,7 @@ tab_complete_file:
     inc rdi
     dec rcx
     jnz .tcf_copy_dir_prefix
-    mov rbx, rdi             ; continue from here
+    mov r9, rdi              ; continue from here
     pop rdi
 
 .tcf_copy_name_only:
@@ -6891,7 +6899,7 @@ tab_complete_file:
     xor rcx, rcx
 .tcf_copy_match:
     mov al, [rsi + rcx]
-    mov [rbx + rcx], al
+    mov [r9 + rcx], al
     test al, al
     jz .tcf_match_copied
     inc rcx
@@ -6899,7 +6907,7 @@ tab_complete_file:
     jge .tcf_match_copied
     jmp .tcf_copy_match
 .tcf_match_copied:
-    mov byte [rbx + rcx], 0
+    mov byte [r9 + rcx], 0
     ; Calculate total size added to tab_buf
     lea rax, [tab_buf]
     add rax, [tab_buf_pos]
@@ -7208,9 +7216,11 @@ enable_cooked_mode:
     lea rdi, [raw_termios]
     mov rcx, 60
     rep movsb
-    ; Ensure ICANON, ECHO, ISIG are set in c_lflag
+    ; Ensure ICANON, ECHO, ISIG are set; clear ECHOCTL so the kernel
+    ; does not echo Ctrl+C / Ctrl+\ etc. as ^C / ^\ before the next prompt.
     mov eax, [raw_termios + 12]
     or eax, (ICANON | ECHO | ISIG)
+    and eax, ~ECHOCTL
     mov [raw_termios + 12], eax
     ; Apply
     mov rax, SYS_IOCTL
