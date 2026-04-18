@@ -74,6 +74,8 @@ DEFAULT REL
 %define SIGTTIN 21
 %define SIGTTOU 22
 %define SIGCHLD 17
+%define SIGHUP  1
+%define SIGTERM 15
 %define SIG_IGN 1
 %define SIG_DFL 0
 
@@ -244,7 +246,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.16", 10, 0
+version_str:    db "bare 0.2.17", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -3249,13 +3251,82 @@ full_redraw:
     ; Initialize render buffer
     mov qword [render_pos], 0
 
-    ; 1. CR + clear entire line
-    mov byte [render_buf], 13          ; CR
-    mov byte [render_buf + 1], 27      ; ESC
-    mov byte [render_buf + 2], '['
-    mov byte [render_buf + 3], '2'
-    mov byte [render_buf + 4], 'K'     ; clear entire line
-    mov qword [render_pos], 5
+    ; 1. Reposition + clear. If the previous render wrapped across
+    ; multiple visual rows we need to move the cursor back to the
+    ; prompt's first row before clearing, otherwise only the current
+    ; visual row gets wiped and stale prompt rewrites accumulate.
+    ; Compute current cursor's visual-row offset from the prompt's
+    ; first row using the cursor's position within line_buf.
+    mov qword [render_pos], 0
+    mov rcx, [term_width]
+    cmp rcx, 1
+    jle .fd_clear_simple
+    push r12
+    call cursor_display_width   ; rax = display width of line_buf[0..r12]
+    pop r12
+    add rax, [prompt_visible_width]
+    xor edx, edx
+    mov rcx, [term_width]
+    div rcx                     ; rax = cursor row offset, edx = col
+    test rax, rax
+    jz .fd_clear_no_up
+    ; Emit ESC[<rows>A then CR.  CSI NA = cursor up N rows; many
+    ; minimal terminal parsers (incl. our glass) implement A but not
+    ; F (CPL), so the explicit CR keeps us portable.
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    mov byte [rdi], 27
+    mov byte [rdi + 1], '['
+    add rdi, 2
+    push rdi
+    lea rdi, [num_buf]
+    call itoa                   ; rax = digit count
+    pop rdi
+    lea rsi, [num_buf]
+    xor ecx, ecx
+.fd_cp_up_init:
+    cmp ecx, eax
+    jge .fd_cp_up_init_done
+    movzx ebx, byte [rsi + rcx]
+    mov [rdi + rcx], bl
+    inc ecx
+    jmp .fd_cp_up_init
+.fd_cp_up_init_done:
+    add rdi, rax
+    mov byte [rdi], 'A'
+    mov byte [rdi + 1], 13      ; CR to col 0
+    add rdi, 2
+    lea rax, [render_buf]
+    sub rdi, rax
+    mov [render_pos], rdi
+    jmp .fd_clear_to_eos
+.fd_clear_no_up:
+    ; Already on the prompt's first visual row: just CR
+    mov rdi, [render_pos]
+    mov byte [render_buf + rdi], 13
+    inc rdi
+    mov [render_pos], rdi
+    jmp .fd_clear_to_eos
+.fd_clear_simple:
+    ; Unknown term width: fall back to old behavior (CR + ESC[2K)
+    mov rdi, [render_pos]
+    mov byte [render_buf + rdi], 13
+    mov byte [render_buf + rdi + 1], 27
+    mov byte [render_buf + rdi + 2], '['
+    mov byte [render_buf + rdi + 3], '2'
+    mov byte [render_buf + rdi + 4], 'K'
+    add rdi, 5
+    mov [render_pos], rdi
+    jmp .fd_after_clear
+.fd_clear_to_eos:
+    ; Append ESC[J (clear from cursor to end of screen)
+    mov rdi, [render_pos]
+    mov byte [render_buf + rdi], 27
+    mov byte [render_buf + rdi + 1], '['
+    mov byte [render_buf + rdi + 2], 'J'
+    add rdi, 3
+    mov [render_pos], rdi
+.fd_after_clear:
 
     ; Set batching flag for all sub-calls
     mov qword [render_to_buf], 1
@@ -7391,8 +7462,41 @@ setup_signals:
     mov r10, 8
     syscall
 
+    ; Handle SIGHUP and SIGTERM: persist config + history before exit so
+    ; closing the terminal window (which delivers SIGHUP via the kernel)
+    ; doesn't drop nicks/bookmarks/etc set during the session.
+    xor eax, eax
+    mov rdi, rsp
+    mov rcx, 160
+    rep stosb
+    mov qword [rsp], sighup_handler
+    mov qword [rsp + 8], SA_RESTORER
+    mov qword [rsp + 16], sigwinch_restorer
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGHUP
+    mov rsi, rsp
+    xor edx, edx
+    mov r10, 8
+    syscall
+    mov rax, SYS_RT_SIGACTION
+    mov edi, SIGTERM
+    mov rsi, rsp
+    xor edx, edx
+    mov r10, 8
+    syscall
+
     add rsp, 160
     ret
+
+; SIGHUP/SIGTERM handler: best-effort save and exit. Async-signal-safety
+; is dicey here (we touch the file system), but the alternative is
+; losing user state.
+sighup_handler:
+    call save_config
+    call save_history
+    xor edi, edi
+    mov rax, SYS_EXIT
+    syscall
 
 ; SIGWINCH signal handler (async-signal-safe: only sets a flag)
 sigwinch_handler:
