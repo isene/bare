@@ -19,6 +19,8 @@ DEFAULT REL
 %define SYS_MUNMAP    11
 %define SYS_BRK       12
 %define SYS_IOCTL     16
+%define SYS_POLL      7
+%define POLLIN        1
 %define SYS_PIPE      22
 %define SYS_DUP2      33
 %define SYS_FORK      57
@@ -246,7 +248,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.17", 10, 0
+version_str:    db "bare 0.2.18", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -897,6 +899,11 @@ _start:
 .no_tip:
 
 ; ── Main loop ────────────────────────────────────────────────────────
+    ; Make sure we're in raw mode before the first prompt so the
+    ; ensure_col_zero DSR query response stays out of the terminal echo.
+    cmp qword [is_tty], 0
+    je .main_loop
+    call enable_raw_mode
 .main_loop:
     ; Print prompt (tty only)
     cmp qword [is_tty], 0
@@ -914,6 +921,7 @@ _start:
     add rsp, 8
     test rax, rax
     jnz .no_prompt           ; data waiting = paste in progress, skip prompt
+    call ensure_col_zero
     call print_prompt
 .no_prompt:
 
@@ -1068,6 +1076,112 @@ _start:
     xor edi, edi
     mov rax, SYS_EXIT
     syscall
+
+; ══════════════════════════════════════════════════════════════════════
+; ensure_col_zero: ensure the next prompt starts at column 0 even when
+; the previous command's output didn't end with a newline. Sends a
+; DSR cursor-position query (ESC[6n), reads back the response with a
+; short poll timeout, parses the column out of "ESC[<row>;<col>R" and
+; emits a newline if col != 1.
+;
+; Trade-off: in raw mode we read whatever stdin currently holds, so a
+; user keystroke that happens in the microsecond gap can end up in
+; this read. The bytes we don't recognise as part of the response are
+; dropped — annoying in the worst case, never wrong in the common
+; case (no key pressed between command exit and next prompt).
+;
+; Skipped when we are not on a TTY (eg. running under a pipe) since
+; the response would never come.
+; ══════════════════════════════════════════════════════════════════════
+ensure_col_zero:
+    cmp qword [is_tty], 0
+    je .ecz_done
+    push rbx
+    push r12
+    ; Send ESC[6n
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.ecz_query]
+    mov rdx, 4
+    syscall
+    ; Poll stdin briefly for the response
+    sub rsp, 16
+    mov dword [rsp], 0
+    mov word [rsp + 4], POLLIN
+    mov word [rsp + 6], 0
+    mov rax, SYS_POLL
+    lea rdi, [rsp]
+    mov rsi, 1
+    mov rdx, 50               ; 50 ms is plenty for a local terminal
+    syscall
+    add rsp, 16
+    test rax, rax
+    jle .ecz_pop
+    ; Read what arrived (cap at 32 bytes — we only need the response)
+    sub rsp, 40
+    mov rax, SYS_READ
+    xor edi, edi
+    mov rsi, rsp
+    mov rdx, 32
+    syscall
+    test rax, rax
+    jle .ecz_pop_buf
+    mov rcx, rax              ; bytes read
+    xor rbx, rbx              ; scan position
+.ecz_find_esc:
+    cmp rbx, rcx
+    jge .ecz_pop_buf
+    cmp byte [rsp + rbx], 27
+    je .ecz_check_lbr
+    inc rbx
+    jmp .ecz_find_esc
+.ecz_check_lbr:
+    inc rbx
+    cmp rbx, rcx
+    jge .ecz_pop_buf
+    cmp byte [rsp + rbx], '['
+    jne .ecz_find_esc
+    inc rbx
+    ; Walk past the row digits to ';'
+.ecz_skip_row:
+    cmp rbx, rcx
+    jge .ecz_pop_buf
+    cmp byte [rsp + rbx], ';'
+    je .ecz_at_col
+    inc rbx
+    jmp .ecz_skip_row
+.ecz_at_col:
+    inc rbx
+    xor eax, eax
+.ecz_col_digit:
+    cmp rbx, rcx
+    jge .ecz_have_col
+    movzx edx, byte [rsp + rbx]
+    cmp dl, '0'
+    jb .ecz_have_col
+    cmp dl, '9'
+    ja .ecz_have_col
+    imul eax, 10
+    sub edx, '0'
+    add eax, edx
+    inc rbx
+    jmp .ecz_col_digit
+.ecz_have_col:
+    cmp eax, 1
+    jle .ecz_pop_buf
+    add rsp, 40
+    call write_nl
+    pop r12
+    pop rbx
+    ret
+.ecz_pop_buf:
+    add rsp, 40
+.ecz_pop:
+    pop r12
+    pop rbx
+.ecz_done:
+    ret
+.ecz_query: db 27, "[6n"
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Print prompt: "bare> " with colors
