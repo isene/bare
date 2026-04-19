@@ -248,7 +248,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.18", 10, 0
+version_str:    db "bare 0.2.19", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -256,6 +256,10 @@ config_suffix:  db "/.barerc", 0
 
 ; State file suffix
 state_suffix:   db "/.barestate", 0
+
+; PATH executable cache file (persists exe_cache between sessions so we
+; can skip the ~600ms PATH directory scan on every shell startup).
+exec_cache_suffix: db "/.bare_exe_cache", 0
 
 ; Error messages for new features
 err_nick:       db "bare: nick: usage: :nick name = value", 10
@@ -560,6 +564,9 @@ cmd_freq_storage: resb 8192
 ; Config file path
 config_path:    resb 256
 
+; PATH exe cache file path
+exec_cache_path: resb 256
+
 ; Command-line flags
 login_flag:     resq 1              ; 1 if -l/--login
 cmd_flag:       resq 1              ; pointer to -c command string
@@ -812,8 +819,16 @@ _start:
     ; Get initial working directory
     call update_cwd
 
-    ; Cache PATH executables for syntax highlighting
+    ; PATH executable cache: try the persistent cache first (~few ms).
+    ; Fall back to a full PATH scan only if the cache file is missing
+    ; or invalid; init_exe_cache writes the cache so this happens at
+    ; most once per machine (and on `:rehash`).
+    call build_exec_cache_path
+    call load_exec_cache
+    test rax, rax
+    jnz .have_exe_cache
     call init_exe_cache
+.have_exe_cache:
 
     ; Initialize last_status
     mov qword [last_status], 0
@@ -8138,6 +8153,9 @@ init_exe_cache:
     pop r13
     pop r12
     pop rbx
+    ; Persist the freshly-built cache so the next bare instance can
+    ; skip the PATH scan entirely and start instantly.
+    call save_exec_cache
     ret
 
 ; Check if name (rdi) is already in exe_cache. Returns rax=1 if dup, 0 if not.
@@ -8191,6 +8209,119 @@ init_exe_cache:
     pop rcx
     pop rbx
     xor eax, eax
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Persistent exe_cache: load on startup (instant), rebuild on first
+; tab if missing (lazy). save_exec_cache is called from the end of
+; init_exe_cache so a successful rebuild is durable.
+; ══════════════════════════════════════════════════════════════════════
+
+build_exec_cache_path:
+    mov rdi, [envp]
+    call find_env_home
+    test rax, rax
+    jz .becp_done
+    lea rdi, [exec_cache_path]
+    mov rsi, rax
+    call strcpy_rsi_rdi
+    lea rsi, [exec_cache_suffix]
+    call strcpy_rsi_rdi
+.becp_done:
+    ret
+
+; load_exec_cache: read ~/.bare_exe_cache into exe_cache.
+; File format: 8-byte count + 8-byte size + raw cache bytes.
+; Returns rax=1 on success, 0 if missing/invalid (caller falls back
+; to lazy init_exe_cache on first tab).
+load_exec_cache:
+    push rbx
+    push r12
+    mov rax, SYS_OPEN
+    lea rdi, [exec_cache_path]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .lec_fail
+    mov r12, rax
+    sub rsp, 16
+    mov rax, SYS_READ
+    mov rdi, r12
+    mov rsi, rsp
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne .lec_close_fail
+    mov rax, [rsp]
+    mov rbx, [rsp + 8]
+    add rsp, 16
+    cmp rbx, 65000
+    ja .lec_close_fail2
+    mov [exe_cache_count], rax
+    mov [exe_cache_pos], rbx
+    mov rax, SYS_READ
+    mov rdi, r12
+    lea rsi, [exe_cache]
+    mov rdx, rbx
+    syscall
+    cmp rax, rbx
+    jne .lec_close_fail2
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+.lec_close_fail:
+    add rsp, 16
+.lec_close_fail2:
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+.lec_fail:
+    mov qword [exe_cache_count], 0
+    mov qword [exe_cache_pos], 0
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+
+; save_exec_cache: best-effort write of exe_cache to disk.
+save_exec_cache:
+    push rbx
+    push r12
+    mov rax, SYS_OPEN
+    lea rdi, [exec_cache_path]
+    mov esi, O_WRONLY | O_CREAT | O_TRUNC
+    mov edx, 0o644
+    syscall
+    test rax, rax
+    js .sec_done
+    mov r12, rax
+    sub rsp, 16
+    mov rax, [exe_cache_count]
+    mov [rsp], rax
+    mov rax, [exe_cache_pos]
+    mov [rsp + 8], rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    mov rsi, rsp
+    mov rdx, 16
+    syscall
+    add rsp, 16
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [exe_cache]
+    mov rdx, [exe_cache_pos]
+    syscall
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+.sec_done:
+    pop r12
+    pop rbx
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
