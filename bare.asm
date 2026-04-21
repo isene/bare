@@ -248,7 +248,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.19", 10, 0
+version_str:    db "bare 0.2.20", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -5159,6 +5159,93 @@ parse_and_exec_child_argv:
     lea rdx, [env_array]     ; use custom env
     syscall
     ; If we get here, exec failed
+
+    ; Auto-edit: typed path (contains '/') to a regular non-executable
+    ; file → open in $EDITOR (fallback /usr/bin/vim) instead of erroring.
+    mov r12, [rbx]                ; argv[0]
+    mov rsi, r12
+.ae_scan_slash:
+    mov al, [rsi]
+    test al, al
+    jz .exec_notfound             ; no '/', not a path
+    cmp al, '/'
+    je .ae_stat
+    inc rsi
+    jmp .ae_scan_slash
+.ae_stat:
+    sub rsp, 144
+    mov rax, SYS_STAT
+    mov rdi, r12
+    mov rsi, rsp
+    syscall
+    test rax, rax
+    js .ae_drop_stat
+    mov eax, [rsp + 24]           ; st_mode
+    add rsp, 144
+    and eax, 0o170000             ; S_IFMT
+    cmp eax, 0o100000             ; S_IFREG
+    jne .exec_notfound
+    ; Find $EDITOR
+    xor r13, r13
+    xor rcx, rcx
+.ae_find_editor:
+    cmp rcx, [env_count]
+    jge .ae_editor_fallback
+    mov rsi, [env_array + rcx*8]
+    test rsi, rsi
+    jz .ae_fe_next
+    cmp dword [rsi], 'EDIT'
+    jne .ae_fe_next
+    cmp word [rsi+4], 'OR'
+    jne .ae_fe_next
+    cmp byte [rsi+6], '='
+    jne .ae_fe_next
+    lea r13, [rsi+7]
+    cmp byte [r13], 0
+    jne .ae_have_editor
+    xor r13, r13
+    jmp .ae_editor_fallback
+.ae_fe_next:
+    inc rcx
+    jmp .ae_find_editor
+.ae_editor_fallback:
+    lea r13, [.ae_vim_path]
+.ae_have_editor:
+    ; If editor path has no '/', resolve via PATH; on miss fall back to vim
+    mov rsi, r13
+.ae_ed_slash_scan:
+    mov al, [rsi]
+    test al, al
+    jz .ae_ed_search
+    cmp al, '/'
+    je .ae_exec_editor
+    inc rsi
+    jmp .ae_ed_slash_scan
+.ae_ed_search:
+    mov rdi, r13
+    call find_in_path
+    test rax, rax
+    jz .ae_ed_use_vim
+    lea r13, [exec_path]
+    jmp .ae_exec_editor
+.ae_ed_use_vim:
+    lea r13, [.ae_vim_path]
+.ae_exec_editor:
+    sub rsp, 32
+    mov [rsp], r13
+    mov [rsp + 8], r12
+    mov qword [rsp + 16], 0
+    mov rdi, r13
+    mov rsi, rsp
+    lea rdx, [env_array]
+    mov rax, SYS_EXECVE
+    syscall
+    add rsp, 32
+    jmp .exec_notfound
+.ae_drop_stat:
+    add rsp, 144
+    jmp .exec_notfound
+.ae_vim_path: db "/usr/bin/vim", 0
 
 .exec_notfound:
     ; Print error
