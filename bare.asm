@@ -248,7 +248,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.20", 10, 0
+version_str:    db "bare 0.2.21", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -936,7 +936,10 @@ _start:
     add rsp, 8
     test rax, rax
     jnz .no_prompt           ; data waiting = paste in progress, skip prompt
-    call ensure_col_zero
+    ; ensure_col_zero (ESC[6n cursor query) removed: response can arrive
+    ; after our poll timeout and leak into the next read as ^[[N;MR. The
+    ; cost is that commands without a trailing newline let the prompt
+    ; share their last line; almost everything ends with \n anyway.
     call print_prompt
 .no_prompt:
 
