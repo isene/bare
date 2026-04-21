@@ -5002,17 +5002,43 @@ parse_and_exec_simple:
 ; Parse and exec for pipe children (needs to parse argv first)
 parse_and_exec_child:
     push rbx
+    push r12
     mov qword [redir_out], 0
     mov qword [redir_in], 0
     mov qword [redir_herestring], 0
     mov qword [redir_append], 0
+    mov r12, rdi                     ; remember original segment text
     mov rsi, rdi
     call parse_argv
     cmp qword [argc], 0
     je .paec_done
     call glob_expand_argv
+    ; Nick expansion: pipe segments deserve the same alias treatment
+    ; as a bare command. Without this, `apts chrome | less` failed
+    ; with "command not found: apts" even though `apts` exists in
+    ; ~/.barerc. Mirror parse_and_exec_simple: feed argv to
+    ; expand_nicks, and on hit re-parse the rewritten segment.
+    lea rdi, [expanded_argv]
+    cmp qword [expanded_argv], 0
+    jne .paec_nick_use_expanded
+    lea rdi, [argv_ptrs]
+.paec_nick_use_expanded:
+    call expand_nicks
+    test rax, rax
+    jz .paec_no_nick
+    mov qword [redir_out], 0
+    mov qword [redir_in], 0
+    mov qword [redir_herestring], 0
+    mov qword [redir_append], 0
+    mov rsi, r12                     ; expand_nicks rewrote our segment in place
+    call parse_argv
+    cmp qword [argc], 0
+    je .paec_done
+    call glob_expand_argv
+.paec_no_nick:
     call parse_and_exec_child_argv
 .paec_done:
+    pop r12
     pop rbx
     ret
 
