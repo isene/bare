@@ -400,9 +400,13 @@ orig_termios:   resb 60
 raw_termios:    resb 60
 
 ; History
-hist_buf:       resb 65536      ; 64KB history buffer
-hist_lines:     resq 512        ; pointers to history lines
+hist_buf:       resb 524288     ; 512KB history buffer
+hist_lines:     resq 8192       ; pointers to history lines
 hist_count:     resq 1
+hist_persisted: resq 1          ; entries already written to disk; save
+                                ; appends only newer ones so concurrent
+                                ; bare instances don't overwrite each
+                                ; other's history
 hist_pos:       resq 1          ; current position when browsing
 hist_path:      resb 256        ; full path to history file
 
@@ -2874,7 +2878,12 @@ read_line:
     xor r15, r15             ; r15 = current selection index
 
 .tab_cycle_redraw:
-    ; Save cursor, print newline + matches with selection highlighting
+    ; Refresh prompt + previewed line FIRST so the candidate list
+    ; that follows isn't wiped by full_redraw's ESC[J. Then save
+    ; cursor at end of prompt, drop a newline, print candidates
+    ; underneath, and restore cursor back to the prompt line.
+    call .tab_preview_selection
+    call full_redraw
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_save_cur]
@@ -2970,18 +2979,13 @@ read_line:
 .tab_color_link_len equ $ - .tab_color_link_seq
 
 .tab_cycle_printed:
-    ; Restore cursor to prompt line
+    ; Restore cursor to the prompt line. Preview + redraw already
+    ; happened above; the candidate list stays visible below us.
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_restore_cur]
     mov rdx, 3
     syscall
-    ; Show current selection in the command line
-    ; Replace word at r14..r12 with selected match
-    ; First rebuild line with selected match
-    call .tab_preview_selection
-    ; Redraw prompt + previewed line with syntax highlighting
-    call full_redraw
 
 .tab_cycle_key:
     ; Read next key
@@ -7841,7 +7845,7 @@ add_history:
 
 .ah_no_dedup:
     mov rcx, [hist_count]
-    cmp rcx, 510
+    cmp rcx, 8190
     jge .ah_shift            ; history full, shift down
 
     ; Store pointer to a copy in hist_buf
@@ -7864,15 +7868,12 @@ add_history:
     jmp .ah_store
 
 .ah_shift:
-    ; Remove oldest entry (shift pointers)
-    mov rcx, 510
-    lea rdi, [hist_lines]
-    lea rsi, [hist_lines + 8]
-    mov rdx, 510
-    ; Simple: just reset count to allow overwrite
-    mov qword [hist_count], 510
-    mov rcx, 510
-    ; Use beginning of hist_buf
+    ; History array exhausted (>8190 entries this session). Drop the
+    ; in-memory entries and start fresh — disk file keeps everything
+    ; via the append-only save path. The new entry goes at slot 0.
+    mov qword [hist_count], 0
+    mov qword [hist_persisted], 0
+    xor rcx, rcx
     mov rdi, hist_buf
 
 .ah_store:
@@ -7897,11 +7898,11 @@ load_history:
     js .lh_no_file           ; file doesn't exist
     mov r12, rax             ; fd
 
-    ; Read into hist_buf
+    ; Read into hist_buf (capped to slightly under buffer size).
     mov rax, SYS_READ
     mov rdi, r12
     lea rsi, [hist_buf]
-    mov rdx, 65000
+    mov rdx, 524000
     syscall
     mov r13, rax             ; bytes read
 
@@ -7921,7 +7922,7 @@ load_history:
     lea rax, [hist_buf + r13]
     cmp rsi, rax
     jge .lh_done
-    cmp ecx, 510
+    cmp ecx, 8190
     jge .lh_done
 
     mov [hist_lines + rcx*8], rsi
@@ -7946,6 +7947,7 @@ load_history:
     xor ecx, ecx
 .lh_done:
     mov [hist_count], rcx
+    mov [hist_persisted], rcx
     pop r13
     pop r12
     pop rbx
@@ -7955,29 +7957,25 @@ save_history:
     push rbx
     push r12
     push r13
-    ; Open history file for writing
+    ; Append-only: open with O_APPEND (no O_TRUNC) and write only the
+    ; entries added since the last save. Concurrent bare instances
+    ; can both write without clobbering each other's additions.
     mov rax, SYS_OPEN
     lea rdi, [hist_path]
-    mov esi, O_WRONLY | O_CREAT | O_TRUNC
+    mov esi, O_WRONLY | O_CREAT | O_APPEND
     mov edx, 0o644
     syscall
     test rax, rax
     js .sh_done
     mov r12, rax             ; fd
 
-    ; Write last 1000 history entries (cap for rotation)
-    mov r13, [hist_count]
-    sub r13, 1000
-    test r13, r13
-    jns .sh_loop
-    xor r13, r13             ; start from 0 if < 1000 entries
+    mov r13, [hist_persisted]
 .sh_loop:
     cmp r13, [hist_count]
     jge .sh_close
     mov rsi, [hist_lines + r13*8]
     test rsi, rsi
     jz .sh_next
-    ; Write line
     push r13
     mov rdi, rsi
     call strlen
@@ -7986,7 +7984,6 @@ save_history:
     mov rdi, r12
     mov rsi, [hist_lines + r13*8]
     syscall
-    ; Write newline
     mov rax, SYS_WRITE
     mov rdi, r12
     lea rsi, [newline]
@@ -8001,6 +7998,8 @@ save_history:
     mov rax, SYS_CLOSE
     mov rdi, r12
     syscall
+    mov rax, [hist_count]
+    mov [hist_persisted], rax
 .sh_done:
     pop r13
     pop r12
@@ -8371,11 +8370,13 @@ build_exec_cache_path:
 
 ; load_exec_cache: read ~/.bare_exe_cache into exe_cache.
 ; File format: 8-byte count + 8-byte size + raw cache bytes.
-; Returns rax=1 on success, 0 if missing/invalid (caller falls back
-; to lazy init_exe_cache on first tab).
+; Returns rax=1 on success, 0 if missing/invalid OR if the cache
+; is stale (any PATH directory has been modified more recently than
+; the cache file's mtime). Caller then falls back to init_exe_cache.
 load_exec_cache:
     push rbx
     push r12
+    push r13
     mov rax, SYS_OPEN
     lea rdi, [exec_cache_path]
     xor esi, esi
@@ -8384,6 +8385,16 @@ load_exec_cache:
     test rax, rax
     js .lec_fail
     mov r12, rax
+    ; Capture cache mtime via fstat — used downstream for staleness.
+    sub rsp, 144
+    mov rax, SYS_FSTAT
+    mov rdi, r12
+    mov rsi, rsp
+    syscall
+    test rax, rax
+    js .lec_fstat_fail
+    mov r13, [rsp + 88]                  ; st_mtime
+    add rsp, 144
     sub rsp, 16
     mov rax, SYS_READ
     mov rdi, r12
@@ -8409,10 +8420,31 @@ load_exec_cache:
     mov rax, SYS_CLOSE
     mov rdi, r12
     syscall
+    ; Cache loaded. Now check freshness vs PATH dir mtimes.
+    mov rdi, r13
+    call exec_cache_stale
+    test rax, rax
+    jnz .lec_stale
+    pop r13
     pop r12
     pop rbx
     mov eax, 1
     ret
+.lec_stale:
+    ; Discard the loaded data so the caller falls back to a rebuild.
+    mov qword [exe_cache_count], 0
+    mov qword [exe_cache_pos], 0
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+.lec_fstat_fail:
+    add rsp, 144
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+    jmp .lec_fail
 .lec_close_fail:
     add rsp, 16
 .lec_close_fail2:
@@ -8422,6 +8454,84 @@ load_exec_cache:
 .lec_fail:
     mov qword [exe_cache_count], 0
     mov qword [exe_cache_pos], 0
+    pop r13
+    pop r12
+    pop rbx
+    xor eax, eax
+    ret
+
+; rdi = cache file mtime (st_mtime, seconds since epoch).
+; Returns rax = 1 if any directory in $PATH has been modified more
+; recently than the cache (so the cache may have stale entries),
+; else 0. PATH is parsed from env_array; missing or unreadable dirs
+; are skipped (no false positives).
+exec_cache_stale:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r13, rdi                          ; cache mtime
+    lea rdi, [env_array]
+    call find_env_path
+    test rax, rax
+    jz .ecs_fresh                         ; no PATH → can't stale
+    mov r12, rax                          ; PATH cursor
+    sub rsp, 4096
+.ecs_dir_loop:
+    ; Copy the next ':'-separated directory into stack scratch.
+    mov rdi, rsp
+    xor ecx, ecx
+.ecs_copy:
+    mov al, [r12]
+    test al, al
+    jz .ecs_dir_done
+    cmp al, ':'
+    je .ecs_dir_done
+    cmp ecx, 4094
+    jge .ecs_advance
+    mov [rdi + rcx], al
+    inc ecx
+.ecs_advance:
+    inc r12
+    jmp .ecs_copy
+.ecs_dir_done:
+    mov byte [rdi + rcx], 0
+    test ecx, ecx
+    jz .ecs_skip
+    sub rsp, 144
+    mov rax, SYS_STAT
+    mov rdi, rsp
+    add rdi, 144                          ; path lives just above stat buf
+    lea rsi, [rsp]
+    syscall
+    test rax, rax
+    js .ecs_skip_stat
+    mov r14, [rsp + 88]                   ; st_mtime
+    add rsp, 144
+    cmp r14, r13
+    jbe .ecs_skip
+    add rsp, 4096
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, 1
+    ret
+.ecs_skip_stat:
+    add rsp, 144
+.ecs_skip:
+    mov al, [r12]
+    test al, al
+    jz .ecs_path_done
+    cmp al, ':'
+    jne .ecs_dir_loop
+    inc r12
+    jmp .ecs_dir_loop
+.ecs_path_done:
+    add rsp, 4096
+.ecs_fresh:
+    pop r14
+    pop r13
     pop r12
     pop rbx
     xor eax, eax
