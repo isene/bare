@@ -4930,6 +4930,18 @@ parse_and_exec_simple:
     ; Parent: set cooked mode so child gets normal terminal, then block wait
     mov [child_pid], rax
     mov r13, rax             ; save child pid
+    ; Foreground job control: put child in its own process group and
+    ; hand the controlling terminal to that pgrp. Both setpgid calls
+    ; race-free (parent + child both call it; whichever wins, the
+    ; result is the same). Without this, the controlling tty's tpgid
+    ; stays as bare's pgrp, which breaks tools that read /proc/PID/stat
+    ; to find the foreground process (e.g. tile's exec-here action).
+    mov rax, SYS_SETPGID
+    mov rdi, r13             ; child pid
+    mov rsi, r13             ; pgid = child pid
+    syscall                  ; ignore errors (race with child's own setpgid is fine)
+    mov rdi, r13
+    call tty_set_fg_pgrp     ; tcsetpgrp(0, child_pid)
     call enable_cooked_mode  ; ICANON + ECHO + ISIG for child
     sub rsp, 16
     ; Blocking wait with WUNTRACED (detect Ctrl-Z via ISIG)
@@ -4954,6 +4966,9 @@ parse_and_exec_simple:
     and eax, 0xFF
     mov [last_status], rax
     add rsp, 16
+    ; Take the terminal back before restoring raw mode.
+    mov rdi, [my_pid]
+    call tty_set_fg_pgrp
     call post_child_restore
     call enable_raw_mode
     jmp .paes_done
@@ -4961,6 +4976,8 @@ parse_and_exec_simple:
 .paes_stopped:
     ; Child was stopped by Ctrl-Z, add to job table
     add rsp, 16
+    mov rdi, [my_pid]
+    call tty_set_fg_pgrp
     call post_child_restore
     call enable_raw_mode
     mov rdi, r13             ; pid
@@ -4980,6 +4997,12 @@ parse_and_exec_simple:
 .stopped_msg_len equ $ - .stopped_msg
 
 .child_exec:
+    ; Race-free pair with parent's setpgid: whichever side wins, the
+    ; child ends up in its own pgrp == its own pid.
+    mov rax, SYS_SETPGID
+    xor edi, edi             ; pid 0 = self
+    xor esi, esi             ; pgid 0 = use own pid
+    syscall
     ; Restore default signals in child (SIG_DFL for SIGTSTP etc.)
     call restore_child_signals
     call parse_and_exec_child_argv
