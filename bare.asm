@@ -383,6 +383,12 @@ cursor_pos:     resq 1
 
 ; Argument parsing
 argv_ptrs:      resq 128        ; max 128 args
+
+; Leading-env prefix support: `VAR=val [VAR2=val2 ...] cmd args`.
+; Detected after parse_argv; applied in the child between fork and
+; execve so the parent's env stays clean (matches bash semantics).
+env_prefix_ptrs: resq 16
+env_prefix_count: resq 1
 argc:           resq 1
 
 ; Working directory
@@ -4807,6 +4813,114 @@ execute_line:
 ; Parse args and execute a simple command (no pipes)
 ; rdi = command string
 ; ══════════════════════════════════════════════════════════════════════
+; Detect leading "IDENT=value" tokens in argv_ptrs and stash them in
+; env_prefix_ptrs[]. Shifts argv_ptrs left so argv[0] becomes the
+; first non-assignment token. argc is decremented accordingly.
+;
+; The assignments are applied in the child (post-fork) via
+; apply_env_prefix; the parent's env_array stays untouched so the
+; semantics match bash (the assignments only affect this one command).
+extract_env_prefix:
+    push rbx
+    push r12
+    mov qword [env_prefix_count], 0
+    xor r12, r12                          ; index into argv
+.eep_loop:
+    cmp r12, [argc]
+    jge .eep_done
+    mov rbx, [argv_ptrs + r12*8]
+    test rbx, rbx
+    jz .eep_done
+    ; Identifier: first char must be A-Z, a-z, or _.
+    movzx eax, byte [rbx]
+    cmp al, '_'
+    je .eep_check_rest
+    cmp al, 'A'
+    jb .eep_done
+    cmp al, 'Z'
+    jbe .eep_check_rest
+    cmp al, 'a'
+    jb .eep_done
+    cmp al, 'z'
+    ja .eep_done
+.eep_check_rest:
+    mov rdi, rbx
+    inc rdi
+.eep_id_chars:
+    movzx eax, byte [rdi]
+    cmp al, '='
+    je .eep_assignment
+    cmp al, 0
+    je .eep_done                          ; no '=' → not an assignment
+    cmp al, '_'
+    je .eep_id_ok
+    cmp al, '0'
+    jb .eep_done
+    cmp al, '9'
+    jbe .eep_id_ok
+    cmp al, 'A'
+    jb .eep_done
+    cmp al, 'Z'
+    jbe .eep_id_ok
+    cmp al, 'a'
+    jb .eep_done
+    cmp al, 'z'
+    ja .eep_done
+.eep_id_ok:
+    inc rdi
+    jmp .eep_id_chars
+.eep_assignment:
+    ; Got VAR=...; record the pointer.
+    mov rax, [env_prefix_count]
+    cmp rax, 16
+    jge .eep_done                         ; cap reached
+    mov [env_prefix_ptrs + rax*8], rbx
+    inc qword [env_prefix_count]
+    inc r12
+    jmp .eep_loop
+.eep_done:
+    test r12, r12
+    jz .eep_ret                           ; nothing to shift
+    ; Shift argv_ptrs left by r12 entries; argc -= r12.
+    mov rcx, [argc]
+    sub rcx, r12
+    mov [argc], rcx
+    xor edx, edx
+.eep_shift:
+    cmp rdx, rcx
+    jge .eep_term
+    mov rax, rdx
+    add rax, r12
+    mov rsi, [argv_ptrs + rax*8]
+    mov [argv_ptrs + rdx*8], rsi
+    inc rdx
+    jmp .eep_shift
+.eep_term:
+    mov qword [argv_ptrs + rdx*8], 0
+.eep_ret:
+    pop r12
+    pop rbx
+    ret
+
+; Apply the recorded env_prefix assignments by calling env_set_entry
+; on each. Called from the CHILD just before execve so the parent's
+; env_array is untouched.
+apply_env_prefix:
+    push rbx
+    push r12
+    xor r12, r12
+.aep_loop:
+    cmp r12, [env_prefix_count]
+    jge .aep_done
+    mov rdi, [env_prefix_ptrs + r12*8]
+    call env_set_entry
+    inc r12
+    jmp .aep_loop
+.aep_done:
+    pop r12
+    pop rbx
+    ret
+
 parse_and_exec_simple:
     push rbx
     push r12
@@ -4821,6 +4935,11 @@ parse_and_exec_simple:
     ; Parse into argv
     mov rsi, rdi
     call parse_argv
+    cmp qword [argc], 0
+    je .paes_done
+
+    ; Strip leading "VAR=val" tokens; saved in env_prefix_ptrs[].
+    call extract_env_prefix
     cmp qword [argc], 0
     je .paes_done
 
@@ -5182,6 +5301,12 @@ parse_and_exec_child_argv:
     lea rdi, [exec_path]
 
 .do_exec:
+    ; Apply any "VAR=val ..." prefix collected by extract_env_prefix
+    ; in the child only — parent's env_array stays untouched. Save
+    ; rdi (path) across the call.
+    push rdi
+    call apply_env_prefix
+    pop rdi
     ; execve(path, argv, envp)
     mov rax, SYS_EXECVE
     ; rdi = path (already set)
