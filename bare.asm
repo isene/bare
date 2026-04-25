@@ -13,6 +13,8 @@ DEFAULT REL
 %define SYS_CLOSE     3
 %define SYS_STAT      4
 %define SYS_FSTAT     5
+%define SYS_ACCESS    21
+%define X_OK          1
 %define SYS_LSEEK     8
 %define SYS_MMAP      9
 %define SYS_MPROTECT  10
@@ -23,6 +25,7 @@ DEFAULT REL
 %define POLLIN        1
 %define SYS_PIPE      22
 %define SYS_DUP2      33
+%define SYS_RENAME    82
 %define SYS_FORK      57
 %define SYS_EXECVE    59
 %define SYS_EXIT      60
@@ -573,6 +576,8 @@ cmd_freq_storage: resb 8192
 
 ; Config file path
 config_path:    resb 256
+config_path_tmp: resb 256       ; <config_path>.tmp — atomic-write target
+config_path_bak: resb 256       ; <config_path>.bak — previous good copy
 
 ; PATH exe cache file path
 exec_cache_path: resb 256
@@ -7580,8 +7585,12 @@ find_in_path:
     push r13
     mov r12, rdi             ; command name
 
-    ; Find PATH in environment
-    mov rdi, [envp]
+    ; Find PATH in environment. Use env_array (the mutable copy that
+    ; reflects `export PATH=...` and any other in-shell env changes)
+    ; rather than envp (the immutable kernel-passed env). Children
+    ; receive env_array via execve, so this keeps lookup consistent
+    ; with what children see.
+    lea rdi, [env_array]
     call find_env_path
     test rax, rax
     jnz .fip_search
@@ -7628,10 +7637,14 @@ find_in_path:
 .fip_copy_done:
     mov byte [rdi], 0
 
-    ; Check if file exists (stat)
-    mov rax, SYS_STAT
+    ; Check if path is executable. access(X_OK) is the right test:
+    ; stat() would also accept a non-executable file (e.g. a stale
+    ; wrapper script with the execute bit cleared) and bare would then
+    ; appear to "find" the command, fail at execve, and report "command
+    ; not found" without trying the next PATH entry.
+    mov rax, SYS_ACCESS
     lea rdi, [exec_path]
-    lea rsi, [tmp_buf]       ; stat buffer
+    mov rsi, X_OK
     syscall
     test rax, rax
     jns .fip_found
@@ -8288,8 +8301,9 @@ init_exe_cache:
     mov qword [exe_cache_pos], 0
     mov qword [exe_cache_count], 0
 
-    ; Get PATH
-    mov rdi, [envp]
+    ; Get PATH from env_array, not envp — same reasoning as in
+    ; find_in_path: env_array reflects user-modified PATH, envp doesn't.
+    lea rdi, [env_array]
     call find_env_path
     test rax, rax
     jnz .iec_have_path
@@ -13661,9 +13675,42 @@ save_config:
 .sc_no_stat:
     add rsp, 144
 
-    ; Open config file for writing
+    ; Atomic save: build config_path_tmp = config_path + ".tmp" and
+    ; config_path_bak = config_path + ".bak". Write to .tmp; on
+    ; successful close, rename config_path → .bak (preserve last
+    ; known-good copy) then .tmp → config_path. If we crash mid-write
+    ; the original config_path is untouched; if a future load reads
+    ; garbage out of .barerc, the previous version survives in .bak.
+    lea rsi, [config_path]
+    lea rdi, [config_path_tmp]
+.sc_cp_tmp:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .sc_cp_tmp_done
+    inc rsi
+    inc rdi
+    jmp .sc_cp_tmp
+.sc_cp_tmp_done:
+    mov dword [rdi], '.tmp'             ; overwrites NUL with .tmp + ...
+    mov byte [rdi + 4], 0
+    lea rsi, [config_path]
+    lea rdi, [config_path_bak]
+.sc_cp_bak:
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .sc_cp_bak_done
+    inc rsi
+    inc rdi
+    jmp .sc_cp_bak
+.sc_cp_bak_done:
+    mov dword [rdi], '.bak'
+    mov byte [rdi + 4], 0
+
+    ; Open the .tmp file for writing.
     mov rax, SYS_OPEN
-    lea rdi, [config_path]
+    lea rdi, [config_path_tmp]
     mov rsi, O_WRONLY | O_CREAT | O_TRUNC
     mov rdx, 0o644
     syscall
@@ -14025,6 +14072,21 @@ save_config:
 .sc_close:
     mov rax, SYS_CLOSE
     mov rdi, r12
+    syscall
+    ; Atomic publish: rename(config_path, config_path_bak), then
+    ; rename(config_path_tmp, config_path). The first may fail with
+    ; ENOENT on a brand-new install (no prior config_path exists);
+    ; that's fine — we just don't write a .bak this round. The second
+    ; rename MUST succeed for the new config to take effect; on
+    ; failure, unlink the .tmp so we don't leave a half-written file.
+    mov rax, SYS_RENAME
+    lea rdi, [config_path]
+    lea rsi, [config_path_bak]
+    syscall
+    ; (ignore result — first save has no original to back up)
+    mov rax, SYS_RENAME
+    lea rdi, [config_path_tmp]
+    lea rsi, [config_path]
     syscall
     ; Record save time
     sub rsp, 16
