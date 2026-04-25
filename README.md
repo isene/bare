@@ -2,7 +2,7 @@
 
 <img src="img/bare.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.2.8-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-9%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.2.21-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-9%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, 126KB. **9 microsecond startup.**
 
@@ -11,6 +11,13 @@ Pure syscalls, zero overhead. No interpreter, no runtime, no garbage collector. 
 This is my login shell. It is not released for your use. It is released for inspiration. This is how you can benefit: 1) Clone this repo, 2) Fire up Claude Code, 3) Prompt it to make it into what you want or need.
 
 <br clear="left"/>
+
+![bare in glass under tile](img/screenshot.png)
+
+bare behind every `>` in the [CHasm](https://github.com/isene/chasm)
+desktop. Every binary on screen is x86_64 assembly — tile owns the
+layout, strip drives the status row, glass renders the terminals,
+show paints the syntax-highlighted source, bare is the shell.
 
 ## Install
 
@@ -32,8 +39,8 @@ yay -S bare-shell
 ### Debian/Ubuntu
 
 ```bash
-curl -LO https://github.com/isene/bare/releases/latest/download/bare_0.2.8-1_amd64.deb
-sudo dpkg -i bare_0.2.8-1_amd64.deb
+curl -LO https://github.com/isene/bare/releases/latest/download/bare_0.2.21-1_amd64.deb
+sudo dpkg -i bare_0.2.21-1_amd64.deb
 ```
 
 ### Set as default shell
@@ -90,8 +97,10 @@ $ time ./bare -c exit
 - Command chaining: `;`, `&&`, `||`
 - Command substitution: `$(cmd)` with nesting
 - Background execution: `&`
+- Per-command env prefix: `VAR=val [VAR2=val2 ...] cmd args` (POSIX-style temporary env)
 - `time` builtin: `time sleep 1` shows elapsed with ms precision
 - Login shell (`-l`), command mode (`-c "cmd"`)
+- Foreground job control with proper `setpgid` + `tcsetpgrp` so signals reach the job
 
 ### Expansion
 - Brace expansion: `file.{txt,md,rs}` -> `file.txt file.md file.rs`
@@ -106,8 +115,10 @@ $ time ./bare -c exit
 
 ### Line Editing and Completion
 - Interactive tab cycling with LS_COLORS (dirs blue, symlinks gray)
+- Tab completion list rendered visibly below the prompt (no overwrite)
 - Tab completion for `:commands` (`:th<TAB>` -> `:theme`)
 - `$VAR` tab completion, subcommand completion (git, apt, cargo)
+- Bare path to a non-executable file (e.g. `notes.md`) auto-opens in `$EDITOR`
 - Ctrl-R reverse incremental history search
 - Inline history suggestions (grayed preview, right-arrow to accept)
 - Prefix history search: type text, press Up/Down to filter
