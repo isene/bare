@@ -677,10 +677,11 @@ _start:
     mov rax, [rsp]
     mov [cmd_start_time], rax     ; reuse cmd_start_time for startup
 
-    ; Open /tmp/bare.log so fork/exec/save-session failures land in a
-    ; tail-able file even when bare's stderr is captured by glass and
-    ; the user has scrolled away. Cold path: only error sites mirror.
-    call log_open_bare
+    ; /tmp/bare.log is only useful when bare is running under a
+    ; terminal whose stderr might be captured/scrolled away. For
+    ; `echo cmd | bare` (non-interactive), stderr goes straight to the
+    ; caller's terminal anyway, so the extra open is pure cost.
+    ; Defer: log_open_bare moved into the interactive-init block below.
     mov rax, [rsp + 8]
     mov [cmd_start_time + 8], rax
     add rsp, 16
@@ -848,6 +849,11 @@ _start:
     ; on non-interactive `echo cmd | bare`: prompts aren't drawn, line
     ; editing isn't used, history isn't recalled, tab completion isn't
     ; triggered. Skipping them brings cold-start cost down dramatically.
+
+    ; Open /tmp/bare.log for diagnostic mirroring (interactive sessions
+    ; under glass need this since glass may have scrolled stderr out of
+    ; view; non-interactive callers get stderr direct).
+    call log_open_bare
 
     ; Username / hostname / timezone — only needed for the prompt.
     call init_username
@@ -1126,14 +1132,16 @@ _start:
     jmp .main_loop
 
 .eof:
-    ; Save config and history
+    ; Save config + history only when interactive — non-interactive runs
+    ; never modified either, so the rename dance is pure waste.
+    cmp qword [is_tty], 0
+    je .eof_non_interactive
     call save_config
     call save_history
-    ; Restore terminal
     call restore_termios
-    ; Print newline and exit
     call write_nl
-    xor edi, edi
+.eof_non_interactive:
+    mov rdi, [last_status]
     mov rax, SYS_EXIT
     syscall
 
