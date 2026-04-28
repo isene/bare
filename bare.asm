@@ -654,6 +654,10 @@ sigwinch_flag:  resq 1              ; set by SIGWINCH handler
 tz_offset:      resq 1              ; timezone offset in seconds from UTC
 shl_output_len: resq 1              ; syntax_highlight_line output length
 
+; Logging fd. 0 = unavailable (kernel never returns 0 from open()
+; while stdin is still attached). log_write_buf no-ops in that case.
+log_fd_bare:    resq 1
+
 ; Session buffer
 session_buf:    resb 16384
 
@@ -672,6 +676,11 @@ _start:
     syscall
     mov rax, [rsp]
     mov [cmd_start_time], rax     ; reuse cmd_start_time for startup
+
+    ; Open /tmp/bare.log so fork/exec/save-session failures land in a
+    ; tail-able file even when bare's stderr is captured by glass and
+    ; the user has scrolled away. Cold path: only error sites mirror.
+    call log_open_bare
     mov rax, [rsp + 8]
     mov [cmd_start_time + 8], rax
     add rsp, 16
@@ -4468,6 +4477,7 @@ execute_line_bg:
     lea rsi, [err_fork]
     mov rdx, err_fork_len
     syscall
+    call log_write_buf
 
 .bg_done:
     mov rsp, rbp
@@ -4802,6 +4812,7 @@ execute_line:
     lea rsi, [err_pipe]
     mov rdx, err_pipe_len
     syscall
+    call log_write_buf
 
 .pipe_done:
 .single_cmd:
@@ -5145,6 +5156,7 @@ parse_and_exec_simple:
     lea rsi, [err_fork]
     mov rdx, err_fork_len
     syscall
+    call log_write_buf
     mov qword [last_status], 1
 
 .paes_done:
@@ -5414,6 +5426,7 @@ parse_and_exec_child_argv:
     lea rsi, [err_exec]
     mov rdx, err_exec_len
     syscall
+    call log_write_buf
     ; Print command name
     mov rsi, [rbx]
     mov rdi, rsi
@@ -5423,11 +5436,13 @@ parse_and_exec_child_argv:
     mov rdi, 2
     mov rsi, [rbx]
     syscall
+    call log_write_buf
     mov rax, SYS_WRITE
     mov rdi, 2
     lea rsi, [newline]
     mov rdx, 1
     syscall
+    call log_write_buf
     ; Suggest similar commands (TTY only)
     cmp qword [is_tty], 0
     je .exec_nf_skip
@@ -5849,6 +5864,7 @@ check_builtin:
     lea rsi, [err_cd]
     mov rdx, err_cd_len
     syscall
+    call log_write_buf
     mov qword [last_status], 1
     jmp .cd_done
 .cd_ok:
@@ -5933,6 +5949,7 @@ check_builtin:
     lea rsi, [err_export]
     mov rdx, err_export_len
     syscall
+    call log_write_buf
     mov qword [last_status], 1
 .export_done:
     mov rax, 1
@@ -6050,6 +6067,7 @@ check_builtin:
     lea rsi, [.cc_unknown]
     mov rdx, .cc_unknown_len
     syscall
+    call log_write_buf
     mov rdi, [r12]
     call strlen
     mov rdx, rax
@@ -6057,6 +6075,7 @@ check_builtin:
     mov rdi, 2
     mov rsi, [r12]
     syscall
+    call log_write_buf
     call write_nl
     mov qword [last_status], 1
 
@@ -8156,6 +8175,40 @@ update_cwd:
     syscall
     ret
 
+; ──────────────────────────────────────────────────────────────────────
+; Logging — mirrors the existing stderr writes into /tmp/bare.log so
+; runtime failures survive even when stderr is consumed by the parent
+; terminal. Cold path; no impact on the hot prompt loop.
+; ──────────────────────────────────────────────────────────────────────
+log_open_bare:
+    mov rax, SYS_OPEN
+    lea rdi, [log_path_bare]
+    mov rsi, 0x441                       ; O_WRONLY | O_CREAT | O_APPEND
+    mov rdx, 0o644
+    syscall
+    test rax, rax
+    js .lo_done
+    mov [log_fd_bare], rax
+.lo_done:
+    ret
+
+; rsi=buf, rdx=len. Preserves rax/rdi/rsi/rdx so callers can chain
+; this immediately after a write(2) to fd 2 without reloading args.
+log_write_buf:
+    cmp qword [log_fd_bare], 0
+    jle .lwb_done
+    push rax
+    push rdi
+    mov rdi, [log_fd_bare]
+    mov rax, SYS_WRITE
+    syscall
+    pop rdi
+    pop rax
+.lwb_done:
+    ret
+
+log_path_bare: db "/tmp/bare.log", 0
+
 ; strlen: rdi = string, returns rax = length
 strlen:
     push rdi
@@ -8203,6 +8256,7 @@ write_stderr:
     mov rax, SYS_WRITE
     mov rdi, 2
     syscall
+    call log_write_buf
     ret
 
 ; write_nl: writes newline to stdout. No arguments.
@@ -10560,6 +10614,7 @@ handle_nick:
     lea rsi, [err_nick]
     mov rdx, err_nick_len
     syscall
+    call log_write_buf
 .hn_done:
     mov qword [last_status], 0
     pop r12
@@ -10815,6 +10870,7 @@ handle_abbrev:
     lea rsi, [.hab_usage]
     mov rdx, .hab_usage_len
     syscall
+    call log_write_buf
 .hab_done:
     mov qword [last_status], 0
     pop r12
@@ -11490,6 +11546,7 @@ handle_pushd:
     lea rsi, [err_cd]
     mov rdx, err_cd_len
     syscall
+    call log_write_buf
     mov qword [last_status], 1
     jmp .hpd_done
 .hpd_full:
@@ -11534,6 +11591,7 @@ handle_popd:
     lea rsi, [.popd_empty_msg]
     mov rdx, .popd_empty_len
     syscall
+    call log_write_buf
     mov qword [last_status], 1
     ret
 .popd_empty_msg: db "bare: popd: directory stack empty", 10
@@ -11544,6 +11602,7 @@ handle_popd:
     lea rsi, [err_cd]
     mov rdx, err_cd_len
     syscall
+    call log_write_buf
     mov qword [last_status], 1
     ret
 
@@ -13037,6 +13096,7 @@ handle_fg:
     lea rsi, [.hfg_no_msg]
     mov rdx, .hfg_no_len
     syscall
+    call log_write_buf
     mov qword [last_status], 1
     pop r12
     pop rbx
@@ -13084,6 +13144,7 @@ handle_bg:
     lea rsi, [.hbg_no_msg]
     mov rdx, .hbg_no_len
     syscall
+    call log_write_buf
     mov qword [last_status], 1
     pop r12
     pop rbx
@@ -13170,6 +13231,7 @@ handle_theme:
     lea rsi, [.ht_err]
     mov rdx, .ht_err_len
     syscall
+    call log_write_buf
     mov qword [last_status], 1
     jmp .ht_done
 
@@ -13309,6 +13371,7 @@ handle_env:
     lea rsi, [.henv_nf_msg]
     mov rdx, .henv_nf_len
     syscall
+    call log_write_buf
     mov qword [last_status], 1
     jmp .henv_ret
 
@@ -16209,6 +16272,7 @@ suggest_correction:
     lea rsi, [.sugc_header]
     mov rdx, .sugc_header_len
     syscall
+    call log_write_buf
     pop rdi
 .sugc_not_first:
     push rdi
@@ -16219,11 +16283,13 @@ suggest_correction:
     mov rdi, 2
     mov rsi, [rsp]
     syscall
+    call log_write_buf
     mov rax, SYS_WRITE
     mov rdi, 2
     lea rsi, [.sugc_sep]
     mov rdx, 2
     syscall
+    call log_write_buf
     pop rdi
     inc r15
 .sugc_skip:
@@ -16247,6 +16313,7 @@ suggest_correction:
     lea rsi, [newline]
     mov rdx, 1
     syscall
+    call log_write_buf
 .sugc_done:
     pop r15
     pop r14
@@ -16396,6 +16463,7 @@ handle_save_session:
     lea rsi, [.hss_usage_msg]
     mov rdx, .hss_usage_len
     syscall
+    call log_write_buf
     jmp .hss_done
 .hss_err:
     mov rax, SYS_WRITE
@@ -16403,6 +16471,7 @@ handle_save_session:
     lea rsi, [.hss_err_msg]
     mov rdx, .hss_err_len
     syscall
+    call log_write_buf
 .hss_done:
     mov qword [last_status], 0
     pop r12
@@ -16555,6 +16624,7 @@ handle_load_session:
     lea rsi, [.hls_usage_msg]
     mov rdx, .hls_usage_len
     syscall
+    call log_write_buf
     jmp .hls_done
 .hls_err:
     mov rax, SYS_WRITE
@@ -16562,6 +16632,7 @@ handle_load_session:
     lea rsi, [.hls_err_msg]
     mov rdx, .hls_err_len
     syscall
+    call log_write_buf
 .hls_done:
     mov qword [last_status], 0
     pop r12
