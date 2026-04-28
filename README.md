@@ -1,115 +1,185 @@
-# CHasm — CHange to ASM
+# bare - Pure Assembly Shell
 
-<img src="img/chasm.svg" align="left" width="170" height="170">
+<img src="img/bare.svg" align="left" width="150" height="150">
 
-A small suite of Linux tools written entirely in **x86_64 assembly**.
-No libc. No toolkits. No dynamic linking. No runtime. Just NASM source,
-direct syscalls, and the X11 wire protocol.
+![Version](https://img.shields.io/badge/version-0.2.26-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-9%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
-Each tool is a single static ELF binary. None of them depend on each
-other or on anything else outside the kernel and the X server.
+Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, 126KB. **9 microsecond startup.**
 
-The reason for releasing these tools into the Public Domain is not that you should use them. They are released for inspiration. Your use cases and preferences are different from mine. So instead of installing these and adopt your ways of working to these tools, you should rather: clone the repos, fire up Claude Code, prompt the changes you want and make the tools fit you.
+Pure syscalls, zero overhead. No interpreter, no runtime, no garbage collector. Just your keystrokes and the kernel.
+
+This is my login shell. It is not released for your use. It is released for inspiration. This is how you can benefit: 1) Clone this repo, 2) Fire up Claude Code, 3) Prompt it to make it into what you want or need.
 
 <br clear="left"/>
 
-![CHasm desktop](img/screenshot.png)
+![bare in glass under tile](img/screenshot.png)
 
-Every binary on this screen is x86_64 assembly: **tile** holds the
-layout, **strip** + the **asmites** (the per-segment programs in
-[chasm-bits](https://github.com/isene/chasm-bits)) drive the status
-row, **glass** renders each pane (pseudo-transparency picks up the
-wallpaper), **bare** is the shell behind every prompt, and **show**
-is rendering syntax-highlighted source in both the left and
-bottom-right panes. No libc, no toolkit — the whole desktop talks
-straight to the kernel and the X server.
+bare behind every `>` in the [CHasm](https://github.com/isene/chasm)
+desktop. Every binary on screen is x86_64 assembly — tile owns the
+layout, strip drives the status row, glass renders the terminals,
+show paints the syntax-highlighted source, bare is the shell.
 
-## The tools
+## Install
 
-| Tool | Purpose | Lines | Binary |
-|------|---------|-------|--------|
-| **[bare](https://github.com/isene/bare)**   | Interactive shell with line editing, history, completion, nicks, multi-pipes, redirects, here-strings, abbreviations, undo, smart hotkeys | ~16k | ~150KB |
-| **[show](https://github.com/isene/show)**   | Pager / file viewer with syntax highlighting, ESC sanitisation, cat/pane/pipe modes | ~3.5k | ~40KB |
-| **[glass](https://github.com/isene/glass)** | Terminal emulator: X11 wire protocol, kitty graphics, color emoji via XRender, pseudo-transparency, configurable fonts/keys | ~12k | ~110KB |
-| **[tile](https://github.com/isene/tile)**   | Tiling window manager: 10 workspaces, per-workspace tabs, row-of-squares bar, smart cycling, stash. Bundles **strip** — the X11 status bar that hosts the asmites | ~7k  | ~70KB |
-| **[chasm-bits](https://github.com/isene/chasm-bits)** | "Asmites" fed into `strip`: clock, cpu, mem, disk, battery, brightness, network, mailbox, moonphase, wintitle, … each one a tiny static binary | ~2k  | ~5KB each |
-| **[glyph](https://github.com/isene/glyph)** | TrueType font rasterizer: TTF/OpenType parser, quadratic Bezier flatten, scanline NZW with 4x4 supersample AA, composite glyphs, UTF-8, variable fonts (fvar+gvar+IUP) | ~4.2k | ~37KB |
-
-Stack them all together and you get a complete X session in **under
-500 KB** of executable code, with zero shared libraries to update,
-patch, or break.
-
-## Why?
-
-Modern software stacks are deep. A terminal emulator routinely loads
-30+ shared libraries before drawing a single character. A shell pulls
-in Python, GLib, OpenSSL transitively. Window managers depend on a
-toolkit that depends on a compositor that depends on... CHasm strips
-all of that away to find out what you actually *need*.
-
-The answer turns out to be: surprisingly little. The Linux kernel gives
-you syscalls. X11 is just a Unix socket and a documented wire protocol.
-Everything else is a choice. CHasm is the choice to write everything
-yourself, from scratch, in the smallest reasonable language.
-
-## Shared aesthetic
-
-Every CHasm tool follows the same conventions:
-
-- **Pure x86_64 NASM**, no libc, no `int 0x80` (only `syscall`)
-- **Single static ELF**, no dynamic linking, no `.so` dependencies
-- **Build pattern**: `nasm -f elf64 file.asm -o file.o && ld file.o -o file`
-- **All BSS**, no malloc — every buffer is statically allocated
-- **Zero-waste rule**: features that aren't used pay no cost. Optional
-  code paths are gated to be cold at rest.
-- **Plain config files**: `~/.barerc`, `~/.glassrc`, `~/.tilerc` — line-
-  based key=value, no JSON/TOML/YAML parsers needed
-- **Unlicense** — public domain
-
-## Build them all
+### From source (requires nasm and ld)
 
 ```bash
-for t in bare show glass tile chasm-bits glyph; do
-  git clone https://github.com/isene/$t.git
-  (cd $t && make)
-done
+git clone https://github.com/isene/bare.git
+cd bare
+make
+sudo make install
 ```
 
-Each `make` runs the same two-step build (nasm → ld). Total wall time
-on a modern laptop: under 3 seconds for the entire suite.
+### Arch Linux (AUR)
 
-## Configuration tools
+```bash
+yay -S bare-shell
+```
 
-The CHasm tools are paired with optional Rust TUI configurators
-([crust](https://github.com/isene/crust)-based) that make their config
-files easier to edit interactively:
+### Debian/Ubuntu
 
-| Configurator | Edits | Status |
-|--------------|-------|--------|
-| [bareconf](https://github.com/isene/bareconf)   | `~/.barerc`  | shipped |
-| [glassconf](https://github.com/isene/glassconf) | `~/.glassrc` | shipped |
-| [tileconf](https://github.com/isene/tileconf)   | `~/.tilerc`  | shipped |
-| [stripconf](https://github.com/isene/stripconf) | `~/.striprc` | shipped |
+```bash
+curl -LO https://github.com/isene/bare/releases/latest/download/bare_0.2.21-1_amd64.deb
+sudo dpkg -i bare_0.2.21-1_amd64.deb
+```
 
-All four use the same `~/.<tool>rc.tmp → .bak → publish` atomic-save
-dance, so a kill mid-write can never blank a config; `mv ~/.<tool>rc.bak
-~/.<tool>rc` always restores the previous good state.
+### Set as default shell
 
-These are the *only* CHasm-adjacent tools written in something other
-than asm; they exist because writing a TUI configurator in pure asm
-would defeat the whole point.
+```bash
+# Add to allowed shells
+sudo sh -c 'echo /usr/local/bin/bare >> /etc/shells'
 
-## Status
+# Set as default terminal shell (wezterm)
+# In ~/.config/wezterm/wezterm.lua:
+config.default_prog = { '/usr/local/bin/bare', '-l' }
+```
 
-All six tools are usable today. tile + strip + the chasm-bits asmites
-form the daily-driver desktop. glyph is the newest — a pure-asm TTF
-rasterizer that already renders OpenType variable fonts (interpolating
-between weight masters via gvar deltas + IUP), with the eventual goal
-of replacing glass's X core bitmap fonts so the whole desktop renders
-TTF without dynamic linking. The next milestone is glyph's integration
-into glass; after that, tile's multi-monitor phase.
+### Setup
+
+```bash
+# Install AI plugins (optional, needs Anthropic API key)
+make install-plugins
+
+# Create login profile
+cat > ~/.bare_profile << 'EOF'
+export PATH=/usr/local/bin:/usr/bin:/bin:$HOME/bin:$HOME/.local/bin
+export EDITOR=vim
+export PAGER=less
+EOF
+```
+
+## Benchmark
+
+```
+$ ./bare --bench
+bare startup: 9 microseconds
+
+$ time ./bare -c exit
+./bare -c exit  0.00s user 0.00s system 94% cpu 0.003 total
+```
+
+## Features
+
+### Prompt and Navigation
+- Dynamic prompt: `user@host: ~/cwd/ (git-branch) >` with configurable colors
+- Git dirty indicator: green dot (clean) / red dot (uncommitted changes)
+- Git branch display (toggleable via `show_git_branch`)
+- Root user detection: separate colors for sudo sessions
+- Bookmarks with tags (`:bm name [path] [#tags]`), tag search (`:bm ?tag`)
+- Auto-cd from bookmark names and bare directory names
+- Directory history (`:dirs`), `cd N` to jump, `cd -` for previous
+- `pushd`/`popd` directory stack
+- Pointer/RTFM file manager auto-cd on exit
+
+### Command Execution
+- Multi-pipe (up to 16 segments): `cmd1 | cmd2 | cmd3`
+- Redirections: `>`, `>>`, `<`
+- Command chaining: `;`, `&&`, `||`
+- Command substitution: `$(cmd)` with nesting
+- Background execution: `&`
+- Per-command env prefix: `VAR=val [VAR2=val2 ...] cmd args` (POSIX-style temporary env)
+- `time` builtin: `time sleep 1` shows elapsed with ms precision
+- Login shell (`-l`), command mode (`-c "cmd"`)
+- Foreground job control with proper `setpgid` + `tcsetpgrp` so signals reach the job
+
+### Expansion
+- Brace expansion: `file.{txt,md,rs}` -> `file.txt file.md file.rs`
+- Tilde, variable (`$VAR`, `${VAR}`, `$?`, `$$`), glob (`*`, `?`, `[a-z]`, `[!x]`)
+- History expansion: `!!`, `!N`, `!-N`
+- Global nick expansion anywhere in line
+
+### Aliases and Abbreviations
+- `:nick ls = ls --color -F` (expand at execution, self-referencing works)
+- `:gnick G = | grep` (expand anywhere in line)
+- `:abbrev gst = git status` (expand live on space)
+
+### Line Editing and Completion
+- Interactive tab cycling with LS_COLORS (dirs blue, symlinks gray)
+- Tab completion list rendered visibly below the prompt (no overwrite)
+- Tab completion for `:commands` (`:th<TAB>` -> `:theme`)
+- `$VAR` tab completion, subcommand completion (git, apt, cargo)
+- Bare path to a non-executable file (e.g. `notes.md`) auto-opens in `$EDITOR`
+- Ctrl-R reverse incremental history search
+- Inline history suggestions (grayed preview, right-arrow to accept)
+- Prefix history search: type text, press Up/Down to filter
+- Alt-F / Alt-B: word movement forward/backward
+- Ctrl-G edit in `$EDITOR`, Ctrl-Y copy to clipboard
+- Syntax highlighting: valid commands (green), nicks (cyan), colon commands, switches
+- Multi-line editing: continuation on `\`, `|`, `&&`, `||`, unclosed quotes
+- Auto-pairing brackets and quotes (configurable)
+
+### Job Control
+- Ctrl-Z suspend, `:jobs`, `:fg [N]`, `:bg [N]`
+
+### Themes and Colors
+- 6 themes: default, solarized, dracula, gruvbox, nord, monokai
+- 18 individual color settings including root-specific colors
+- Companion TUI configurator: [bareconf](https://github.com/isene/bareconf)
+
+### Configuration
+- `~/.barerc`: auto-saved on exit, line-based key=value format (multi-terminal safe)
+- `~/.bare_profile`: login profile (simple export lines)
+- `~/.bare_history`: capped at 1000 entries, smart deduplication
+- Runtime changes: `:config key value`
+- Toggles: show_tips, auto_correct, auto_pair, rprompt, show_git_branch, completion_fuzzy
+
+### Plugins
+
+Plugins are executables in `~/.bare/plugins/`. Any unknown colon command runs the matching plugin.
+
+```bash
+make install-plugins    # installs :ask and :suggest (AI via Anthropic API)
+```
+
+- `:ask <question>` - ask AI a question
+- `:suggest <task>` - get a shell command suggestion
+
+See [plugins/README.md](plugins/README.md) for setup and writing your own.
+
+### Other Builtins
+- `cd`, `pwd`, `exit`, `export`, `unset`, `history`, `pushd`, `popd`, `time`
+- `:calc`, `:stats`, `:validate`, `:save_session`, `:load_session`
+- `:save`, `:backup [name]`, `:restore [name]` (config/history snapshots)
+- `:env`, `:rehash`, `:reload`, `:rmhistory`, `:info`, `:version`, `:help`
+- Auto-correct suggestions on command not found
+- Startup tips (configurable)
+
+## Part of CHasm (CHange to ASM)
+
+The same shell, three languages:
+
+| Shell | Language | Startup | Suite |
+|-------|----------|---------|-------|
+| **[bare](https://github.com/isene/bare)** | **x86_64 Assembly** | **9us** | **CHasm** |
+| [rush](https://github.com/isene/rush) | Rust | ~26ms | Fe2O3 |
+| [rsh](https://github.com/isene/rsh) | Ruby | ~300ms | |
+
+Companion: [bareconf](https://github.com/isene/bareconf) (TUI configurator, built on [crust](https://github.com/isene/crust))
 
 ## License
 
-[Unlicense](https://unlicense.org/) — public domain. Take it, fork it,
-strip it for parts.
+[Unlicense](https://unlicense.org/) - public domain.
+
+## Credits
+
+Created by Geir Isene (https://isene.org) with extensive pair-programming with Claude Code.
