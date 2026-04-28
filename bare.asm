@@ -805,16 +805,18 @@ _start:
     ; Initialize default colors
     call init_default_colors
 
-    ; Build config file path and load config
+    ; Build config file path and load config (always — nicks/abbrevs/
+    ; bookmarks affect command resolution even in non-interactive mode).
     call build_config_path
     call load_config
 
-    ; Initialize username and hostname for prompt
-    call init_username
-    call init_hostname
-    call init_timezone
-
-    ; Check if stdin is a TTY (ioctl TCGETS succeeds only on ttys)
+    ; Detect stdin tty FIRST so the rest of the init can branch on it.
+    ; Without this gating, `echo cmd | bare` paid for history loading,
+    ; PATH cache build, and per-prompt state every invocation — putting
+    ; bare ~2 orders of magnitude behind bash on the
+    ; `echo cmd | shell` benchmark even though it's not a fair test of
+    ; bare's interactive use case. Now non-interactive bare skips all
+    ; the editline / history / completion setup.
     mov rax, SYS_IOCTL
     xor edi, edi
     mov esi, TCGETS
@@ -828,25 +830,42 @@ _start:
     mov qword [is_tty], 0
 .tty_done:
 
-    ; Save original terminal settings
-    call save_termios
-
-    ; Ignore SIGINT in the shell process (children will restore it)
+    ; Ignore SIGINT in the shell process (children will restore it).
+    ; Cheap; do unconditionally.
     call setup_signals
 
-    ; Build history file path
-    call build_hist_path
-
-    ; Load history from file
-    call load_history
-
-    ; Get initial working directory
+    ; Get initial working directory (cheap getcwd; needed for $PWD even
+    ; non-interactive).
     call update_cwd
+
+    ; Initialize last_status
+    mov qword [last_status], 0
+
+    cmp qword [is_tty], 0
+    je .skip_interactive_init
+
+    ; Interactive-only init from here on. None of these have any effect
+    ; on non-interactive `echo cmd | bare`: prompts aren't drawn, line
+    ; editing isn't used, history isn't recalled, tab completion isn't
+    ; triggered. Skipping them brings cold-start cost down dramatically.
+
+    ; Username / hostname / timezone — only needed for the prompt.
+    call init_username
+    call init_hostname
+    call init_timezone
+
+    ; Save original terminal settings (only meaningful on a tty).
+    call save_termios
+
+    ; History file: load 1000 entries + index for prefix-search /
+    ; suggestion. Useless without an interactive line editor.
+    call build_hist_path
+    call load_history
 
     ; PATH executable cache: try the persistent cache first (~few ms).
     ; Fall back to a full PATH scan only if the cache file is missing
-    ; or invalid; init_exe_cache writes the cache so this happens at
-    ; most once per machine (and on `:rehash`).
+    ; or invalid. Used by tab completion + syntax highlighter — neither
+    ; runs in non-interactive mode.
     call build_exec_cache_path
     call load_exec_cache
     test rax, rax
@@ -854,8 +873,7 @@ _start:
     call init_exe_cache
 .have_exe_cache:
 
-    ; Initialize last_status
-    mov qword [last_status], 0
+.skip_interactive_init:
 
     ; Handle -c command mode
     cmp qword [cmd_flag], 0
