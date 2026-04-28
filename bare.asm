@@ -2964,13 +2964,28 @@ read_line:
 .tab_cycle_name:
     mov rcx, [rsp]
     mov rsi, [tab_results + rcx*8]
+    ; Display only the basename — when the user typed a path prefix,
+    ; tab_results stores the full path so completion can replace the
+    ; whole token, but printing it on-screen for every match makes the
+    ; suggestion strip useless (one or two suggestions fill the row).
+    ; Scan for the last '/' and start the displayed string after it.
+    mov r8, rsi                        ; r8 = walker
+.tab_basename_scan:
+    movzx eax, byte [r8]
+    test al, al
+    jz .tab_basename_done
+    cmp al, '/'
+    jne .tab_basename_next
+    lea rsi, [r8 + 1]                  ; rsi advances to char after '/'
+.tab_basename_next:
+    inc r8
+    jmp .tab_basename_scan
+.tab_basename_done:
     mov rdi, rsi
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
     mov rdi, 1
-    mov rcx, [rsp]
-    mov rsi, [tab_results + rcx*8]
     syscall
     ; Reset color
     mov rax, SYS_WRITE
