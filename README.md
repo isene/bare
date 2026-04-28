@@ -70,13 +70,37 @@ EOF
 
 ## Benchmark
 
+Two numbers worth quoting separately, since "shell startup" can mean different
+things and the smaller number tells you nothing about the bigger one.
+
+**Interactive prologue** — cost from `execve` to "ready to handle the first
+keystroke" with all interactive features (history, tab completion,
+syntax-highlighted prompt) initialised lazily on the path that actually
+needs them:
+
 ```
 $ ./bare --bench
 bare startup: 9 microseconds
-
-$ time ./bare -c exit
-./bare -c exit  0.00s user 0.00s system 94% cpu 0.003 total
 ```
+
+**Non-interactive whole-process** — cost of `echo cmd | bare > /dev/null`,
+i.e. spawn shell, parse one line, fork-exec the command, wait, exit. This
+is the right number for `bare` as a script interpreter or pipe target.
+Both shells running on the same machine, 1000 iterations:
+
+| shell | `echo true \| shell` | `echo ls \| shell` | syscalls/invocation |
+|------|------:|------:|----:|
+| bash | 2.5s | 4.5s | 26 |
+| bare | **2.1s** | 4.5s | **14** |
+
+Bare wins the minimal benchmark (~17% faster) and ties on the realistic
+one where the spawned command's own work dominates. Half the syscalls
+per invocation, no dynamic linker, no `.bashrc` parse.
+
+Both numbers reflect the same binary; bare detects `isatty(0)` at startup
+and gates history loading, PATH exec-cache build, and prompt-state init
+behind it. Without that gate, the bench-vs-real gap was ~2 orders of
+magnitude (h/t @romforth and @Corbin on lobste.rs for prodding).
 
 ## Features
 
