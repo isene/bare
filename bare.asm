@@ -5237,7 +5237,16 @@ parse_and_exec_child:
     mov qword [redir_in], 0
     mov qword [redir_herestring], 0
     mov qword [redir_append], 0
-    mov rsi, r12                     ; expand_nicks rewrote our segment in place
+    ; expand_nicks writes the expanded line to line_buf starting at
+    ; offset 0. For a non-pipe command r12 already pointed at line_buf,
+    ; so the old `mov rsi, r12` happened to work. For a pipe segment
+    ; r12 points 9+ bytes into line_buf (where the segment was after
+    ; the splitter NUL-terminated at '|'), so re-parsing from r12 reads
+    ; into the MIDDLE of the just-written expansion — produced
+    ; "command not found: lor=auto" for `... | grep five` because r12
+    ; landed on the 'l' of "color". Always re-parse from line_buf.
+    lea rsi, [line_buf]
+    mov r12, rsi
     call parse_argv
     cmp qword [argc], 0
     je .paec_done
@@ -5355,7 +5364,7 @@ parse_and_exec_child_argv:
     ; Search PATH for the command
     call find_in_path
     test rax, rax
-    jz .exec_notfound
+    jz .search_path_miss
     lea rdi, [exec_path]
 
 .do_exec:
@@ -5373,18 +5382,24 @@ parse_and_exec_child_argv:
     syscall
     ; If we get here, exec failed
 
-    ; Auto-edit: typed path (contains '/') to a regular non-executable
-    ; file → open in $EDITOR (fallback /usr/bin/vim) instead of erroring.
+    ; Auto-open: typed name resolves to a regular non-executable file
+    ; → dispatch via the bare-open helper, which queries xdg-mime for
+    ; a registered handler, then falls back to $EDITOR for text files.
+    ; If bare-open isn't installed (execve fails), we fall through to
+    ; bare's own $EDITOR/vim path so the legacy behaviour still works
+    ; on a stripped-down system.
+    ;
+    ; The filename can be absolute (/path/file), relative (sub/file),
+    ; or bare (foo.hl) — stat() resolves all three against CWD/abs.
+    ; Earlier code required a '/' as a heuristic for "this is a path",
+    ; which made `WitchCraft.hl` fall through to "command not found".
     mov r12, [rbx]                ; argv[0]
-    mov rsi, r12
-.ae_scan_slash:
-    mov al, [rsi]
-    test al, al
-    jz .exec_notfound             ; no '/', not a path
-    cmp al, '/'
-    je .ae_stat
-    inc rsi
-    jmp .ae_scan_slash
+    jmp .ae_stat
+.search_path_miss:
+    ; Cmd not in PATH: try it as a CWD-relative file (auto-open path).
+    ; This is what makes `WitchCraft.hl` open in the registered
+    ; handler instead of erroring with "command not found".
+    mov r12, [rbx]
 .ae_stat:
     sub rsp, 144
     mov rax, SYS_STAT
@@ -5398,6 +5413,35 @@ parse_and_exec_child_argv:
     and eax, 0o170000             ; S_IFMT
     cmp eax, 0o100000             ; S_IFREG
     jne .exec_notfound
+
+    ; Try the bare-open helper first. It does mime-aware dispatch:
+    ;   xdg-mime query filetype → registered handler? → exec xdg-open
+    ;   no handler + text mime → exec $EDITOR
+    ;   no handler + non-text → fail with message
+    ; All extension-specific routing lives in xdg-mime, not here.
+    ;
+    ; Resolve via PATH so ~/bin/bare-open works without root install
+    ; (CHasm symlink convention) AND /usr/local/bin/bare-open works
+    ; after `sudo make install`.
+    lea rdi, [.ae_bareopen_name]
+    call find_in_path
+    test rax, rax
+    jz .ae_no_bareopen
+    sub rsp, 32
+    lea rax, [exec_path]
+    mov [rsp], rax
+    mov [rsp + 8], r12
+    mov qword [rsp + 16], 0
+    mov rdi, rax
+    mov rsi, rsp
+    lea rdx, [env_array]
+    mov rax, SYS_EXECVE
+    syscall
+    add rsp, 32
+.ae_no_bareopen:
+    ; bare-open not on PATH. Fall through to bare's built-in
+    ; $EDITOR/vim path so file-open still works on minimal systems.
+
     ; Find $EDITOR
     xor r13, r13
     xor rcx, rcx
@@ -5459,6 +5503,7 @@ parse_and_exec_child_argv:
     add rsp, 144
     jmp .exec_notfound
 .ae_vim_path: db "/usr/bin/vim", 0
+.ae_bareopen_name: db "bare-open", 0
 
 .exec_notfound:
     ; Print error

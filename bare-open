@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# bare-open — mime-aware file dispatcher used by bare's auto-open path.
+#
+# Lookup chain:
+#   1. xdg-mime query filetype <file> → MIME type
+#   2. xdg-mime query default <mime>  → handler .desktop file
+#      → if a handler is registered, exec xdg-open <file>
+#   3. else if MIME is text/*         → exec $EDITOR (fallback vim)
+#   4. else (binary, no handler)      → error to stderr, exit 1
+#
+# All extension-specific routing lives in xdg-mime, not here. To bind
+# a new file type to an app, use:
+#   xdg-mime default <app>.desktop <mime>
+# e.g. for hyperlist files:
+#   xdg-mime default hyper.desktop application/x-hyperlist
+#
+# Bare execs this on a not-found command that resolves to a regular
+# file. If this script is missing, bare falls back to $EDITOR/vim
+# directly so simple text-file open still works.
+
+set -e
+
+f="$1"
+[[ -n "$f" ]] || { echo "bare-open: no file given" >&2; exit 2; }
+[[ -e "$f" ]] || { echo "bare-open: not found: $f" >&2; exit 2; }
+
+mime=$(xdg-mime query filetype "$f" 2>/dev/null || true)
+
+if [[ -n "$mime" ]]; then
+    desktop=$(xdg-mime query default "$mime" 2>/dev/null || true)
+    if [[ -n "$desktop" ]]; then
+        exec xdg-open "$f"
+    fi
+fi
+
+# No registered handler. If the MIME type starts with "text/", open in
+# $EDITOR. Use `file` as the source of truth — xdg-mime sometimes
+# guesses by extension only and misses Markdown/etc that have no
+# registered handler.
+mime_class=$(file --mime-type -b "$f" 2>/dev/null | cut -d/ -f1)
+if [[ "$mime_class" == "text" ]]; then
+    exec "${EDITOR:-vim}" "$f"
+fi
+
+echo "bare-open: no handler for '$f' (mime: ${mime:-unknown})" >&2
+echo "bare-open: register one with: xdg-mime default <app>.desktop ${mime:-<mime>}" >&2
+exit 1

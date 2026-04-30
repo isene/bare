@@ -11,7 +11,9 @@ bare: bare.asm
 install: bare
 	install -Dm755 bare $(DESTDIR)$(BINDIR)/bare
 	install -Dm644 bare.1 $(DESTDIR)$(MANDIR)/bare.1
+	install -Dm755 bare-open $(DESTDIR)$(BINDIR)/bare-open
 	@echo "Installed bare to $(BINDIR)/bare"
+	@echo "Installed bare-open to $(BINDIR)/bare-open (mime-aware file dispatcher)"
 	@echo "To add to /etc/shells: sudo sh -c 'echo $(BINDIR)/bare >> /etc/shells'"
 
 install-plugins:
@@ -21,6 +23,7 @@ install-plugins:
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/bare
+	rm -f $(DESTDIR)$(BINDIR)/bare-open
 	rm -f $(DESTDIR)$(MANDIR)/bare.1
 
 clean:
