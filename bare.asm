@@ -251,7 +251,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.21", 10, 0
+version_str:    db "bare 0.2.28", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -650,6 +650,19 @@ exe_cache_count: resq 1                 ; number of cached names
 render_buf:     resb 16384
 render_pos:     resq 1
 render_to_buf:  resq 1              ; flag: 1 = write prompt to render_buf
+prev_cursor_row: resq 1             ; visual row offset of the cursor at the
+                                    ; end of the previous full_redraw — i.e.
+                                    ; where the terminal cursor actually
+                                    ; sits when this redraw begins. Using
+                                    ; the CURRENT r12 to compute the up-
+                                    ; movement was wrong: r12 has already
+                                    ; been mutated by the keystroke that
+                                    ; triggered this redraw, but the
+                                    ; terminal cursor still reflects the
+                                    ; pre-keystroke position. Reset to 0
+                                    ; on each new read_line iteration and
+                                    ; SIGWINCH (cursor is at the prompt's
+                                    ; first row after both events).
 sigwinch_flag:  resq 1              ; set by SIGWINCH handler
 tz_offset:      resq 1              ; timezone offset in seconds from UTC
 shl_output_len: resq 1              ; syntax_highlight_line output length
@@ -1309,6 +1322,22 @@ read_line:
 
     xor r12, r12            ; cursor position
     mov qword [line_len], 0
+    mov qword [prev_cursor_row], 0   ; cursor sits at end of prompt = row 0
+
+    ; Save the cursor at the end of the just-printed prompt so every
+    ; full_redraw can ESC[u back to a known anchor instead of trying
+    ; to track its own row offset across keystrokes. Without this anchor
+    ; the cursor walks off-by-one every time an edit (Left, Right,
+    ; backspace) crossed a wrap boundary, and Left/Right would silently
+    ; stop moving once the redraw landed on the wrong absolute row.
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.rl_save_cursor]
+    mov rdx, 3
+    syscall
+    jmp .rl_save_cursor_done
+.rl_save_cursor: db 27, '[', 's'
+.rl_save_cursor_done:
     ; Reset history browsing position
     mov rax, [hist_count]
     mov [hist_pos], rax
@@ -1326,11 +1355,23 @@ read_line:
     cmp qword [sigwinch_flag], 0
     je .read_char            ; spurious EINTR, retry
     mov qword [sigwinch_flag], 0
-    ; Terminal resized: clear screen, home, save cursor, redraw
+    ; Terminal resized: clear screen, home, RE-PRINT the prompt (so the
+    ; ESC[s anchor moves to the new end-of-prompt position), RE-SAVE the
+    ; cursor, then redraw the line. Without this the saved anchor from
+    ; .rl_interactive would point at a row that no longer holds the
+    ; prompt after the resize, and the next redraw's ESC[u would land
+    ; mid-screen.
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.winch_seq]
     mov rdx, .winch_seq_len
+    syscall
+    mov qword [prev_cursor_row], 0
+    call print_prompt
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.rl_save_cursor]
+    mov rdx, 3
     syscall
     call full_redraw
     jmp .read_char
@@ -1567,6 +1608,28 @@ read_line:
     call find_history_suggestion
     test rax, rax
     jz .read_char
+    ; Skip the suggestion when prompt + typed line + suggestion would
+    ; not fit on a single visual row. The suggestion is written by a
+    ; raw SYS_WRITE then reposition_cursor (CR + ESC[col]G — same-row
+    ; only), so once the suggestion's auto-wrap pushes the terminal
+    ; cursor down a row, every subsequent full_redraw moves up by the
+    ; wrong amount and the previous prompt rows leak. Pasting a long
+    ; line that history already matches would cascade into hundreds of
+    ; staircase prompts. Single-row suggestions are still useful and
+    ; safe; multi-row ones are off.
+    push rax
+    push rdx
+    push r12
+    mov r12, [line_len]
+    call cursor_display_width   ; rax = display width of typed line
+    pop r12
+    mov rcx, rax                ; rcx = line display width
+    pop rdx                     ; rdx = suggestion byte length
+    pop rax                     ; rax = suggestion pointer
+    add rcx, [prompt_visible_width]
+    add rcx, rdx                ; rough total visible width
+    cmp rcx, [term_width]
+    jge .read_char
     ; rax = pointer to suggestion remainder, rdx = length
     ; Save suggestion for right-arrow acceptance
     mov [suggestion_ptr], rax
@@ -1625,15 +1688,14 @@ read_line:
     dec rcx
     jnz .shift_left
 .bs_redraw:
-    ; Move cursor back, redraw, clear trailing char
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [.bs_seq]
-    mov rdx, 4
-    syscall
-    call redraw_from_cursor
+    ; full_redraw handles multi-row wrapped lines correctly: moves the
+    ; cursor up to the prompt's first row, ESC[J clears to end of
+    ; screen, then reprints prompt + line and repositions the cursor
+    ; to r12. The previous "\b ESC[K" + redraw_from_cursor path only
+    ; cleared one visual row, so backspacing inside a wrapped paste
+    ; produced a staircase of leftover suffix lines below the prompt.
+    call full_redraw
     jmp .read_char
-.bs_seq: db 8, 27, '[K'       ; backspace + clear to end
 
 .delete_word:
     ; Delete back to previous space
@@ -2305,14 +2367,21 @@ read_line:
 .cursor_right:
     cmp r12, [line_len]
     jge .accept_suggestion
+.cr_inc:
     inc r12
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [.right_seq]
-    mov rdx, 3
-    syscall
+    cmp r12, [line_len]
+    jge .cr_redraw
+    ; Skip UTF-8 continuation bytes (0x80..0xBF) so each Right press
+    ; advances by exactly one codepoint — without this, ⚡ (3 UTF-8
+    ; bytes) takes three presses to traverse and the cursor visibly
+    ; sits in the same display column for two of them.
+    movzx eax, byte [line_buf + r12]
+    and al, 0xC0
+    cmp al, 0x80
+    je .cr_inc
+.cr_redraw:
+    call full_redraw
     jmp .read_char
-.right_seq: db 27, '[', 'C'
 
 .accept_suggestion:
     ; Accept inline suggestion if available
@@ -2354,14 +2423,19 @@ read_line:
 .cursor_left:
     test r12, r12
     jz .read_char
+.cl_dec:
     dec r12
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [.left_seq]
-    mov rdx, 3
-    syscall
+    test r12, r12
+    jz .cl_redraw
+    ; Skip UTF-8 continuation bytes so each Left press moves back by
+    ; one codepoint, not by one byte.
+    movzx eax, byte [line_buf + r12]
+    and al, 0xC0
+    cmp al, 0x80
+    je .cl_dec
+.cl_redraw:
+    call full_redraw
     jmp .read_char
-.left_seq: db 27, '[', 'D'
 
 .word_forward:
     ; Alt-F / Ctrl-Right: move cursor forward to end of next word
@@ -2675,14 +2749,30 @@ read_line:
 .cont_prompt: db "> "
 
 .rd_finish:
-    ; Print newline
-    call write_nl
+    ; Hand the terminal off to the child with the cursor at column 0
+    ; of a fresh row. Two parts:
+    ;   1. r12 = line_len + full_redraw — moves the visible cursor to
+    ;      end-of-line so the child doesn't inherit an in-line edit
+    ;      column (when the user pressed Enter mid-line via Left).
+    ;   2. CR + LF — advance to next row, column 0. raw-mode LF only
+    ;      goes DOWN (no column reset); without the CR the child opens
+    ;      with a stale column offset that survives e.g. vim's
+    ;      alt-screen entry, leaving its visible cursor at the column
+    ;      where bare's edit cursor was.
+    mov r12, [line_len]
+    call full_redraw
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.rd_crlf]
+    mov rdx, 2
+    syscall
     call restore_termios
     mov rax, [line_len]
     pop r13
     pop r12
     pop rbx
     ret
+.rd_crlf: db 13, 10
 
 .read_eof:
     call restore_termios
@@ -3448,90 +3538,43 @@ full_redraw:
     ; Initialize render buffer
     mov qword [render_pos], 0
 
-    ; 1. Reposition + clear. If the previous render wrapped across
-    ; multiple visual rows we need to move the cursor back to the
-    ; prompt's first row before clearing, otherwise only the current
-    ; visual row gets wiped and stale prompt rewrites accumulate.
-    ; Compute current cursor's visual-row offset from the prompt's
-    ; first row using the cursor's position within line_buf.
-    mov qword [render_pos], 0
-    mov rcx, [term_width]
-    cmp rcx, 1
-    jle .fd_clear_simple
-    push r12
-    call cursor_display_width   ; rax = display width of line_buf[0..r12]
-    pop r12
-    add rax, [prompt_visible_width]
-    xor edx, edx
-    mov rcx, [term_width]
-    div rcx                     ; rax = cursor row offset, edx = col
-    test rax, rax
-    jz .fd_clear_no_up
-    ; Emit ESC[<rows>A then CR.  CSI NA = cursor up N rows; many
-    ; minimal terminal parsers (incl. our glass) implement A but not
-    ; F (CPL), so the explicit CR keeps us portable.
+    ; 1. Restore cursor to end-of-prompt (saved with ESC[s by
+    ; .rl_interactive on entry), then CR to put cursor at col 0 of the
+    ; prompt's row, RE-PRINT the prompt (overwrites the same cells with
+    ; identical bytes — no visual change but recovers from anything
+    ; that overwrote the prompt area between redraws, e.g. tab-
+    ; completion strip rendering, child-process output that wasn't
+    ; followed by a newline, terminal scroll caused by a long line).
+    ; Then ESC[J to clear from the post-prompt cursor to end of screen.
     mov rdi, [render_pos]
     lea rdi, [render_buf + rdi]
-    mov byte [rdi], 27
-    mov byte [rdi + 1], '['
-    add rdi, 2
-    push rdi
-    lea rdi, [num_buf]
-    call itoa                   ; rax = digit count
-    pop rdi
-    lea rsi, [num_buf]
-    xor ecx, ecx
-.fd_cp_up_init:
-    cmp ecx, eax
-    jge .fd_cp_up_init_done
-    movzx ebx, byte [rsi + rcx]
-    mov [rdi + rcx], bl
-    inc ecx
-    jmp .fd_cp_up_init
-.fd_cp_up_init_done:
-    add rdi, rax
-    mov byte [rdi], 'A'
-    mov byte [rdi + 1], 13      ; CR to col 0
-    add rdi, 2
+    mov byte [rdi+0], 27
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], 'u'
+    mov byte [rdi+3], 13                ; CR
+    add rdi, 4
     lea rax, [render_buf]
     sub rdi, rax
     mov [render_pos], rdi
-    jmp .fd_clear_to_eos
-.fd_clear_no_up:
-    ; Already on the prompt's first visual row: just CR
-    mov rdi, [render_pos]
-    mov byte [render_buf + rdi], 13
-    inc rdi
-    mov [render_pos], rdi
-    jmp .fd_clear_to_eos
-.fd_clear_simple:
-    ; Unknown term width: fall back to old behavior (CR + ESC[2K)
-    mov rdi, [render_pos]
-    mov byte [render_buf + rdi], 13
-    mov byte [render_buf + rdi + 1], 27
-    mov byte [render_buf + rdi + 2], '['
-    mov byte [render_buf + rdi + 3], '2'
-    mov byte [render_buf + rdi + 4], 'K'
-    add rdi, 5
-    mov [render_pos], rdi
-    jmp .fd_after_clear
-.fd_clear_to_eos:
-    ; Append ESC[J (clear from cursor to end of screen)
-    mov rdi, [render_pos]
-    mov byte [render_buf + rdi], 27
-    mov byte [render_buf + rdi + 1], '['
-    mov byte [render_buf + rdi + 2], 'J'
-    add rdi, 3
-    mov [render_pos], rdi
-.fd_after_clear:
 
     ; Set batching flag for all sub-calls
     mov qword [render_to_buf], 1
 
-    ; 2. Print prompt into render buffer
+    ; 2. Re-print prompt
     call print_prompt
 
-    ; 3. Syntax highlighted line content
+    ; 3. ESC[J after the prompt to clear from end-of-prompt down
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    mov byte [rdi+0], 27
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], 'J'
+    add rdi, 3
+    lea rax, [render_buf]
+    sub rdi, rax
+    mov [render_pos], rdi
+
+    ; 4. Syntax highlighted line content
     mov rcx, [line_len]
     test rcx, rcx
     jz .fd_repos
@@ -3576,73 +3619,78 @@ full_redraw:
     add [render_pos], rcx
 
 .fd_repos:
-    ; 4. Reposition cursor for wrapped lines
-    ; After writing all content, cursor is at prompt_width + line_len
-    ; We want it at prompt_width + r12
-    ; Calculate rows/cols for both positions
-    mov rdi, [render_pos]
-    lea rdi, [render_buf + rdi]
-
-    ; Current position (end of content) using display width
-    ; Save r12, temporarily set it to line_len for display width calc
+    ; Reposition cursor by:
+    ;   ESC[u        — restore to the saved end-of-prompt anchor.
+    ;   ESC[<rows>B  — move cursor DOWN rows (only if rows > 0).
+    ;   CR           — col 0 of current row.
+    ;   ESC[<col+1>G — go to absolute column.
+    ;
+    ; Doing absolute positioning from the ESC[s/ESC[u anchor avoids the
+    ; "deferred wrap" trap that natural-advance positioning falls into:
+    ; when a write fills exactly tw cells, most terminals leave the cursor
+    ; at (row, tw-1) with a wrap-pending flag instead of (row+1, 0). The
+    ; FIRST cell of every wrapped row was therefore unreachable via Left.
+    ; Down-then-CR forces the cursor onto the right row at col 0 every
+    ; time, regardless of which side of a wrap boundary we're on.
     push r12
     mov r12, [line_len]
-    call cursor_display_width  ; rax = display width of entire line
+    call cursor_display_width   ; rax = display width of full line (for end_disp; not used here, but warms cache)
     pop r12
+    call cursor_display_width   ; rax = display width of line_buf[0..r12]
     add rax, [prompt_visible_width]
-    xor edx, edx
     mov rcx, [term_width]
     test rcx, rcx
     jz .fd_repos_simple
     cmp rcx, 1
     jle .fd_repos_simple
-    push rax
-    div rcx                    ; rax = end_row, edx = end_col
-    mov rbx, rax               ; rbx = end_row
-
-    ; Target position (cursor) using display width
-    call cursor_display_width  ; rax = display width of line_buf[0..r12]
-    add rax, [prompt_visible_width]
     xor edx, edx
-    mov rcx, [term_width]
-    div rcx                    ; rax = target_row, edx = target_col
-    pop rcx                    ; discard saved end position
+    div rcx                     ; rax = target_row, edx = target_col
 
-    ; Move up (end_row - target_row) rows
-    sub rbx, rax               ; rows to move up
-    test rbx, rbx
-    jz .fd_repos_col
-    mov byte [rdi], 27
-    mov byte [rdi + 1], '['
+    ; Emit ESC[u (always — places us at the anchor regardless of where
+    ; the FULL-line render left the cursor, including the deferred-wrap
+    ; pseudo-position).
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    mov byte [rdi+0], 27
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], 'u'
+    add rdi, 3
+
+    ; ESC[<rows>B if rows > 0
+    test rax, rax
+    jz .fd_repos_skip_down
+    mov byte [rdi+0], 27
+    mov byte [rdi+1], '['
     add rdi, 2
-    mov rax, rbx
+    push rdx
     push rdi
     lea rdi, [num_buf]
     call itoa
     pop rdi
+    pop rdx
     lea rsi, [num_buf]
     xor ecx, ecx
-.fd_cp_up2:
+.fd_repos_cp_rows:
     cmp ecx, eax
-    jge .fd_cp_up2_done
+    jge .fd_repos_cp_rows_done
     movzx ebx, byte [rsi + rcx]
     mov [rdi + rcx], bl
     inc ecx
-    jmp .fd_cp_up2
-.fd_cp_up2_done:
+    jmp .fd_repos_cp_rows
+.fd_repos_cp_rows_done:
     add rdi, rax
-    mov byte [rdi], 'A'
+    mov byte [rdi], 'B'
     inc rdi
 
-.fd_repos_col:
-    ; Set column: ESC[{col+1}G
-    mov byte [rdi], 13         ; CR first
+.fd_repos_skip_down:
+    ; CR
+    mov byte [rdi], 13
     inc rdi
-    inc edx                    ; 1-indexed column
-    test edx, edx
-    jz .fd_repos_done
-    mov byte [rdi], 27
-    mov byte [rdi + 1], '['
+
+    ; ESC[<col+1>G
+    inc edx
+    mov byte [rdi+0], 27
+    mov byte [rdi+1], '['
     add rdi, 2
     mov rax, rdx
     push rdi
@@ -3651,50 +3699,32 @@ full_redraw:
     pop rdi
     lea rsi, [num_buf]
     xor ecx, ecx
-.fd_cp_col2:
+.fd_repos_cp_col:
     cmp ecx, eax
-    jge .fd_cp_col2_done
+    jge .fd_repos_cp_col_done
     movzx ebx, byte [rsi + rcx]
     mov [rdi + rcx], bl
     inc ecx
-    jmp .fd_cp_col2
-.fd_cp_col2_done:
+    jmp .fd_repos_cp_col
+.fd_repos_cp_col_done:
     add rdi, rax
     mov byte [rdi], 'G'
     inc rdi
-    jmp .fd_repos_done
+    jmp .fd_repos_finalise
 
 .fd_repos_simple:
-    ; No term_width, fallback to simple CR + col
+    ; Unknown / 1-col-wide terminal: just CR and hope.
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
     mov byte [rdi], 13
-    mov byte [rdi + 1], 27
-    mov byte [rdi + 2], '['
-    add rdi, 3
-    call cursor_display_width  ; rax = display width of line_buf[0..r12]
-    add rax, [prompt_visible_width]
-    inc rax
-    push rdi
-    lea rdi, [num_buf]
-    call itoa
-    pop rdi
-    lea rsi, [num_buf]
-    xor ecx, ecx
-.fd_cp_simple:
-    cmp ecx, eax
-    jge .fd_cp_simple_done
-    movzx ebx, byte [rsi + rcx]
-    mov [rdi + rcx], bl
-    inc ecx
-    jmp .fd_cp_simple
-.fd_cp_simple_done:
-    add rdi, rax
-    mov byte [rdi], 'G'
     inc rdi
 
-.fd_repos_done:
-    ; Update render_pos
-    sub rdi, render_buf
+.fd_repos_finalise:
+    lea rax, [render_buf]
+    sub rdi, rax
     mov [render_pos], rdi
+
+.fd_repos_done:
 
     ; 5. Clear batching flag and single write of entire render buffer
     mov qword [render_to_buf], 0
