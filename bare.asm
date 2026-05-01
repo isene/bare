@@ -110,6 +110,11 @@ DEFAULT REL
 %define MAX_BOOKMARKS 64
 %define MAX_BM_STORAGE 8192
 %define MAX_DIR_HISTORY 64
+; Hard cap on persistent shell history entries. With dedup on (smart or
+; full mode), 1024 distinct commands is more than any normal user
+; accumulates in months. Older entries roll off when the cap is hit so
+; suggestion / Ctrl-R lookups stay O(N) at a small N.
+%define MAX_HIST 1024
 %define MAX_PIPE_SEGMENTS 16
 %define MAX_JOBS 32
 
@@ -251,7 +256,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.30", 10, 0
+version_str:    db "bare 0.2.31", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -435,6 +440,10 @@ raw_termios:    resb 60
 hist_buf:       resb 524288     ; 512KB history buffer
 hist_lines:     resq 8192       ; pointers to history lines
 hist_count:     resq 1
+hist_dirty:     resq 1          ; 1 if an entry rolled off via cap rotation
+                                ; this session — next save needs to be a
+                                ; rewrite, not an append, to compact the
+                                ; on-disk file.
 hist_persisted: resq 1          ; entries already written to disk; save
                                 ; appends only newer ones so concurrent
                                 ; bare instances don't overwrite each
@@ -8728,8 +8737,8 @@ add_history:
 
 .ah_no_dedup:
     mov rcx, [hist_count]
-    cmp rcx, 8190
-    jge .ah_shift            ; history full, shift down
+    cmp rcx, MAX_HIST
+    jge .ah_cap_rotate       ; cap hit: drop oldest, then add
 
     ; Store pointer to a copy in hist_buf
     ; Find end of hist_buf content
@@ -8750,14 +8759,51 @@ add_history:
     inc rdi                  ; past null terminator
     jmp .ah_store
 
-.ah_shift:
-    ; History array exhausted (>8190 entries this session). Drop the
-    ; in-memory entries and start fresh — disk file keeps everything
-    ; via the append-only save path. The new entry goes at slot 0.
-    mov qword [hist_count], 0
-    mov qword [hist_persisted], 0
-    xor rcx, rcx
+.ah_cap_rotate:
+    ; History at MAX_HIST entries — drop the oldest (slot 0), shift the
+    ; rest down by one, append at the new tail. Disk file goes through
+    ; rewrite_history at next sync point because save_history is append-
+    ; only and would otherwise re-emit duplicates.
+    push rbx
+    xor rbx, rbx
+.ah_shift_loop:
+    mov rax, rbx
+    inc rax
+    cmp rax, [hist_count]
+    jge .ah_shift_done
+    mov rdi, [hist_lines + rax*8]
+    mov [hist_lines + rbx*8], rdi
+    mov rbx, rax
+    jmp .ah_shift_loop
+.ah_shift_done:
+    pop rbx
+    dec qword [hist_count]
+    ; Reset persisted to 0: next save_history will append the (still
+    ; intact) tail of the in-memory list, but the rolled-off oldest
+    ; entry stays in the on-disk file until rewrite_history runs (e.g.
+    ; via Ctrl-X or :exit). Acceptable: in-memory truncation is what
+    ; controls suggestion-lookup cost; on-disk overflow gets compacted
+    ; on the next interactive exit.
+    mov rcx, [hist_count]
     mov rdi, hist_buf
+    test rcx, rcx
+    jz .ah_store
+    mov rax, rcx
+    dec rax
+    mov rdi, [hist_lines + rax*8]
+.ah_cap_find_end:
+    cmp byte [rdi], 0
+    je .ah_cap_found_end
+    inc rdi
+    jmp .ah_cap_find_end
+.ah_cap_found_end:
+    inc rdi
+    ; Mark the in-memory list as needing a full disk rewrite at next
+    ; sync — rolled-off oldest entries are still on disk via the
+    ; append-only save_history path. rewrite_history compacts them
+    ; out. Triggering it from the .eof / .bi_exit save path keeps the
+    ; common case (no cap hit) on the cheap append-only fast path.
+    mov byte [hist_dirty], 1
 
 .ah_store:
     mov [hist_lines + rcx*8], rdi
@@ -8830,6 +8876,30 @@ load_history:
     xor ecx, ecx
 .lh_done:
     mov [hist_count], rcx
+    ; Trim to MAX_HIST: stale .bare_history files from before the cap
+    ; was introduced (or accumulated under prior larger caps) can hold
+    ; thousands of entries; we want only the most recent MAX_HIST in
+    ; memory. Slide the tail down to slot 0.
+    cmp rcx, MAX_HIST
+    jbe .lh_no_trim
+    push rbx
+    mov rbx, rcx
+    sub rbx, MAX_HIST         ; rbx = entries to drop from the front
+    xor rax, rax
+.lh_trim:
+    cmp rax, MAX_HIST
+    jge .lh_trim_done
+    mov rdi, rbx
+    add rdi, rax
+    mov rdi, [hist_lines + rdi*8]
+    mov [hist_lines + rax*8], rdi
+    inc rax
+    jmp .lh_trim
+.lh_trim_done:
+    pop rbx
+    mov rcx, MAX_HIST
+    mov [hist_count], rcx
+.lh_no_trim:
     mov [hist_persisted], rcx
     pop r13
     pop r12
@@ -8890,6 +8960,17 @@ rewrite_history:
     ret
 
 save_history:
+    ; If the cap rolled an entry off this session, the disk file holds
+    ; entries that aren't in memory anymore — append-only writes would
+    ; leave them stranded. Detour through rewrite_history (full O_TRUNC
+    ; rewrite) and clear the flag. Concurrent-bare-instance protection
+    ; still holds for the common case (no cap hit, hist_dirty == 0).
+    cmp byte [hist_dirty], 0
+    je .sh_append_path
+    mov byte [hist_dirty], 0
+    call rewrite_history
+    ret
+.sh_append_path:
     push rbx
     push r12
     push r13
