@@ -251,7 +251,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.29", 10, 0
+version_str:    db "bare 0.2.30", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -6292,9 +6292,16 @@ check_builtin:
     ret
 
 .bi_exit:
+    ; Same gate as .eof: don't run the atomic rename dance + history
+    ; flush when nothing could have been changed. `bare -c "exit"` was
+    ; spending 93% of its runtime in two rename(2) calls for an idle
+    ; .barerc round-trip.
+    cmp qword [is_tty], 0
+    je .bi_exit_now
     call save_config
     call save_history
     call restore_termios
+.bi_exit_now:
     mov rdi, [last_status]
     mov rax, SYS_EXIT
     syscall
