@@ -251,7 +251,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.28", 10, 0
+version_str:    db "bare 0.2.29", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -370,6 +370,29 @@ bg_jobsep:      db "] ", 0
 dot_name:       db ".", 0
 dotdot_name:    db "..", 0
 
+; Default LS_COLORS used when the env var is unset (e.g. bare spawned
+; by a window manager outside any login-shell context). Matches the
+; spirit of GNU dircolors -b output trimmed to the most-used keys.
+default_ls_colors:
+ db "di=38;5;111;1:ln=38;5;248;1:ex=38;5;46:bd=38;5;196;4:cd=38;5;198;4:"
+ db "pi=38;5;124;4:so=38;5;196;4:do=38;5;197;4:fi=0:no=0:or=38;5;212;3:"
+ db "ow=38;5;197;4;100:tw=38;5;255;3;100:st=38;5;255;3:sg=38;5;255;4;100:"
+ db "su=38;5;255;4;100;1:mh=38;5;248;3:ca=38;5;197;4:"
+ db "*.tar=38;5;130:*.tgz=38;5;130:*.gz=38;5;130:*.bz2=38;5;130:"
+ db "*.xz=38;5;130:*.zip=38;5;130:*.7z=38;5;130:*.deb=38;5;130:"
+ db "*.rpm=38;5;130:*.jar=38;5;130:"
+ db "*.jpg=38;5;141:*.jpeg=38;5;141:*.png=38;5;141:*.gif=38;5;141:"
+ db "*.bmp=38;5;141:*.svg=38;5;141:*.webp=38;5;141:*.ico=38;5;141:"
+ db "*.mp3=38;5;81:*.flac=38;5;81:*.wav=38;5;81:*.ogg=38;5;81:"
+ db "*.mp4=38;5;81:*.mkv=38;5;81:*.webm=38;5;81:*.mov=38;5;81:"
+ db "*.pdf=38;5;160:*.epub=38;5;160:*.mobi=38;5;160:"
+ db "*.md=38;5;229:*.txt=38;5;229:*.org=38;5;229:"
+ db "*.c=38;5;148:*.cpp=38;5;148:*.h=38;5;148:*.hpp=38;5;148:"
+ db "*.rs=38;5;148:*.go=38;5;148:*.py=38;5;148:*.rb=38;5;148:"
+ db "*.js=38;5;148:*.ts=38;5;148:*.sh=38;5;148:*.asm=38;5;148:"
+ db 0
+default_ls_colors_end:
+
 section .bss
 
 ; TTY flag (1 if stdin is a terminal, 0 if pipe)
@@ -442,6 +465,39 @@ last_status:    resq 1
 
 ; Expand buffer (tilde + env var expansion)
 expand_buf:     resb 4096
+
+; LS_COLORS cache. Cached once at startup (find in envp, copy raw value
+; here, null-terminate). Lookups are linear scans over this buffer
+; — LS_COLORS typically has 500–700 entries (~10 KB) which is fine
+; for cold-tab-completion frequency.
+lscolors_buf:   resb 16384
+lscolors_len:   resq 1                 ; bytes copied (0 = unset)
+lscolors_inited: resq 1
+
+; dir_color path-pattern table. Loaded from ~/.barerc lines like
+;   dir_color = MakeItSimple 172
+; The syntax highlighter substring-matches each path-shaped token
+; against these patterns; matches paint with `\033[38;5;Nm`.
+%define DIR_COLOR_MAX 64
+%define DIR_COLOR_POOL_SZ 4096
+dir_color_count: resq 1
+dir_color_pat_ptrs: resq DIR_COLOR_MAX  ; pointers into dir_color_pool
+dir_color_pat_lens: resq DIR_COLOR_MAX  ; cached strlen for each pattern
+dir_color_codes: resb DIR_COLOR_MAX     ; 256-color code (1..255)
+dir_color_pool:  resb DIR_COLOR_POOL_SZ
+dir_color_pool_pos: resq 1
+
+; Restore-sequence stash for emit_path_token. Set by caller, read after
+; each match. Lets the prompt's CWD render keep its outer color across
+; pattern matches without emit_path_token having to know about prompt
+; state.
+emit_path_restore_ptr: resq 1
+emit_path_restore_len: resq 1
+
+; Pre-built "\033[38;5;<c_cwd>m" used by the prompt CWD render as the
+; restore sequence handed to emit_path_token.
+cwd_restore_buf: resb 16
+cwd_restore_len: resq 1
 
 ; Custom environment array and storage (for export/unset)
 env_array:      resq MAX_ENV_ENTRIES    ; pointers to "VAR=VALUE" strings
@@ -815,6 +871,11 @@ _start:
 
     ; Initialize custom environment
     call init_env_array
+
+    ; Cache LS_COLORS for tab-completion file coloring. Empty if unset
+    ; — looker is a no-op then, falls through to default unstyled
+    ; output (no extra branches in the hot tab path).
+    call lscolors_init
 
     ; Initialize default colors
     call init_default_colors
@@ -1448,6 +1509,10 @@ read_line:
     cmp al, 7
     je .edit_in_editor
 
+    ; Ctrl-X = delete current history entry (browse-via-Up or suggestion)
+    cmp al, 24
+    je .delete_history_entry
+
     ; Ctrl-Y = copy line to clipboard
     cmp al, 25
     je .copy_clipboard
@@ -1726,15 +1791,25 @@ read_line:
     jmp .read_char
 
 .clear_screen:
-    ; Clear screen and redraw prompt + current line
+    ; Clear screen, repaint prompt at row 1, then RE-save the cursor
+    ; so full_redraw's ESC[u anchors at the new row instead of warping
+    ; back to wherever read_line saved it on entry. Without the re-save,
+    ; full_redraw walks back to the original anchor and stamps a second
+    ; prompt at the old row — leaving two prompts visible after Ctrl+L.
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [clear_screen_seq]
     mov rdx, clear_screen_len
     syscall
     call print_prompt
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.cls_save_seq]
+    mov rdx, 3
+    syscall
     call full_redraw
     jmp .read_char
+.cls_save_seq: db 27, '[', 's'
 
 .clear_line:
     xor r12, r12
@@ -1924,14 +1999,23 @@ read_line:
     pop rax
     test rax, rax
     jle .eie_fail
-    ; Strip trailing newlines
+    ; Strip trailing newlines. The previous loop ran `dec rcx; js ...`
+    ; — when the file held just "\n" (the case we always hit, because
+    ; the parent always appends a newline before the fork), the loop
+    ; chewed through the lone byte and underflowed rcx to -1, then
+    ; wrote a zero byte at line_buf - 1 (corrupting the BSS slot just
+    ; before line_buf) and stored -1 into line_len. full_redraw then
+    ; tried to render 2^64 - 1 bytes, which the kernel would page-walk
+    ; the whole address space for before SIGSEGV-ing. That's the
+    ; "Ctrl-G freezes glass for several seconds" symptom.
     mov rcx, rax
 .eie_strip:
+    test rcx, rcx
+    jz .eie_empty
+    cmp byte [line_buf + rcx - 1], 10
+    jne .eie_empty
     dec rcx
-    js .eie_empty
-    cmp byte [line_buf + rcx], 10
-    je .eie_strip
-    inc rcx
+    jmp .eie_strip
 .eie_empty:
     mov byte [line_buf + rcx], 0
     mov [line_len], rcx
@@ -1960,11 +2044,33 @@ read_line:
     call .eie_find_editor
     test rax, rax
     jnz .eie_have_editor
-    lea rax, [.eie_vi]       ; fallback to vi
+    lea rax, [.eie_vi]       ; fallback to /usr/bin/vi (absolute)
 .eie_have_editor:
-    ; execve(editor, [editor, tmpfile, NULL], envp)
+    ; rax = editor name (e.g. "vim") or absolute path. execve does NOT
+    ; search PATH — it expects a fully-qualified path. If the editor
+    ; name contains '/', use as-is. Otherwise resolve via find_in_path,
+    ; which stores the result in exec_path.
+    mov r12, rax              ; r12 = original editor name (argv[0])
+    mov rsi, rax
+.eie_check_slash:
+    movzx ecx, byte [rsi]
+    test cl, cl
+    jz .eie_no_slash
+    cmp cl, '/'
+    je .eie_path_ready        ; absolute / relative path already
+    inc rsi
+    jmp .eie_check_slash
+.eie_no_slash:
+    ; No slash — search PATH.
+    mov rdi, r12
+    call find_in_path
+    test rax, rax
+    jz .eie_exec_fail         ; not found in PATH; surface as exit 127
+    lea rax, [exec_path]
+.eie_path_ready:
+    ; rax = exec path (resolved or original), r12 = argv[0] name
     sub rsp, 32
-    mov [rsp], rax            ; argv[0] = editor path
+    mov [rsp], r12            ; argv[0] = name as the user typed it
     lea rcx, [suggestion_buf]
     mov [rsp + 8], rcx        ; argv[1] = temp file
     mov qword [rsp + 16], 0   ; argv[2] = NULL
@@ -1973,6 +2079,7 @@ read_line:
     lea rdx, [env_array]
     mov rax, SYS_EXECVE
     syscall
+.eie_exec_fail:
     mov rax, SYS_EXIT
     mov edi, 127
     syscall
@@ -2004,6 +2111,177 @@ read_line:
     ret
 .eie_cr: db 13
 .eie_vi: db "/usr/bin/vi", 0
+
+.delete_history_entry:
+    ; Ctrl-X: drop the currently-displayed history entry from in-memory
+    ; history AND rewrite the on-disk file so the deletion sticks.
+    ;
+    ; Two trigger contexts:
+    ;   1. User browsed Up to an entry: hist_pos < hist_count, line_buf
+    ;      holds the loaded entry. Delete hist_lines[hist_pos], reload
+    ;      whichever entry now occupies that index (the next-newer one),
+    ;      or clear the line if hist_pos has fallen off the end.
+    ;   2. A history-match suggestion is on screen: suggestion_ptr is
+    ;      non-zero and points into a hist_lines entry's tail. Find the
+    ;      matching index, delete it, recompute and redraw the next
+    ;      suggestion (.show_suggestion) for whatever's left.
+    ;
+    ; If neither browsing nor suggestion is active, Ctrl-X is a no-op
+    ; (nothing to delete).
+    cmp qword [suggestion_ptr], 0
+    jne .dhe_from_suggestion
+    mov rax, [hist_pos]
+    cmp rax, [hist_count]
+    jge .read_char                  ; not browsing, no suggestion
+    ; Browse mode: rax = hist_pos = index to delete
+    mov rcx, 0                      ; mode=0 → browse (reload)
+    jmp .dhe_have_index
+
+.dhe_from_suggestion:
+    ; suggestion_ptr = hist_lines[i] + line_len for some i. Walk backward
+    ; (most-recent-first; matches find_history_suggestion's order) to
+    ; find ANY entry whose pointer + line_len equals suggestion_ptr — we
+    ; only need a sample of the offending content to nuke ALL identical
+    ; entries below. Same content seen via the same prefix means the
+    ; user wants the suggestion gone for good, not just one occurrence
+    ; whittled away while 34 duplicates still queue up behind it.
+    mov rax, [hist_count]
+    dec rax
+    js .read_char
+    mov rdx, [line_len]
+.dhe_sug_loop:
+    test rax, rax
+    js .read_char
+    mov rdi, [hist_lines + rax*8]
+    test rdi, rdi
+    jz .dhe_sug_next
+    add rdi, rdx
+    cmp rdi, [suggestion_ptr]
+    je .dhe_sug_found
+.dhe_sug_next:
+    dec rax
+    jmp .dhe_sug_loop
+.dhe_sug_found:
+    ; rax = a matching index. Save its full-string pointer as the
+    ; "kill template", then compact hist_lines, dropping every entry
+    ; that strcmp-matches the template. The hist_buf bytes themselves
+    ; are not freed (no allocator), but no hist_lines slot points at
+    ; them anymore so they're inert.
+    mov rdx, [hist_lines + rax*8]   ; rdx = template pointer (preserved
+                                    ; across strcmp via push/pop below)
+    xor rcx, rcx                    ; rcx = read index
+    xor r8, r8                      ; r8  = write index
+.dhe_sug_filter:
+    cmp rcx, [hist_count]
+    jge .dhe_sug_filter_done
+    mov rdi, [hist_lines + rcx*8]
+    test rdi, rdi
+    jz .dhe_sug_filter_skip
+    push rcx
+    push rdx
+    push r8
+    mov rsi, rdx
+    call strcmp                     ; rax = 0 if equal (delete)
+    pop r8
+    pop rdx
+    pop rcx
+    test rax, rax
+    jz .dhe_sug_filter_skip
+    mov rsi, [hist_lines + rcx*8]
+    mov [hist_lines + r8*8], rsi
+    inc r8
+.dhe_sug_filter_skip:
+    inc rcx
+    jmp .dhe_sug_filter
+.dhe_sug_filter_done:
+    mov rcx, r8
+.dhe_sug_zero:
+    cmp rcx, [hist_count]
+    jge .dhe_sug_zero_done
+    mov qword [hist_lines + rcx*8], 0
+    inc rcx
+    jmp .dhe_sug_zero
+.dhe_sug_zero_done:
+    mov [hist_count], r8
+    ; hist_pos was sitting at OLD hist_count (suggestion mode = not
+    ; browsing). After the compaction the OLD value is past the new
+    ; end, leaving hist_lines[hist_pos..old] full of zeros — Up would
+    ; then dec hist_pos through every zeroed slot and look like it's
+    ; ignoring keypresses. Snap hist_pos to the new tail so the next
+    ; Up enters .hp_search_back from a valid spot.
+    mov [hist_pos], r8
+    mov qword [hist_prefix_len], 0
+    call rewrite_history
+    mov qword [suggestion_ptr], 0
+    mov qword [suggestion_len], 0
+    call full_redraw
+    jmp .show_suggestion
+
+.dhe_have_index:
+    ; rax = index to delete, rcx = mode flag (0 = browse). Browse-mode
+    ; deletes exactly one entry — the user navigated to a specific
+    ; position via Up/Down and wants that particular instance gone, not
+    ; all duplicates of its content.
+    push rcx                        ; preserve mode across shift
+    mov rcx, rax
+    inc rax
+.dhe_shift:
+    cmp rax, [hist_count]
+    jge .dhe_shift_done
+    mov rdi, [hist_lines + rax*8]
+    mov [hist_lines + rcx*8], rdi
+    inc rax
+    inc rcx
+    jmp .dhe_shift
+.dhe_shift_done:
+    dec qword [hist_count]
+    mov qword [hist_lines + rcx*8], 0
+    ; Persist: rewrite the file from scratch so the deleted entry is
+    ; gone on disk too. Resets hist_persisted = hist_count so a later
+    ; save_history (called on exit) doesn't append duplicates.
+    call rewrite_history
+    mov qword [suggestion_ptr], 0
+    mov qword [suggestion_len], 0
+    pop rcx
+    jmp .dhe_browse_reload
+
+.dhe_browse_reload:
+    ; Browse mode: hist_pos still points at the same index, which now
+    ; holds the entry that was one slot newer (or is past the end).
+    mov rax, [hist_pos]
+    cmp rax, [hist_count]
+    jge .dhe_clear
+    mov rsi, [hist_lines + rax*8]
+    test rsi, rsi
+    jz .dhe_clear
+    lea rdi, [line_buf]
+    xor rcx, rcx
+.dhe_load:
+    mov al, [rsi + rcx]
+    test al, al
+    jz .dhe_loaded
+    mov [rdi + rcx], al
+    inc rcx
+    cmp rcx, 16382
+    jge .dhe_loaded
+    jmp .dhe_load
+.dhe_loaded:
+    mov byte [rdi + rcx], 0
+    mov [line_len], rcx
+    mov r12, rcx
+    call full_redraw
+    jmp .read_char
+
+.dhe_clear:
+    ; Past end of (now-shorter) history: clear line, leave hist_pos at
+    ; hist_count so the next Up restarts from the (new) tail.
+    mov rax, [hist_count]
+    mov [hist_pos], rax
+    xor r12, r12
+    mov qword [line_len], 0
+    mov byte [line_buf], 0
+    call full_redraw
+    jmp .read_char
 
 .reverse_search:
     ; Ctrl-R: incremental reverse history search
@@ -3049,33 +3327,53 @@ read_line:
     syscall
     jmp .tab_cycle_name
 .tab_cycle_normal:
-    ; Color based on file type (LS_COLORS style)
-    mov rcx, [rsp]           ; peek at saved rcx without pop
-    movzx eax, byte [tab_types + rcx]
-    ; DT_DIR=4: blue+bold, DT_LNK=10: cyan, DT_REG+exec: green, default: gray
-    cmp al, 4               ; directory
-    je .tab_color_dir
-    cmp al, 10              ; symlink
-    je .tab_color_link
-    ; Default: dim gray
+    ; Look up LS_COLORS for this entry. Pass d_type via sil and the
+    ; FULL path (tab_results[rcx]) so suffix-match (`*.tar`, `*README`)
+    ; sees the filename. If lookup returns nothing, emit the legacy
+    ; dim-gray that bare used pre-LS_COLORS so the strip stays readable.
+    mov rcx, [rsp]
+    movzx esi, byte [tab_types + rcx]
+    mov rdi, [tab_results + rcx*8]
+    call lscolors_color_for_entry
+    test rax, rax
+    jnz .tab_color_lscolors
+    ; Fallback: dim gray for everything (matches old "default" path).
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.tab_hl_dim]
     mov rdx, .tab_hl_dim_len
     syscall
     jmp .tab_cycle_name
-.tab_color_dir:
+.tab_color_lscolors:
+    ; rax = ptr to LS_COLORS value (e.g. "38;5;111;1"), rdx = its length.
+    ; Wrap with "\033[" + value + "m". Build into tmp_buf so it's one
+    ; SYS_WRITE.
+    push rax
+    push rdx
+    lea rdi, [tmp_buf]
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    add rdi, 2
+    pop rdx
+    pop rsi                          ; value ptr
+    mov rcx, rdx
+.tab_color_copy:
+    test rcx, rcx
+    jz .tab_color_copy_done
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jmp .tab_color_copy
+.tab_color_copy_done:
+    mov byte [rdi], 'm'
+    inc rdi
+    lea rsi, [tmp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
     mov rax, SYS_WRITE
     mov rdi, 1
-    lea rsi, [.tab_color_dir_seq]
-    mov rdx, .tab_color_dir_len
-    syscall
-    jmp .tab_cycle_name
-.tab_color_link:
-    mov rax, SYS_WRITE
-    mov rdi, 1
-    lea rsi, [.tab_color_link_seq]
-    mov rdx, .tab_color_link_len
     syscall
 .tab_cycle_name:
     mov rcx, [rsp]
@@ -7851,6 +8149,311 @@ find_env_path:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
+; LS_COLORS — cache + lookup for tab-completion file coloring
+; ══════════════════════════════════════════════════════════════════════
+; Copy LS_COLORS env value into lscolors_buf at startup. Idempotent.
+; No-ops if env var is unset, empty, or longer than 16 KB - 1.
+lscolors_init:
+    cmp qword [lscolors_inited], 0
+    jne .lci_ret
+    push rbx
+    push r12
+    mov qword [lscolors_inited], 1
+    mov rbx, [envp]
+.lci_loop:
+    mov rdi, [rbx]
+    test rdi, rdi
+    jz .lci_done
+    cmp dword [rdi], 'LS_C'
+    jne .lci_next
+    cmp dword [rdi + 4], 'OLOR'
+    jne .lci_next
+    cmp word [rdi + 8], 'S='
+    jne .lci_next
+    lea rsi, [rdi + 10]               ; value start
+    mov rdi, lscolors_buf
+    xor r12, r12
+.lci_copy:
+    mov al, [rsi]
+    test al, al
+    jz .lci_copy_done
+    cmp r12, 16382
+    jge .lci_copy_done
+    mov [rdi + r12], al
+    inc rsi
+    inc r12
+    jmp .lci_copy
+.lci_copy_done:
+    mov byte [rdi + r12], 0
+    mov [lscolors_len], r12
+    jmp .lci_done
+.lci_next:
+    add rbx, 8
+    jmp .lci_loop
+.lci_done:
+    ; Fallback: if env didn't carry LS_COLORS (window-manager-spawned
+    ; bare with no login-shell ancestry), copy the baked default. The
+    ; default targets the same color scheme as the rest of CHasm.
+    cmp qword [lscolors_len], 0
+    jne .lci_real_done
+    lea rsi, [default_ls_colors]
+    mov rdi, lscolors_buf
+    xor r12, r12
+.lci_def_copy:
+    mov al, [rsi]
+    test al, al
+    jz .lci_def_done
+    cmp r12, 16382
+    jge .lci_def_done
+    mov [rdi + r12], al
+    inc rsi
+    inc r12
+    jmp .lci_def_copy
+.lci_def_done:
+    mov byte [rdi + r12], 0
+    mov [lscolors_len], r12
+.lci_real_done:
+    pop r12
+    pop rbx
+.lci_ret:
+    ret
+
+; rdi = pattern ptr, rsi = pattern length. Search lscolors_buf for an
+; entry matching `<pattern>=<value>` delimited by ':' or NUL. Returns
+; rax = ptr to value, rdx = value length, or rax = 0 if no match.
+; Clobbers rcx, r8, r9.
+lscolors_lookup:
+    cmp qword [lscolors_len], 0
+    je .ll_none
+    mov r8, lscolors_buf              ; r8 = scan cursor
+.ll_entry:
+    cmp byte [r8], 0
+    je .ll_none
+    ; Compare pattern at r8.
+    xor rcx, rcx
+.ll_cmp:
+    cmp rcx, rsi
+    jge .ll_check_eq
+    mov al, [rdi + rcx]
+    cmp al, [r8 + rcx]
+    jne .ll_skip
+    inc rcx
+    jmp .ll_cmp
+.ll_check_eq:
+    cmp byte [r8 + rcx], '='
+    jne .ll_skip
+    ; Match — value starts after '='.
+    lea rax, [r8 + rsi + 1]
+    mov rdx, rax
+.ll_vlen:
+    movzx ecx, byte [rdx]
+    test cl, cl
+    jz .ll_have_len
+    cmp cl, ':'
+    je .ll_have_len
+    inc rdx
+    jmp .ll_vlen
+.ll_have_len:
+    sub rdx, rax
+    ret
+.ll_skip:
+    ; Advance r8 to the next ':' or NUL, then past the ':'.
+.ll_skip_loop:
+    movzx ecx, byte [r8]
+    test cl, cl
+    jz .ll_none
+    cmp cl, ':'
+    je .ll_skip_past
+    inc r8
+    jmp .ll_skip_loop
+.ll_skip_past:
+    inc r8
+    jmp .ll_entry
+.ll_none:
+    xor eax, eax
+    xor edx, edx
+    ret
+
+; rdi = filename, sil (sil = low byte of rsi) = d_type. Returns the
+; LS_COLORS value bytes (rax = ptr, rdx = len) for this entry, or
+; (0, 0) if no match. Order: type code first (di/ln/ex), then suffix
+; matches (`*pattern`). Caller writes "\033[" + value + "m" around
+; the filename and "\033[0m" after.
+;
+; sil  d_type meaning   LS_COLORS key probed
+; ────────────────────────────────────────────
+;  4   DT_DIR             "di"
+;  10  DT_LNK             "ln"
+;  6   DT_BLK             "bd"
+;  2   DT_CHR             "cd"
+;  12  DT_SOCK            "so"
+;  1   DT_FIFO            "pi"
+; everything else (incl. DT_REG=8 / DT_UNKNOWN=0) → suffix-match only
+lscolors_color_for_entry:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13b, sil
+    cmp r13b, 4
+    je .lcfe_di
+    cmp r13b, 10
+    je .lcfe_ln
+    cmp r13b, 6
+    je .lcfe_bd
+    cmp r13b, 2
+    je .lcfe_cd
+    cmp r13b, 12
+    je .lcfe_so
+    cmp r13b, 1
+    je .lcfe_pi
+    jmp .lcfe_suffix
+.lcfe_di:
+    lea rdi, [.lcfe_k_di]
+    mov rsi, 2
+    call lscolors_lookup
+    test rax, rax
+    jnz .lcfe_done
+    jmp .lcfe_suffix
+.lcfe_ln:
+    lea rdi, [.lcfe_k_ln]
+    mov rsi, 2
+    call lscolors_lookup
+    test rax, rax
+    jnz .lcfe_done
+    jmp .lcfe_suffix
+.lcfe_bd:
+    lea rdi, [.lcfe_k_bd]
+    mov rsi, 2
+    call lscolors_lookup
+    test rax, rax
+    jnz .lcfe_done
+    jmp .lcfe_suffix
+.lcfe_cd:
+    lea rdi, [.lcfe_k_cd]
+    mov rsi, 2
+    call lscolors_lookup
+    test rax, rax
+    jnz .lcfe_done
+    jmp .lcfe_suffix
+.lcfe_so:
+    lea rdi, [.lcfe_k_so]
+    mov rsi, 2
+    call lscolors_lookup
+    test rax, rax
+    jnz .lcfe_done
+    jmp .lcfe_suffix
+.lcfe_pi:
+    lea rdi, [.lcfe_k_pi]
+    mov rsi, 2
+    call lscolors_lookup
+    test rax, rax
+    jnz .lcfe_done
+    jmp .lcfe_suffix
+
+.lcfe_suffix:
+    ; Walk lscolors_buf for entries beginning with '*'. For each such
+    ; entry, compare its tail (skipping the '*') against the filename
+    ; tail. Return the first hit. We scan the value-part of LS_COLORS
+    ; in raw form, so r8 walks one entry at a time.
+    cmp qword [lscolors_len], 0
+    je .lcfe_none
+    mov r8, lscolors_buf
+.lcfe_sx_entry:
+    cmp byte [r8], 0
+    je .lcfe_none
+    cmp byte [r8], '*'
+    jne .lcfe_sx_skip
+    ; Find '=' to delimit pattern.
+    mov rax, r8
+    inc rax
+.lcfe_sx_eq:
+    movzx ecx, byte [rax]
+    test cl, cl
+    jz .lcfe_none
+    cmp cl, '='
+    je .lcfe_sx_have_eq
+    inc rax
+    jmp .lcfe_sx_eq
+.lcfe_sx_have_eq:
+    ; Pattern is r8+1 .. rax-1 (length = rax - r8 - 1). Filename tail
+    ; must equal pattern. Compute filename length, compare tails.
+    mov rbx, rax                      ; rbx = '=' position
+    sub rax, r8
+    sub rax, 1                        ; rax = pattern length
+    push rbx
+    mov rdi, r12
+    call strlen
+    pop rbx
+    mov rcx, rax                      ; rcx = filename length
+    ; Pattern length is now in (rbx - r8 - 1); recompute
+    mov rax, rbx
+    sub rax, r8
+    dec rax                           ; rax = pattern length
+    cmp rax, rcx
+    jg .lcfe_sx_skip                  ; pattern longer than filename
+    ; Compare filename[len-pat_len..len] vs pattern[0..pat_len]
+    mov rdx, r12
+    add rdx, rcx
+    sub rdx, rax                      ; rdx = filename tail start
+    lea rdi, [r8 + 1]                 ; pattern start
+    xor rcx, rcx
+.lcfe_sx_cmp:
+    cmp rcx, rax
+    jge .lcfe_sx_match
+    mov sil, [rdi + rcx]
+    cmp sil, [rdx + rcx]
+    jne .lcfe_sx_skip
+    inc rcx
+    jmp .lcfe_sx_cmp
+.lcfe_sx_match:
+    ; rax = pattern length, value at rbx+1 .. next ':'/NUL
+    lea rax, [rbx + 1]
+    mov rdx, rax
+.lcfe_sx_vlen:
+    movzx ecx, byte [rdx]
+    test cl, cl
+    jz .lcfe_sx_done
+    cmp cl, ':'
+    je .lcfe_sx_done
+    inc rdx
+    jmp .lcfe_sx_vlen
+.lcfe_sx_done:
+    sub rdx, rax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.lcfe_sx_skip:
+.lcfe_sx_skip_loop:
+    movzx ecx, byte [r8]
+    test cl, cl
+    jz .lcfe_none
+    cmp cl, ':'
+    je .lcfe_sx_skip_past
+    inc r8
+    jmp .lcfe_sx_skip_loop
+.lcfe_sx_skip_past:
+    inc r8
+    jmp .lcfe_sx_entry
+
+.lcfe_none:
+    xor eax, eax
+    xor edx, edx
+.lcfe_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.lcfe_k_di: db "di"
+.lcfe_k_ln: db "ln"
+.lcfe_k_bd: db "bd"
+.lcfe_k_cd: db "cd"
+.lcfe_k_so: db "so"
+.lcfe_k_pi: db "pi"
+
+; ══════════════════════════════════════════════════════════════════════
 ; Terminal / termios
 ; ══════════════════════════════════════════════════════════════════════
 save_termios:
@@ -8221,6 +8824,59 @@ load_history:
 .lh_done:
     mov [hist_count], rcx
     mov [hist_persisted], rcx
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Rewrite the on-disk history file from scratch to reflect the current
+; in-memory hist_lines. Used after an interactive deletion (Ctrl-X) —
+; the regular save_history is append-only and cannot remove entries.
+; Sets hist_persisted = hist_count so a subsequent save_history at
+; exit doesn't re-append the entries we just persisted.
+rewrite_history:
+    push rbx
+    push r12
+    push r13
+    mov rax, SYS_OPEN
+    lea rdi, [hist_path]
+    mov esi, O_WRONLY | O_CREAT | O_TRUNC
+    mov edx, 0o644
+    syscall
+    test rax, rax
+    js .rh_done
+    mov r12, rax                         ; fd
+    xor r13, r13
+.rh_loop:
+    cmp r13, [hist_count]
+    jge .rh_close
+    mov rsi, [hist_lines + r13*8]
+    test rsi, rsi
+    jz .rh_next
+    push r13
+    mov rdi, rsi
+    call strlen
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    mov rsi, [hist_lines + r13*8]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    pop r13
+.rh_next:
+    inc r13
+    jmp .rh_loop
+.rh_close:
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+    mov rax, [hist_count]
+    mov [hist_persisted], rax
+.rh_done:
     pop r13
     pop r12
     pop rbx
@@ -9442,6 +10098,19 @@ load_config:
     jmp .lc_advance
 
 .lc_not_color:
+    ; Check for "dir_color = pattern code". Value is split into pattern
+    ; (everything up to first whitespace) and integer code (rest). Used
+    ; by the syntax highlighter to colorise path-shaped tokens.
+    mov rdi, r12
+    lea rsi, [.str_dir_color]
+    call strcmp
+    test rax, rax
+    jnz .lc_not_dirc
+    mov rdi, r14
+    call config_add_dir_color
+    jmp .lc_advance
+.str_dir_color: db "dir_color", 0
+.lc_not_dirc:
     ; Check for "completion_limit"
     mov rdi, r12
     lea rsi, [.str_comp_limit]
@@ -9931,6 +10600,341 @@ config_set_bool:
     or [config_flags], rax
     ret
 
+; emit_path_token — render a token through dir_color pattern matching.
+; Walks the token byte-by-byte; at each position, scans every configured
+; pattern for a substring match starting at that position whose entire
+; length still fits inside the token. First hit wins (table is in
+; user-defined order; put more-specific entries first). A match emits
+; `\033[38;5;Nm` + matched bytes + restore-sequence; non-match emits
+; one byte verbatim.
+;
+; In:  rdi = token bytes ptr,    rsi = token length,
+;      rdx = output cursor,       rcx = restore-sequence ptr,
+;      r8  = restore-sequence length (0 → emit "\033[0m" instead).
+; Out: rax = bytes written into output (cursor delta).
+;
+; The restore sequence lets the caller resume the OUTER color after a
+; match — e.g. the prompt's CWD render passes "\033[38;5;81m" so the
+; non-matched parts of the path stay in c_cwd color rather than going
+; to terminal default.
+;
+; Register convention inside this routine:
+;   r12 = token base, r13 = token length, r14 = output base,
+;   r15 = output cursor, rbx = read index in token,
+;   rbp = matched pattern index (when in .ept_match).
+emit_path_token:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    mov r13, rsi
+    mov r14, rdx
+    mov r15, rdx
+    mov [emit_path_restore_ptr], rcx
+    mov [emit_path_restore_len], r8
+    xor rbx, rbx
+.ept_loop:
+    cmp rbx, r13
+    jge .ept_done
+    ; Try each configured pattern at position rbx.
+    xor rcx, rcx
+.ept_try:
+    cmp rcx, [dir_color_count]
+    jge .ept_no_match
+    mov rdi, [dir_color_pat_lens + rcx*8]
+    mov r8, r13
+    sub r8, rbx
+    cmp rdi, r8
+    jg .ept_next_pat
+    mov rsi, [dir_color_pat_ptrs + rcx*8]
+    lea r9, [r12 + rbx]
+    xor rdx, rdx
+.ept_cmp:
+    cmp rdx, rdi
+    jge .ept_match
+    mov al, [rsi + rdx]
+    cmp al, [r9 + rdx]
+    jne .ept_next_pat
+    inc rdx
+    jmp .ept_cmp
+.ept_next_pat:
+    inc rcx
+    jmp .ept_try
+
+.ept_no_match:
+    ; No pattern matched at rbx — copy one byte and advance.
+    mov al, [r12 + rbx]
+    mov [r15], al
+    inc r15
+    inc rbx
+    jmp .ept_loop
+
+.ept_match:
+    mov rbp, rcx                          ; rbp = matched pattern index
+    movzx eax, byte [dir_color_codes + rbp]
+    ; "\033[38;5;"
+    mov rdi, r15
+    mov byte [rdi+0], 27
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '3'
+    mov byte [rdi+3], '8'
+    mov byte [rdi+4], ';'
+    mov byte [rdi+5], '5'
+    mov byte [rdi+6], ';'
+    add rdi, 7
+    ; itoa rax (0..255) → rdi advances past digits
+    cmp rax, 100
+    jl .ept_code_lt100
+    mov rcx, 100
+    xor rdx, rdx
+    div rcx
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov rax, rdx
+    mov rcx, 10
+    xor rdx, rdx
+    div rcx
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+    jmp .ept_code_done
+.ept_code_lt100:
+    cmp rax, 10
+    jl .ept_code_lt10
+    mov rcx, 10
+    xor rdx, rdx
+    div rcx
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+    jmp .ept_code_done
+.ept_code_lt10:
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+.ept_code_done:
+    mov byte [rdi], 'm'
+    inc rdi
+    mov r15, rdi
+    ; Copy matched substring (length = pat_lens[rbp]).
+    mov rcx, [dir_color_pat_lens + rbp*8]
+    lea rsi, [r12 + rbx]
+    add rbx, rcx                          ; advance read past match
+.ept_copy:
+    test rcx, rcx
+    jz .ept_copy_done
+    mov al, [rsi]
+    mov [r15], al
+    inc rsi
+    inc r15
+    dec rcx
+    jmp .ept_copy
+.ept_copy_done:
+    ; Restore outer state. If the caller didn't supply one, use
+    ; "\033[0m" (revert to terminal default).
+    mov rcx, [emit_path_restore_len]
+    test rcx, rcx
+    jz .ept_default_reset
+    mov rsi, [emit_path_restore_ptr]
+.ept_restore_copy:
+    test rcx, rcx
+    jz .ept_loop
+    mov al, [rsi]
+    mov [r15], al
+    inc rsi
+    inc r15
+    dec rcx
+    jmp .ept_restore_copy
+.ept_default_reset:
+    mov byte [r15+0], 27
+    mov byte [r15+1], '['
+    mov byte [r15+2], '0'
+    mov byte [r15+3], 'm'
+    add r15, 4
+    jmp .ept_loop
+
+.ept_done:
+    mov rax, r15
+    sub rax, r14
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; find_dir_color_for_path — does any dir_color pattern occur as a
+; substring of the path? First match wins.
+;
+; In:  rdi = path bytes ptr, rsi = path length
+; Out: rax = 256-color code (1..255) of the first matching pattern,
+;      or 0 if no pattern matches (or table is empty).
+find_dir_color_for_path:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    mov r13, rsi
+    mov rax, [dir_color_count]
+    test rax, rax
+    jz .fdc_none
+    xor rbx, rbx
+.fdc_pat_loop:
+    cmp rbx, [dir_color_count]
+    jge .fdc_none
+    mov r14, [dir_color_pat_ptrs + rbx*8]
+    mov r15, [dir_color_pat_lens + rbx*8]
+    test r15, r15
+    jz .fdc_pat_next
+    cmp r15, r13
+    jg .fdc_pat_next
+    mov rcx, r13
+    sub rcx, r15
+    inc rcx
+    xor rdx, rdx
+.fdc_slide:
+    cmp rdx, rcx
+    jge .fdc_pat_next
+    xor r8, r8
+.fdc_cmp:
+    cmp r8, r15
+    jge .fdc_hit
+    mov al, [r14 + r8]
+    mov r9, r12
+    add r9, rdx
+    cmp al, [r9 + r8]
+    jne .fdc_slide_next
+    inc r8
+    jmp .fdc_cmp
+.fdc_slide_next:
+    inc rdx
+    jmp .fdc_slide
+.fdc_hit:
+    movzx eax, byte [dir_color_codes + rbx]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.fdc_pat_next:
+    inc rbx
+    jmp .fdc_pat_loop
+.fdc_none:
+    xor eax, eax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Splits at first whitespace. Pattern → dir_color_pool, code → 256-color
+; index parsed as decimal. Silently drops the line if the table is full,
+; if the pool is full, or if the value can't be split.
+config_add_dir_color:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rax, [dir_color_count]
+    cmp rax, DIR_COLOR_MAX
+    jge .cadc_done
+    ; r12 = pattern start
+    mov r12, rdi
+    ; Find first whitespace = pattern end
+    mov r13, rdi
+.cadc_find_ws:
+    movzx eax, byte [r13]
+    test al, al
+    jz .cadc_done                     ; no code → bad line
+    cmp al, ' '
+    je .cadc_have_end
+    cmp al, 9
+    je .cadc_have_end
+    inc r13
+    jmp .cadc_find_ws
+.cadc_have_end:
+    ; r13 = pattern end (whitespace position)
+    mov r14, r13
+    sub r14, r12                       ; r14 = pattern length
+    test r14, r14
+    jz .cadc_done                      ; empty pattern
+    ; Skip whitespace to code
+.cadc_skip_ws:
+    movzx eax, byte [r13]
+    test al, al
+    jz .cadc_done
+    cmp al, ' '
+    je .cadc_skip_one
+    cmp al, 9
+    je .cadc_skip_one
+    jmp .cadc_have_code
+.cadc_skip_one:
+    inc r13
+    jmp .cadc_skip_ws
+.cadc_have_code:
+    ; r13 = first non-whitespace after pattern → start of integer code
+    mov rdi, r13
+    call parse_int                     ; rax = code (256-color index)
+    test rax, rax
+    jz .cadc_done                      ; 0 = unset, treat as malformed
+    cmp rax, 255
+    ja .cadc_done
+    mov r15, rax                       ; r15 = code byte
+    ; Reserve space in dir_color_pool: pattern_length + 1 (NUL).
+    mov rbx, [dir_color_pool_pos]
+    mov rax, rbx
+    add rax, r14
+    inc rax
+    cmp rax, DIR_COLOR_POOL_SZ
+    jg .cadc_done                      ; pool full
+    lea rdi, [dir_color_pool + rbx]
+    mov rcx, [dir_color_count]
+    mov [dir_color_pat_ptrs + rcx*8], rdi
+    mov [dir_color_pat_lens + rcx*8], r14
+    mov al, r15b
+    mov [dir_color_codes + rcx], al
+    inc qword [dir_color_count]
+    ; Copy pattern bytes
+    mov rsi, r12
+    mov rcx, r14
+.cadc_copy:
+    test rcx, rcx
+    jz .cadc_copied
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jmp .cadc_copy
+.cadc_copied:
+    mov byte [rdi], 0
+    inc rdi
+    sub rdi, dir_color_pool
+    mov [dir_color_pool_pos], rdi
+.cadc_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; parse_int: rdi = string, returns rax = integer
 parse_int:
     xor rax, rax
@@ -10089,63 +11093,82 @@ print_prompt_dynamic:
     mov word [tmp_buf + r12], ': '
     add r12, 2
 
-    ; CWD with tilde substitution and color
-    movzx eax, byte [color_settings + C_CWD]
-    lea rdi, [tmp_buf + r12]
-    call write_fg_color
-    add r12, rax
-
-    ; Check if cwd starts with HOME for tilde substitution
+    ; CWD with tilde substitution and color. Phase 1: build the
+    ; displayed path into path_buf (~ substitution + optional trailing
+    ; '/'). Phase 2: scan dir_color patterns against the built path —
+    ; first hit wins, and its 256-color code applies to the WHOLE path
+    ; (matches rush's UX: a single matched substring colors the entire
+    ; rendered path, not just the matched range). No match → c_cwd.
+    push r13
+    xor r13, r13                    ; r13 = path_buf write index
     mov rdi, [envp]
     call find_env_home
     test rax, rax
-    jz .ppd_no_tilde
-    mov rsi, rax            ; HOME
+    jz .ppd_path_no_tilde
+    mov rsi, rax
     lea rdi, [cwd_buf]
-    ; Compare HOME prefix
-.ppd_cmp_home:
+.ppd_path_cmp_home:
     mov cl, [rsi]
     test cl, cl
-    jz .ppd_home_match
+    jz .ppd_path_home_match
     cmp cl, [rdi]
-    jne .ppd_no_tilde
+    jne .ppd_path_no_tilde
     inc rsi
     inc rdi
-    jmp .ppd_cmp_home
-.ppd_home_match:
-    ; cwd starts with HOME, replace with ~
-    mov byte [tmp_buf + r12], '~'
-    inc r12
-    ; Copy rest of cwd after HOME prefix
-.ppd_copy_cwd_rest:
+    jmp .ppd_path_cmp_home
+.ppd_path_home_match:
+    mov byte [path_buf + r13], '~'
+    inc r13
+.ppd_path_copy_rest:
     mov al, [rdi]
     test al, al
-    jz .ppd_cwd_done
-    mov [tmp_buf + r12], al
+    jz .ppd_path_built
+    mov [path_buf + r13], al
     inc rdi
-    inc r12
-    jmp .ppd_copy_cwd_rest
-
-.ppd_no_tilde:
-    ; Copy full cwd
+    inc r13
+    jmp .ppd_path_copy_rest
+.ppd_path_no_tilde:
     lea rsi, [cwd_buf]
-.ppd_copy_full_cwd:
+.ppd_path_copy_full:
     mov al, [rsi]
     test al, al
-    jz .ppd_cwd_done
-    mov [tmp_buf + r12], al
+    jz .ppd_path_built
+    mov [path_buf + r13], al
     inc rsi
+    inc r13
+    jmp .ppd_path_copy_full
+.ppd_path_built:
+    cmp r13, 1
+    jle .ppd_path_no_slash
+    cmp byte [path_buf + r13 - 1], '/'
+    je .ppd_path_no_slash
+    mov byte [path_buf + r13], '/'
+    inc r13
+.ppd_path_no_slash:
+    ; Decide foreground color: pattern match → its code, else c_cwd.
+    lea rdi, [path_buf]
+    mov rsi, r13
+    call find_dir_color_for_path        ; rax = code or 0
+    test rax, rax
+    jnz .ppd_path_have_dc_color
+    movzx eax, byte [color_settings + C_CWD]
+.ppd_path_have_dc_color:
+    lea rdi, [tmp_buf + r12]
+    call write_fg_color
+    add r12, rax
+    ; Emit the path bytes verbatim — color was just set above.
+    lea rsi, [path_buf]
+    xor rcx, rcx
+.ppd_path_emit_loop:
+    cmp rcx, r13
+    jge .ppd_path_emitted
+    mov al, [rsi + rcx]
+    mov [tmp_buf + r12], al
     inc r12
-    jmp .ppd_copy_full_cwd
-.ppd_cwd_done:
-    ; Add trailing / to indicate directory
-    cmp r12, 1
-    jle .ppd_skip_slash       ; don't add to bare "/" root
-    cmp byte [tmp_buf + r12 - 1], '/'
-    je .ppd_skip_slash        ; already has slash
-    mov byte [tmp_buf + r12], '/'
-    inc r12
-.ppd_skip_slash:
+    inc rcx
+    jmp .ppd_path_emit_loop
+.ppd_path_emitted:
+    pop r13
 
     ; Try to detect git branch
     call detect_git_branch
@@ -14052,7 +15075,7 @@ save_config:
     lea rbx, [color_name_table]
 .sc_color_loop:
     cmp r13, NUM_COLORS
-    jge .sc_settings
+    jge .sc_dir_colors
     ; "c_<name> = <value>\n"
     mov rax, SYS_WRITE
     mov rdi, r12
@@ -14096,6 +15119,50 @@ save_config:
     jmp .sc_color_loop
 
 .sc_c_pre: db "c_"
+
+.sc_dir_colors:
+    ; Write dir_color entries (round-trip the user's pattern table so
+    ; manual additions to ~/.barerc survive auto-save). Format:
+    ;   dir_color = <pattern> <code>\n
+    xor r13, r13
+.sc_dc_loop:
+    cmp r13, [dir_color_count]
+    jge .sc_dc_done
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [.sc_dir_color_pre]
+    mov rdx, .sc_dir_color_pre_len
+    syscall
+    ; Pattern
+    mov rsi, [dir_color_pat_ptrs + r13*8]
+    mov rdx, [dir_color_pat_lens + r13*8]
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    syscall
+    ; Space
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [.sc_dc_space]
+    mov rdx, 1
+    syscall
+    ; Code (decimal)
+    movzx eax, byte [dir_color_codes + r13]
+    lea rdi, [num_buf]
+    call itoa
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [num_buf]
+    syscall
+    ; Newline
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    inc r13
+    jmp .sc_dc_loop
+.sc_dc_done:
 
 .sc_settings:
     ; Write boolean/numeric settings
@@ -14295,6 +15362,9 @@ save_config:
 .sc_gnick_pre: db "gnick."
 .sc_abbrev_pre: db "abbrev."
 .sc_bm_pre: db "bm."
+.sc_dir_color_pre: db "dir_color = "
+.sc_dir_color_pre_len equ $ - .sc_dir_color_pre
+.sc_dc_space: db " "
 .sc_show_tips_true: db "show_tips = true", 10
 .sc_show_tips_true_len equ $ - .sc_show_tips_true
 .sc_show_tips_false: db "show_tips = false", 10
@@ -14770,7 +15840,9 @@ syntax_highlight_line:
     jmp .shl_char
 
 .shl_not_switch:
-    ; Default: copy character as-is
+    ; Default: copy character as-is. (Path-pattern coloring is handled
+    ; in the PROMPT cwd render, not here on arg tokens — that's where
+    ; the user wanted it per the rush UX.)
     lea rdi, [suggestion_buf]
     mov [rdi + rbx], al
     inc rbx
