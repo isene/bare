@@ -3223,7 +3223,6 @@ read_line:
 
     ; Insert remaining chars: match[prefix_len..match_len]
     sub rcx, rdx            ; chars to insert
-    test rcx, rcx
     jle .tab_add_space
     add rsi, rdx            ; point to remaining chars ("ME" for $HOME)
     ; Insert chars into line_buf at cursor
@@ -3761,7 +3760,6 @@ redraw_from_cursor:
     push r12
     mov rcx, [line_len]
     sub rcx, r12
-    test rcx, rcx
     jle .rfc_done
     mov rax, SYS_WRITE
     mov rdi, 1
