@@ -970,7 +970,7 @@ _start:
     ; Execute the command and exit
     mov rsi, [cmd_flag]
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .cmd_copy:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -1025,14 +1025,14 @@ _start:
     jz .no_tip
     ; Use PID as pseudo-random source
     mov rax, [my_pid]
-    xor rdx, rdx
+    xor edx, edx
     mov rcx, 10
     div rcx                  ; rdx = pid % 10
     cmp rdx, 3               ; show if remainder < 3 (~30%)
     jge .no_tip
     ; Pick tip: pid % tip_count
     mov rax, [my_pid]
-    xor rdx, rdx
+    xor edx, edx
     mov rcx, tip_count
     div rcx
     mov rsi, [tip_table + rdx*8]
@@ -1142,7 +1142,6 @@ _start:
     sub rax, [cmd_start_time]
     mov rcx, [cmd_end_time + 8]
     sub rcx, [cmd_start_time + 8]
-    test rcx, rcx
     jns .time_no_borrow
     dec rax
     add rcx, 1000000000
@@ -1278,7 +1277,7 @@ ensure_col_zero:
     test rax, rax
     jle .ecz_pop_buf
     mov rcx, rax              ; bytes read
-    xor rbx, rbx              ; scan position
+    xor ebx, ebx              ; scan position
 .ecz_find_esc:
     cmp rbx, rcx
     jge .ecz_pop_buf
@@ -1355,7 +1354,7 @@ read_line:
     jne .rl_interactive
 
     ; Non-interactive: read until newline or EOF
-    xor r12, r12
+    xor r12d, r12d
 .rl_pipe_read:
     mov rax, SYS_READ
     xor edi, edi
@@ -1390,7 +1389,7 @@ read_line:
     ; Enable raw mode for char-by-char input
     call enable_raw_mode
 
-    xor r12, r12            ; cursor position
+    xor r12d, r12d            ; cursor position
     mov qword [line_len], 0
     mov qword [prev_cursor_row], 0   ; cursor sits at end of prompt = row 0
 
@@ -1752,7 +1751,6 @@ read_line:
     lea rsi, [line_buf + r12 + 1]
     mov rcx, [line_len]
     sub rcx, r12
-    test rcx, rcx
     jz .bs_redraw
 .shift_left:
     mov al, [rsi]
@@ -1821,7 +1819,7 @@ read_line:
 .cls_save_seq: db 27, '[', 's'
 
 .clear_line:
-    xor r12, r12
+    xor r12d, r12d
     mov qword [line_len], 0
     mov byte [line_buf], 0
     call full_redraw
@@ -1840,7 +1838,7 @@ read_line:
 .clr_eol: db 27, '[', '0', 'K'
 
 .home:
-    xor r12, r12
+    xor r12d, r12d
     call reposition_cursor
     jmp .read_char
 
@@ -1924,7 +1922,7 @@ read_line:
     imul rcx, rax, 4096
     lea rsi, [undo_stack + rcx]
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .ua_copy:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -2095,7 +2093,7 @@ read_line:
 .eie_find_editor:
     ; Search env_array for EDITOR=
     push rbx
-    xor rcx, rcx
+    xor ecx, ecx
 .eie_fe_loop:
     cmp rcx, [env_count]
     jge .eie_fe_none
@@ -2178,8 +2176,8 @@ read_line:
     ; them anymore so they're inert.
     mov rdx, [hist_lines + rax*8]   ; rdx = template pointer (preserved
                                     ; across strcmp via push/pop below)
-    xor rcx, rcx                    ; rcx = read index
-    xor r8, r8                      ; r8  = write index
+    xor ecx, ecx                    ; rcx = read index
+    xor r8d, r8d                      ; r8  = write index
 .dhe_sug_filter:
     cmp rcx, [hist_count]
     jge .dhe_sug_filter_done
@@ -2264,7 +2262,7 @@ read_line:
     test rsi, rsi
     jz .dhe_clear
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .dhe_load:
     mov al, [rsi + rcx]
     test al, al
@@ -2286,7 +2284,7 @@ read_line:
     ; hist_count so the next Up restarts from the (new) tail.
     mov rax, [hist_count]
     mov [hist_pos], rax
-    xor r12, r12
+    xor r12d, r12d
     mov qword [line_len], 0
     mov byte [line_buf], 0
     call full_redraw
@@ -2416,7 +2414,7 @@ read_line:
     jz .rs_cancel
     mov rsi, rax
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .rs_copy:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -2817,7 +2815,6 @@ read_line:
     dec rcx
     mov [line_len], rcx
     sub rcx, r12
-    test rcx, rcx
     jz .del_redraw
 .del_shift:
     mov al, [rsi]
@@ -2875,7 +2872,7 @@ read_line:
     jz .hp_search_back
     ; Compare prefix
     lea rdi, [hist_prefix_buf]
-    xor rcx, rcx
+    xor ecx, ecx
     mov rdx, [hist_prefix_len]
 .hp_cmp:
     cmp rcx, rdx
@@ -2914,7 +2911,7 @@ read_line:
     jz .hn_search_fwd
     ; Compare prefix
     lea rdi, [hist_prefix_buf]
-    xor rcx, rcx
+    xor ecx, ecx
     mov rdx, [hist_prefix_len]
 .hn_cmp:
     cmp rcx, rdx
@@ -2935,7 +2932,7 @@ read_line:
     lea rsi, [hist_prefix_buf]
     lea rdi, [line_buf]
     mov rcx, [hist_prefix_len]
-    xor rax, rax
+    xor eax, eax
 .hn_restore:
     cmp rax, rcx
     jge .hn_restored
@@ -2961,7 +2958,7 @@ read_line:
     cmp rax, [hist_count]
     jl .hn_load
     ; At end: clear line
-    xor r12, r12
+    xor r12d, r12d
     mov qword [line_len], 0
     mov byte [line_buf], 0
     call full_redraw
@@ -2983,7 +2980,7 @@ read_line:
 .cancel_line:
     ; Leave cancelled text visible, print newline, fresh prompt
     call write_nl
-    xor r12, r12
+    xor r12d, r12d
     mov qword [line_len], 0
     mov byte [line_buf], 0
     mov qword [suggestion_len], 0
@@ -3087,7 +3084,7 @@ read_line:
 .tab_start_found:
     test rcx, rcx
     jns .tab_start_ok
-    xor rcx, rcx
+    xor ecx, ecx
 .tab_start_ok:
     ; rcx = start of word, r12 = cursor (end of word)
     push r14
@@ -3124,7 +3121,7 @@ read_line:
     jz .tab_command_completion
 
     ; Check if everything before r14 is spaces
-    xor rdi, rdi
+    xor edi, edi
 .tab_check_prev:
     cmp rdi, r14
     jge .tab_command_completion
@@ -3298,7 +3295,7 @@ read_line:
 
 .tab_multiple:
     ; ── Interactive tab cycling ──
-    xor r15, r15             ; r15 = current selection index
+    xor r15d, r15d             ; r15 = current selection index
 
 .tab_cycle_redraw:
     ; Refresh prompt + previewed line FIRST so the candidate list
@@ -3313,7 +3310,7 @@ read_line:
     mov rdx, 3
     syscall
     call write_nl
-    xor rcx, rcx
+    xor ecx, ecx
 .tab_cycle_print:
     ; Limit display to completion_limit
     mov rax, [completion_limit]
@@ -3480,7 +3477,7 @@ read_line:
     inc r15
     cmp r15, [tab_count]
     jl .tab_cycle_erase
-    xor r15, r15             ; wrap around
+    xor r15d, r15d             ; wrap around
     jmp .tab_cycle_erase
 
 .tab_cycle_prev:
@@ -3650,7 +3647,7 @@ read_line:
     ; Copy line prefix (before word) to suggestion_buf as temp
     lea rdi, [suggestion_buf]
     lea rsi, [line_buf]
-    xor rax, rax
+    xor eax, eax
 .tps_copy_pre:
     cmp rax, r14
     jge .tps_copy_match
@@ -3662,7 +3659,7 @@ read_line:
     ; Copy match
     push rax                 ; save output position
     mov rsi, [tab_results + r15*8]
-    xor rcx, rcx
+    xor ecx, ecx
 .tps_cm:
     movzx edx, byte [rsi + rcx]
     test dl, dl
@@ -3684,7 +3681,7 @@ read_line:
     ; Copy back to line_buf
     lea rsi, [suggestion_buf]
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .tps_cb:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -3740,7 +3737,7 @@ load_hist_line:
     jz .lhl_ret
     ; Copy to line_buf
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .lhl_copy:
     mov al, [rsi + rcx]
     test al, al
@@ -3896,7 +3893,7 @@ full_redraw:
     lea rsi, [suggestion_buf]
     mov rdi, [render_pos]
     lea rdi, [render_buf + rdi]
-    xor rax, rax
+    xor eax, eax
 .fd_copy_hl:
     cmp rax, rcx
     jge .fd_copy_done
@@ -3914,7 +3911,7 @@ full_redraw:
     lea rsi, [line_buf]
     mov rdi, [render_pos]
     lea rdi, [render_buf + rdi]
-    xor rax, rax
+    xor eax, eax
 .fd_plain_copy:
     cmp rax, rcx
     jge .fd_plain_done
@@ -4058,7 +4055,7 @@ expand_line:
 
     lea rsi, [line_buf]     ; source
     lea rdi, [expand_buf]   ; destination
-    xor r12, r12            ; output position
+    xor r12d, r12d            ; output position
     mov r14, 4090           ; max output size
 
 .exp_loop:
@@ -4318,7 +4315,7 @@ expand_line:
     ; Copy expand_buf back to line_buf
     lea rsi, [expand_buf]
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .exp_copyback:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -4374,7 +4371,7 @@ lookup_env_var:
     mov r12, rdi            ; save var name
 
     ; First search env_array (custom env)
-    xor rcx, rcx
+    xor ecx, ecx
 .lev_loop:
     cmp rcx, [env_count]
     jge .lev_notfound
@@ -4436,7 +4433,7 @@ execute_chained_line:
     call parse_chain
 
     ; Execute each command in sequence
-    xor r12, r12             ; chain index
+    xor r12d, r12d             ; chain index
 .chain_loop:
     cmp r12, [chain_count]
     jge .chain_done
@@ -5060,7 +5057,7 @@ execute_line:
     test rcx, rcx
     jz .mp_single            ; shouldn't happen but safety
     mov r12, rcx             ; r12 = num pipes
-    xor r13, r13             ; pipe index
+    xor r13d, r13d             ; pipe index
 .mp_create_pipes:
     cmp r13, r12
     jge .mp_pipes_created
@@ -5074,7 +5071,7 @@ execute_line:
 .mp_pipes_created:
 
     ; Step 3: fork children for each segment
-    xor r13, r13             ; segment index
+    xor r13d, r13d             ; segment index
 .mp_fork_loop:
     cmp r13, [pipe_seg_count]
     jge .mp_parent_cleanup
@@ -5115,7 +5112,7 @@ execute_line:
 
 .mp_child_no_stdout:
     ; Close ALL pipe fds in child
-    xor r14, r14
+    xor r14d, r14d
 .mp_child_close:
     cmp r14, r12
     jge .mp_child_exec
@@ -5138,7 +5135,7 @@ execute_line:
 
 .mp_parent_cleanup:
     ; Parent: close all pipe fds
-    xor r13, r13
+    xor r13d, r13d
 .mp_close_all:
     cmp r13, r12
     jge .mp_wait_all
@@ -5155,7 +5152,7 @@ execute_line:
     ; Wait for all children
     sub rsp, 16
     mov r14, [pipe_seg_count]
-    xor r13, r13
+    xor r13d, r13d
 .mp_wait_loop:
     cmp r13, r14
     jge .mp_wait_done
@@ -5218,7 +5215,7 @@ extract_env_prefix:
     push rbx
     push r12
     mov qword [env_prefix_count], 0
-    xor r12, r12                          ; index into argv
+    xor r12d, r12d                          ; index into argv
 .eep_loop:
     cmp r12, [argc]
     jge .eep_done
@@ -5302,7 +5299,7 @@ extract_env_prefix:
 apply_env_prefix:
     push rbx
     push r12
-    xor r12, r12
+    xor r12d, r12d
 .aep_loop:
     cmp r12, [env_prefix_count]
     jge .aep_done
@@ -5381,7 +5378,7 @@ parse_and_exec_simple:
     mov rdi, [r13]
     test rdi, rdi
     jz .paes_done
-    xor rcx, rcx
+    xor ecx, ecx
 .paes_bm_loop:
     cmp rcx, [bm_count]
     jge .paes_not_bm
@@ -5780,8 +5777,8 @@ parse_and_exec_child_argv:
     ; $EDITOR/vim path so file-open still works on minimal systems.
 
     ; Find $EDITOR
-    xor r13, r13
-    xor rcx, rcx
+    xor r13d, r13d
+    xor ecx, ecx
 .ae_find_editor:
     cmp rcx, [env_count]
     jge .ae_editor_fallback
@@ -5797,7 +5794,7 @@ parse_and_exec_child_argv:
     lea r13, [rsi+7]
     cmp byte [r13], 0
     jne .ae_have_editor
-    xor r13, r13
+    xor r13d, r13d
     jmp .ae_editor_fallback
 .ae_fe_next:
     inc rcx
@@ -6253,7 +6250,7 @@ check_builtin:
     ; Copy prev_dir to tmp_buf (target)
     lea rsi, [prev_dir]
     lea rdi, [path_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .cd_dash_cp:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -6352,7 +6349,7 @@ check_builtin:
     jmp .export_done
 .export_no_arg:
     ; Just "export" with no args: print all env vars
-    xor rcx, rcx
+    xor ecx, ecx
 .export_print_loop:
     cmp rcx, [env_count]
     jge .export_done
@@ -6402,7 +6399,7 @@ check_builtin:
 
 .bi_history:
     ; Print all history entries with line numbers
-    xor rcx, rcx
+    xor ecx, ecx
 .hist_print_loop:
     cmp rcx, [hist_count]
     jge .hist_print_done
@@ -6530,7 +6527,7 @@ init_env_array:
     je .iea_done
 
     mov rbx, [envp]
-    xor r12, r12             ; count
+    xor r12d, r12d             ; count
 .iea_loop:
     mov rax, [rbx]
     test rax, rax
@@ -6563,7 +6560,7 @@ env_set_entry:
 
     ; Find '=' to determine var name length
     mov rsi, rdi
-    xor rcx, rcx
+    xor ecx, ecx
 .ese_find_eq:
     cmp byte [rsi + rcx], '='
     je .ese_found_eq
@@ -6609,7 +6606,7 @@ env_set_entry:
     add [env_storage_pos], rax
 
     ; Search for existing entry with same var name
-    xor rcx, rcx
+    xor ecx, ecx
 .ese_search:
     cmp rcx, [env_count]
     jge .ese_add_new
@@ -6673,7 +6670,7 @@ env_remove_entry:
     call strlen
     mov r13, rax             ; var name length
 
-    xor rcx, rcx
+    xor ecx, ecx
 .ere_search:
     cmp rcx, [env_count]
     jge .ere_done
@@ -6743,8 +6740,8 @@ glob_expand_argv:
     mov qword [expanded_argv], 0
     mov qword [glob_buf_pos], 0
 
-    xor r12, r12             ; source argv index
-    xor r13, r13             ; dest expanded index
+    xor r12d, r12d             ; source argv index
+    xor r13d, r13d             ; dest expanded index
     mov r14, 0               ; flag: did any expansion happen?
 
 .gea_loop:
@@ -6772,7 +6769,7 @@ glob_expand_argv:
 
     ; Add all matches to expanded_argv
     mov r14, 1               ; expansion happened
-    xor rcx, rcx
+    xor ecx, ecx
 .gea_add_matches:
     cmp rcx, [glob_count]
     jge .gea_next
@@ -6875,7 +6872,7 @@ glob_recursive:
 .gr_cp_pre:
     test rcx, rcx
     jz .gr_prefix_dot
-    xor rax, rax
+    xor eax, eax
 .gr_cp_pre_loop:
     cmp rax, rcx
     jge .gr_cp_pre_done
@@ -6927,7 +6924,7 @@ glob_recursive:
     test rax, rax
     jle .gr_close
 
-    xor rcx, rcx
+    xor ecx, ecx
 .gr_entry:
     cmp rcx, rax
     jge .gr_scan
@@ -6991,7 +6988,7 @@ glob_recursive:
     lea rdi, [glob_buf + rdx]
     lea rsi, [glob_path_buf]
     push rcx
-    xor rax, rax
+    xor eax, eax
 .gr_cp_result:
     cmp rax, rcx
     jge .gr_cp_result_done
@@ -7038,7 +7035,7 @@ glob_recursive:
     add rdi, [glob_queue_wpos]
     lea rsi, [glob_path_buf]
     push rax
-    xor rcx, rcx
+    xor ecx, ecx
 .gr_cp_queue:
     cmp rcx, rax
     jge .gr_cp_queue_done
@@ -7122,8 +7119,8 @@ glob_expand_single:
     ; Split into directory and pattern parts
     ; Find last '/' in pattern
     mov rsi, r12
-    xor r13, r13             ; last slash position (0 = none)
-    xor rcx, rcx
+    xor r13d, r13d             ; last slash position (0 = none)
+    xor ecx, ecx
 .ges_find_slash:
     movzx eax, byte [rsi + rcx]
     test al, al
@@ -7195,7 +7192,7 @@ glob_expand_single:
     jle .ges_close
 
     ; Process entries
-    xor rcx, rcx             ; offset into buffer
+    xor ecx, ecx             ; offset into buffer
 .ges_entry_loop:
     cmp rcx, rax
     jge .ges_read_loop
@@ -7258,7 +7255,7 @@ glob_expand_single:
 .ges_prefix_done:
     ; Copy entry name after prefix
     pop rsi                  ; restore d_name as source
-    xor rcx, rcx
+    xor ecx, ecx
 .ges_copy_prefixed_name:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -7290,7 +7287,7 @@ glob_expand_single:
     ; rdi = name pointer
     mov rsi, rdi
     mov rdi, rbx
-    xor rcx, rcx
+    xor ecx, ecx
 .ges_copy_name:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -7545,7 +7542,7 @@ tab_complete_command:
     test rax, rax
     jle .tcc_close_dir
 
-    xor rcx, rcx
+    xor ecx, ecx
 .tcc_entry_loop:
     cmp rcx, rax
     jge .tcc_read_entries
@@ -7583,7 +7580,7 @@ tab_complete_command:
 
     ; Dedup: check if this name already exists in tab_results
     push rdi
-    xor rcx, rcx
+    xor ecx, ecx
 .tcc_dedup:
     cmp rcx, [tab_count]
     jge .tcc_dedup_ok
@@ -7607,7 +7604,7 @@ tab_complete_command:
     mov rcx, [tab_buf_pos]
     lea rbx, [tab_buf + rcx]
     mov rsi, rdi
-    xor rcx, rcx
+    xor ecx, ecx
 .tcc_copy_match:
     mov al, [rsi + rcx]
     mov [rbx + rcx], al
@@ -7759,8 +7756,8 @@ tab_complete_file:
 
     ; Check for directory prefix in the partial name
     mov rsi, r12
-    xor r14, r14             ; last slash pos (0 = none)
-    xor rcx, rcx
+    xor r14d, r14d             ; last slash pos (0 = none)
+    xor ecx, ecx
 .tcf_find_slash:
     movzx eax, byte [rsi + rcx]
     test al, al
@@ -7830,7 +7827,7 @@ tab_complete_file:
     test rax, rax
     jle .tcf_close
 
-    xor rcx, rcx
+    xor ecx, ecx
 .tcf_entry_loop:
     cmp rcx, rax
     jge .tcf_read_entries
@@ -7913,7 +7910,7 @@ tab_complete_file:
 
 .tcf_copy_name_only:
     mov rsi, rdi
-    xor rcx, rcx
+    xor ecx, ecx
 .tcf_copy_match:
     mov al, [rsi + rcx]
     mov [r9 + rcx], al
@@ -7988,7 +7985,7 @@ tab_find_common_prefix:
     ; Compare tab_results[0] with tab_results[rcx]
     mov rsi, [tab_results]
     mov rdi, [tab_results + rcx*8]
-    xor rbx, rbx
+    xor ebx, ebx
 .tfcp_cmp:
     cmp rbx, r12
     jge .tfcp_cmp_done
@@ -8188,7 +8185,7 @@ lscolors_init:
     jne .lci_next
     lea rsi, [rdi + 10]               ; value start
     mov rdi, lscolors_buf
-    xor r12, r12
+    xor r12d, r12d
 .lci_copy:
     mov al, [rsi]
     test al, al
@@ -8214,7 +8211,7 @@ lscolors_init:
     jne .lci_real_done
     lea rsi, [default_ls_colors]
     mov rdi, lscolors_buf
-    xor r12, r12
+    xor r12d, r12d
 .lci_def_copy:
     mov al, [rsi]
     test al, al
@@ -8246,7 +8243,7 @@ lscolors_lookup:
     cmp byte [r8], 0
     je .ll_none
     ; Compare pattern at r8.
-    xor rcx, rcx
+    xor ecx, ecx
 .ll_cmp:
     cmp rcx, rsi
     jge .ll_check_eq
@@ -8413,7 +8410,7 @@ lscolors_color_for_entry:
     add rdx, rcx
     sub rdx, rax                      ; rdx = filename tail start
     lea rdi, [r8 + 1]                 ; pattern start
-    xor rcx, rcx
+    xor ecx, ecx
 .lcfe_sx_cmp:
     cmp rcx, rax
     jge .lcfe_sx_match
@@ -8714,7 +8711,7 @@ add_history:
     ; Full dedup: skip if anywhere in history
     test rax, (1 << CFG_HIST_DEDUP_FULL)
     jz .ah_no_dedup
-    xor rcx, rcx
+    xor ecx, ecx
 .ah_full_scan:
     cmp rcx, [hist_count]
     jge .ah_no_dedup
@@ -8765,7 +8762,7 @@ add_history:
     ; rewrite_history at next sync point because save_history is append-
     ; only and would otherwise re-emit duplicates.
     push rbx
-    xor rbx, rbx
+    xor ebx, ebx
 .ah_shift_loop:
     mov rax, rbx
     inc rax
@@ -8885,7 +8882,7 @@ load_history:
     push rbx
     mov rbx, rcx
     sub rbx, MAX_HIST         ; rbx = entries to drop from the front
-    xor rax, rax
+    xor eax, eax
 .lh_trim:
     cmp rax, MAX_HIST
     jge .lh_trim_done
@@ -8923,7 +8920,7 @@ rewrite_history:
     test rax, rax
     js .rh_done
     mov r12, rax                         ; fd
-    xor r13, r13
+    xor r13d, r13d
 .rh_loop:
     cmp r13, [hist_count]
     jge .rh_close
@@ -9268,7 +9265,7 @@ init_exe_cache:
     test rax, rax
     jle .iec_close_dir
 
-    xor r12, r12
+    xor r12d, r12d
 .iec_entry_loop:
     cmp r12, rax
     jge .iec_read_entries
@@ -9773,7 +9770,7 @@ build_config_path:
 init_username:
     push rbx
     ; Look for USER= in env_array
-    xor rcx, rcx
+    xor ecx, ecx
 .iu_loop:
     cmp rcx, [env_count]
     jge .iu_default
@@ -10643,7 +10640,7 @@ config_set_color:
     mov r13, rdi            ; color name
 
     ; Search color_name_table for matching name
-    xor rbx, rbx
+    xor ebx, ebx
 .cs_search:
     cmp rbx, NUM_COLORS
     jge .cs_done
@@ -10723,12 +10720,12 @@ emit_path_token:
     mov r15, rdx
     mov [emit_path_restore_ptr], rcx
     mov [emit_path_restore_len], r8
-    xor rbx, rbx
+    xor ebx, ebx
 .ept_loop:
     cmp rbx, r13
     jge .ept_done
     ; Try each configured pattern at position rbx.
-    xor rcx, rcx
+    xor ecx, ecx
 .ept_try:
     cmp rcx, [dir_color_count]
     jge .ept_no_match
@@ -10739,7 +10736,7 @@ emit_path_token:
     jg .ept_next_pat
     mov rsi, [dir_color_pat_ptrs + rcx*8]
     lea r9, [r12 + rbx]
-    xor rdx, rdx
+    xor edx, edx
 .ept_cmp:
     cmp rdx, rdi
     jge .ept_match
@@ -10777,14 +10774,14 @@ emit_path_token:
     cmp rax, 100
     jl .ept_code_lt100
     mov rcx, 100
-    xor rdx, rdx
+    xor edx, edx
     div rcx
     add al, '0'
     mov [rdi], al
     inc rdi
     mov rax, rdx
     mov rcx, 10
-    xor rdx, rdx
+    xor edx, edx
     div rcx
     add al, '0'
     mov [rdi], al
@@ -10797,7 +10794,7 @@ emit_path_token:
     cmp rax, 10
     jl .ept_code_lt10
     mov rcx, 10
-    xor rdx, rdx
+    xor edx, edx
     div rcx
     add al, '0'
     mov [rdi], al
@@ -10879,7 +10876,7 @@ find_dir_color_for_path:
     mov rax, [dir_color_count]
     test rax, rax
     jz .fdc_none
-    xor rbx, rbx
+    xor ebx, ebx
 .fdc_pat_loop:
     cmp rbx, [dir_color_count]
     jge .fdc_none
@@ -10892,11 +10889,11 @@ find_dir_color_for_path:
     mov rcx, r13
     sub rcx, r15
     inc rcx
-    xor rdx, rdx
+    xor edx, edx
 .fdc_slide:
     cmp rdx, rcx
     jge .fdc_pat_next
-    xor r8, r8
+    xor r8d, r8d
 .fdc_cmp:
     cmp r8, r15
     jge .fdc_hit
@@ -10960,7 +10957,6 @@ config_add_dir_color:
     ; r13 = pattern end (whitespace position)
     mov r14, r13
     sub r14, r12                       ; r14 = pattern length
-    test r14, r14
     jz .cadc_done                      ; empty pattern
     ; Skip whitespace to code
 .cadc_skip_ws:
@@ -11025,8 +11021,8 @@ config_add_dir_color:
 
 ; parse_int: rdi = string, returns rax = integer
 parse_int:
-    xor rax, rax
-    xor rcx, rcx
+    xor eax, eax
+    xor ecx, ecx
 .pi_loop:
     movzx ecx, byte [rdi]
     test cl, cl
@@ -11188,7 +11184,7 @@ print_prompt_dynamic:
     ; (matches rush's UX: a single matched substring colors the entire
     ; rendered path, not just the matched range). No match → c_cwd.
     push r13
-    xor r13, r13                    ; r13 = path_buf write index
+    xor r13d, r13d                    ; r13 = path_buf write index
     mov rdi, [envp]
     call find_env_home
     test rax, rax
@@ -11246,7 +11242,7 @@ print_prompt_dynamic:
     add r12, rax
     ; Emit the path bytes verbatim — color was just set above.
     lea rsi, [path_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .ppd_path_emit_loop:
     cmp rcx, r13
     jge .ppd_path_emitted
@@ -11366,8 +11362,8 @@ print_prompt_dynamic:
     inc r12
 
     ; Calculate visible prompt width (scan tmp_buf, skip ANSI escapes)
-    xor rbx, rbx            ; visible char count
-    xor rcx, rcx            ; position in buffer
+    xor ebx, ebx            ; visible char count
+    xor ecx, ecx            ; position in buffer
 .ppd_vis_count:
     cmp rcx, r12
     jge .ppd_vis_done
@@ -11420,7 +11416,7 @@ print_prompt_dynamic:
     mov rcx, r12
     mov rdi, [render_pos]
     lea rdi, [render_buf + rdi]
-    xor rax, rax
+    xor eax, eax
 .ppd_buf_copy:
     cmp rax, rcx
     jge .ppd_buf_done
@@ -11524,7 +11520,6 @@ detect_git_branch:
     ; Copy truncated path to git_head_buf temporarily
     mov rcx, rsi
     sub rcx, r12
-    test rcx, rcx
     jz .dgb_not_found
     lea rdi, [git_head_buf]
     mov rsi, r12
@@ -11543,7 +11538,6 @@ detect_git_branch:
     call strcpy_rsi_rdi
     ; Strip /.git/HEAD from end (10 chars)
     sub rax, 10
-    test rax, rax
     js .dgb_root_ok
     mov byte [git_root_buf + rax], 0
 .dgb_root_ok:
@@ -11632,7 +11626,7 @@ expand_nicks:
     jz .en_no
 
     ; Search nick_names
-    xor rcx, rcx
+    xor ecx, ecx
 .en_search:
     cmp rcx, [nick_count]
     jge .en_no
@@ -11767,7 +11761,7 @@ handle_nick:
 .hn_delete:
     ; Delete nick by name (skip the '-')
     lea rdi, [rdi + 1]
-    xor rcx, rcx
+    xor ecx, ecx
 .hn_del_search:
     cmp rcx, [nick_count]
     jge .hn_done
@@ -11797,7 +11791,7 @@ handle_nick:
     jmp .hn_del_shift
 
 .hn_list:
-    xor rcx, rcx
+    xor ecx, ecx
 .hn_list_loop:
     cmp rcx, [nick_count]
     jge .hn_done
@@ -11903,7 +11897,7 @@ handle_gnick:
 
 .hg_delete:
     lea rdi, [rdi + 1]
-    xor rcx, rcx
+    xor ecx, ecx
 .hg_del_search:
     cmp rcx, [gnick_count]
     jge .hg_done
@@ -11932,7 +11926,7 @@ handle_gnick:
     jmp .hg_del_shift
 
 .hg_list:
-    xor rcx, rcx
+    xor ecx, ecx
 .hg_list_loop:
     cmp rcx, [gnick_count]
     jge .hg_done
@@ -12028,7 +12022,7 @@ handle_abbrev:
 
 .hab_delete:
     lea rdi, [rdi + 1]
-    xor rcx, rcx
+    xor ecx, ecx
 .hab_del_search:
     cmp rcx, [abbrev_count]
     jge .hab_done
@@ -12057,7 +12051,7 @@ handle_abbrev:
     jmp .hab_del_shift
 
 .hab_list:
-    xor rcx, rcx
+    xor ecx, ecx
 .hab_list_loop:
     cmp rcx, [abbrev_count]
     jge .hab_done
@@ -12486,7 +12480,7 @@ handle_bm:
 
 .hbm_delete:
     lea rdi, [rdi + 1]      ; skip '-'
-    xor rcx, rcx
+    xor ecx, ecx
 .hbm_del_search:
     cmp rcx, [bm_count]
     jge .hbm_done
@@ -12519,7 +12513,7 @@ handle_bm:
 .hbm_search:
     ; Search by tag
     lea rbx, [rdi + 1]      ; tag to search for (skip '?')
-    xor rcx, rcx
+    xor ecx, ecx
 .hbm_tag_loop:
     cmp rcx, [bm_count]
     jge .hbm_done
@@ -12542,7 +12536,7 @@ handle_bm:
     jmp .hbm_tag_loop
 
 .hbm_list:
-    xor rcx, rcx
+    xor ecx, ecx
 .hbm_list_loop:
     cmp rcx, [bm_count]
     jge .hbm_done
@@ -12650,7 +12644,7 @@ strstr_simple:
 
 ; :dirs handler
 handle_dirs:
-    xor rcx, rcx
+    xor ecx, ecx
 .hd_loop:
     cmp rcx, [dir_hist_count]
     jge .hd_done
@@ -12847,7 +12841,7 @@ add_dir_history:
     cmp rax, MAX_DIR_HISTORY
     jl .adh_ok
     ; Full: shift pointers down, reuse storage (don't reclaim, just drop oldest pointer)
-    xor rcx, rcx
+    xor ecx, ecx
 .adh_shift:
     mov rdx, rcx
     inc rdx
@@ -12866,7 +12860,7 @@ add_dir_history:
     add rdi, [dir_hist_pos]
     mov [dir_history + rax*8], rdi
     lea rsi, [cwd_buf]
-    xor r12, r12             ; byte counter
+    xor r12d, r12d             ; byte counter
 .adh_copy:
     mov cl, [rsi]
     mov [rdi], cl
@@ -12900,7 +12894,7 @@ find_reverse_match:
 
     mov r12, [hist_count]
     dec r12                  ; start from most recent
-    xor r13, r13             ; matches skipped so far
+    xor r13d, r13d             ; matches skipped so far
 
 .frm_loop:
     test r12, r12
@@ -12966,7 +12960,7 @@ find_history_suggestion:
 
     ; Check if this entry starts with line_buf content
     lea rsi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .fhs_prefix_cmp:
     cmp rcx, r12
     jge .fhs_prefix_match
@@ -13018,7 +13012,7 @@ expand_history:
 
     lea rsi, [line_buf]
     lea rdi, [expand_buf]
-    xor r12, r12            ; output position
+    xor r12d, r12d            ; output position
     mov r14, 4090
 
 .eh_loop:
@@ -13070,7 +13064,7 @@ expand_history:
     ; !-N = Nth from end
     add rsi, 2              ; skip !-
     ; Parse number
-    xor rax, rax
+    xor eax, eax
 .eh_bm_parse:
     movzx ecx, byte [rsi]
     sub cl, '0'
@@ -13095,7 +13089,7 @@ expand_history:
 .eh_bang_num:
     ; !N = absolute history number (1-based)
     inc rsi                 ; skip !
-    xor rax, rax
+    xor eax, eax
 .eh_bn_parse:
     movzx ecx, byte [rsi]
     sub cl, '0'
@@ -13164,7 +13158,7 @@ expand_history:
     ; Copy back to line_buf
     lea rsi, [expand_buf]
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .eh_copyback:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -13194,7 +13188,7 @@ expand_cmd_subst:
 
     lea rsi, [line_buf]
     lea rdi, [subst_buf]
-    xor r12, r12            ; output position
+    xor r12d, r12d            ; output position
     mov r14, 8190
 
 .ecs_loop:
@@ -13215,7 +13209,7 @@ expand_cmd_subst:
     ; Found $(, find matching )
     add rsi, 2              ; skip $(
     mov r13, rsi            ; start of command
-    xor r15, r15            ; paren depth
+    xor r15d, r15d            ; paren depth
     inc r15                 ; depth = 1
 .ecs_find_close:
     cmp byte [rsi], 0
@@ -13263,7 +13257,7 @@ expand_cmd_subst:
 
     ; Read output into subst_tmp
     lea r15, [subst_tmp]
-    xor r13, r13            ; bytes read total
+    xor r13d, r13d            ; bytes read total
 .ecs_read_loop:
     mov rax, SYS_READ
     mov edi, [pipe_fds]
@@ -13412,7 +13406,7 @@ expand_cmd_subst:
     ; Copy back to line_buf
     lea rsi, [subst_buf]
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .ecs_copyback:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -13451,7 +13445,7 @@ expand_braces:
 
     lea rsi, [line_buf]
     lea rdi, [brace_buf]
-    xor r12, r12            ; output position
+    xor r12d, r12d            ; output position
 
 .eb_loop:
     movzx eax, byte [rsi]
@@ -13471,7 +13465,7 @@ expand_braces:
     ; Validate: must contain comma and closing }
     mov rcx, rsi
     inc rcx
-    xor r15, r15
+    xor r15d, r15d
 .eb_validate:
     cmp byte [rcx], 0
     je .eb_copy
@@ -13663,7 +13657,7 @@ expand_braces:
     ; Copy back to line_buf
     lea rsi, [brace_buf]
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .eb_cb:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -13715,7 +13709,6 @@ try_expand_abbrev:
     ; Extract word
     mov rcx, r12
     sub rcx, r13
-    test rcx, rcx
     jz .tea_no
     cmp rcx, 250
     jg .tea_no
@@ -13736,7 +13729,7 @@ try_expand_abbrev:
     pop rcx
 
     ; Search abbreviations
-    xor r14, r14
+    xor r14d, r14d
 .tea_search:
     cmp r14, [abbrev_count]
     jge .tea_no
@@ -13759,7 +13752,7 @@ try_expand_abbrev:
     ; Rebuild line in suggestion_buf
     lea rdi, [suggestion_buf]
     lea rsi, [line_buf]
-    xor rax, rax
+    xor eax, eax
     ; Copy prefix (before word)
 .tea_cp_pre:
     cmp rax, r13
@@ -13772,7 +13765,7 @@ try_expand_abbrev:
     ; Copy expansion
     push rax
     mov rsi, [abbrev_values + r14*8]
-    xor rdx, rdx
+    xor edx, edx
 .tea_cp_exp_ch:
     cmp rdx, rcx
     jge .tea_cp_space
@@ -13820,7 +13813,7 @@ try_expand_abbrev:
     ; Copy back to line_buf
     lea rsi, [suggestion_buf]
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .tea_cb:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -13857,13 +13850,13 @@ expand_gnicks:
     je .eg_done
 
     ; Up to 3 expansion passes
-    xor r14, r14
+    xor r14d, r14d
 .eg_pass:
     cmp r14, 3
     jge .eg_done
-    xor r13, r13             ; found-any flag
+    xor r13d, r13d             ; found-any flag
 
-    xor r12, r12
+    xor r12d, r12d
 .eg_nick_loop:
     cmp r12, [gnick_count]
     jge .eg_pass_done
@@ -13891,7 +13884,7 @@ expand_gnicks:
     sub rdx, rsi             ; prefix length
     push rdx
     push rcx
-    xor rcx, rcx
+    xor ecx, ecx
     test rdx, rdx
     jz .eg_cp_val
 .eg_cp_pre:
@@ -13907,7 +13900,7 @@ expand_gnicks:
     mov rcx, rdx             ; output position
     push rcx
     mov rsi, [gnick_values + r12*8]
-    xor rdx, rdx
+    xor edx, edx
 .eg_cv:
     cmp rdx, rax
     jge .eg_cp_suf
@@ -13931,7 +13924,7 @@ expand_gnicks:
 .eg_replace_done:
     lea rsi, [suggestion_buf]
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .eg_rcb:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -14136,7 +14129,7 @@ handle_jobs:
     ; First, reap any finished background jobs
     call reap_jobs
 
-    xor r12, r12
+    xor r12d, r12d
 .hj_loop:
     cmp r12, [job_count]
     jge .hj_done
@@ -14385,7 +14378,7 @@ reap_jobs:
     push r12
     sub rsp, 16
 
-    xor r12, r12
+    xor r12d, r12d
 .rj_loop:
     cmp r12, [job_count]
     jge .rj_done
@@ -14427,7 +14420,7 @@ handle_theme:
 
     ; Find theme by name
     lea r13, [theme_names]
-    xor rcx, rcx
+    xor ecx, ecx
 .ht_search:
     mov rsi, [r13 + rcx*8]
     test rsi, rsi
@@ -14470,7 +14463,7 @@ handle_theme:
     mov rdx, .ht_avail_len
     syscall
     lea r13, [theme_names]
-    xor rcx, rcx
+    xor ecx, ecx
 .ht_list_loop:
     mov rsi, [r13 + rcx*8]
     test rsi, rsi
@@ -14604,7 +14597,7 @@ handle_env:
 
 .henv_list:
     ; Print first 30 env vars
-    xor rcx, rcx
+    xor ecx, ecx
 .henv_list_loop:
     cmp rcx, [env_count]
     jge .henv_done
@@ -14823,7 +14816,7 @@ handle_config:
     ; Print all colors with preview
     push rbx
     lea rbx, [.hcfg_color_names]
-    xor rcx, rcx
+    xor ecx, ecx
 .hcfg_color_loop:
     cmp rcx, NUM_COLORS
     jge .hcfg_colors_done
@@ -15009,7 +15002,7 @@ save_config:
     mov r12, rax             ; fd
 
     ; Write nicks
-    xor r13, r13
+    xor r13d, r13d
 .sc_nick_loop:
     cmp r13, [nick_count]
     jge .sc_gnicks
@@ -15047,7 +15040,7 @@ save_config:
     jmp .sc_nick_loop
 
 .sc_gnicks:
-    xor r13, r13
+    xor r13d, r13d
 .sc_gnick_loop:
     cmp r13, [gnick_count]
     jge .sc_abbrevs
@@ -15084,7 +15077,7 @@ save_config:
     jmp .sc_gnick_loop
 
 .sc_abbrevs:
-    xor r13, r13
+    xor r13d, r13d
 .sc_abbrev_loop:
     cmp r13, [abbrev_count]
     jge .sc_bookmarks
@@ -15121,7 +15114,7 @@ save_config:
     jmp .sc_abbrev_loop
 
 .sc_bookmarks:
-    xor r13, r13
+    xor r13d, r13d
 .sc_bm_loop:
     cmp r13, [bm_count]
     jge .sc_colors
@@ -15159,7 +15152,7 @@ save_config:
 
 .sc_colors:
     ; Write color settings
-    xor r13, r13
+    xor r13d, r13d
     lea rbx, [color_name_table]
 .sc_color_loop:
     cmp r13, NUM_COLORS
@@ -15212,7 +15205,7 @@ save_config:
     ; Write dir_color entries (round-trip the user's pattern table so
     ; manual additions to ~/.barerc survive auto-save). Format:
     ;   dir_color = <pattern> <code>\n
-    xor r13, r13
+    xor r13d, r13d
 .sc_dc_loop:
     cmp r13, [dir_color_count]
     jge .sc_dc_done
@@ -15521,7 +15514,7 @@ save_undo_state:
     imul rcx, rax, 4096
     lea rdi, [undo_stack + rcx]
     lea rsi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .sus_copy:
     mov bl, [rsi + rcx]
     mov [rdi + rcx], bl
@@ -15578,7 +15571,7 @@ check_continuation:
 
 .cc_check_quotes:
     ; Count unmatched quotes
-    xor rcx, rcx             ; position
+    xor ecx, ecx             ; position
     xor edx, edx             ; single quote count
     xor r8d, r8d             ; double quote count
 .cc_quote_loop:
@@ -15629,8 +15622,8 @@ syntax_highlight_line:
     jz .shl_done
 
     lea rdi, [suggestion_buf]
-    xor rbx, rbx             ; output position
-    xor rcx, rcx             ; input position
+    xor ebx, ebx             ; output position
+    xor ecx, ecx             ; input position
     mov r15, 1               ; r15 = 1 means "next word is a command"
 
 .shl_char:
@@ -16027,7 +16020,7 @@ tab_complete_switch:
     syscall
 
     ; Read help output into switch_help_buf
-    xor r12, r12             ; total bytes read
+    xor r12d, r12d             ; total bytes read
 .tcs_read_loop:
     mov rax, SYS_READ
     mov edi, [pipe_fds]
@@ -16370,7 +16363,7 @@ tab_complete_var:
     mov qword [tab_count], 0
     mov qword [tab_buf_pos], 0
 
-    xor r12, r12             ; loop counter
+    xor r12d, r12d             ; loop counter
 .tcv_loop:
     cmp r12, [env_count]
     jge .tcv_done
@@ -16379,7 +16372,7 @@ tab_complete_var:
     jz .tcv_next
 
     ; Compare prefix against env var name
-    xor rcx, rcx
+    xor ecx, ecx
 .tcv_cmp:
     cmp rcx, r14
     jge .tcv_prefix_match    ; all prefix chars matched
@@ -16412,7 +16405,7 @@ tab_complete_var:
     inc rdi
 
     ; Copy var name from env entry until '='
-    xor rcx, rcx
+    xor ecx, ecx
 .tcv_copy:
     movzx eax, byte [rsi + rcx]
     test al, al
@@ -16448,7 +16441,7 @@ check_subcommand_completion:
     push rbx
     push r12
     lea rdi, [line_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .csc_find_end:
     cmp rcx, [line_len]
     jge .csc_no
@@ -16494,7 +16487,7 @@ check_subcommand_completion:
     cmp byte [rsi], 0
     je .csc_end_list
     push rsi
-    xor rcx, rcx
+    xor ecx, ecx
     test r12, r12
     jz .csc_match
 .csc_cmp:
@@ -16569,7 +16562,7 @@ handle_calc:
     mov r12, rdi
     lea rdi, [nick_expand_buf]
     mov rcx, 1
-    xor rbx, rbx
+    xor ebx, ebx
 .hcalc_build:
     mov rsi, [r12 + rcx*8]
     test rsi, rsi
@@ -16688,7 +16681,7 @@ calc_eval:
     pop rbx
     ret
 .ce_num:
-    xor rax, rax
+    xor eax, eax
     xor ecx, ecx
     cmp byte [r12], '-'
     jne .cen_loop
@@ -16720,7 +16713,7 @@ handle_stats:
     push r12
     push r13
     mov qword [cmd_freq_count], 0
-    xor r12, r12
+    xor r12d, r12d
 .hs_loop:
     cmp r12, [hist_count]
     jge .hs_display
@@ -16728,7 +16721,7 @@ handle_stats:
     test rsi, rsi
     jz .hs_next
     lea rdi, [search_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .hs_cmd:
     movzx eax, byte [rsi + rcx]
     test al, al
@@ -16744,7 +16737,7 @@ handle_stats:
     mov byte [rdi + rcx], 0
     test rcx, rcx
     jz .hs_next
-    xor r13, r13
+    xor r13d, r13d
 .hs_find:
     cmp r13, [cmd_freq_count]
     jge .hs_add
@@ -16787,13 +16780,13 @@ handle_stats:
     lea rsi, [.hs_hdr]
     mov rdx, .hs_hdr_len
     syscall
-    xor r12, r12
+    xor r12d, r12d
 .hs_show:
     cmp r12, 20
     jge .hs_end
-    xor r13, r13
+    xor r13d, r13d
     mov rbx, -1
-    xor rcx, rcx
+    xor ecx, ecx
 .hs_max:
     cmp r13, [cmd_freq_count]
     jge .hs_best
@@ -16862,7 +16855,7 @@ handle_validate:
     ; Add: pattern = action
     lea rbx, [nick_expand_buf]
     mov rcx, 1
-    xor rax, rax
+    xor eax, eax
 .hv_build:
     mov rsi, [r12 + rcx*8]
     test rsi, rsi
@@ -16961,7 +16954,7 @@ handle_validate:
     syscall
     jmp .hv_done
 .hv_list:
-    xor rcx, rcx
+    xor ecx, ecx
 .hv_ll:
     cmp rcx, [valid_count]
     jge .hv_done
@@ -17090,7 +17083,7 @@ source_file:
     ; Copy line to line_buf
     lea rdi, [line_buf]
     mov rsi, r12
-    xor rcx, rcx
+    xor ecx, ecx
 .sf_copy:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
@@ -17218,7 +17211,7 @@ show_rprompt:
 
     ; Build rprompt string in rprompt_buf
     lea rdi, [rprompt_buf]
-    xor rbx, rbx             ; output position
+    xor ebx, ebx             ; output position
 
     ; HH:MM
     mov rax, r12
@@ -17394,7 +17387,7 @@ show_rprompt:
     ; Copy rprompt text
     pop rbx
     lea rsi, [rprompt_buf]
-    xor rcx, rcx
+    xor ecx, ecx
 .rp_copy_text:
     cmp rcx, rbx
     jge .rp_copy_text_done
@@ -17461,7 +17454,7 @@ suggest_correction:
     lea rax, [default_path]
 .sugc_have_path:
     mov r14, rax             ; PATH
-    xor r15, r15             ; found count
+    xor r15d, r15d             ; found count
 
     ; Print "bare: command not found, did you mean:"
     ; (caller already printed the error)
@@ -17508,7 +17501,7 @@ suggest_correction:
     test rax, rax
     jle .sugc_close
 
-    xor rcx, rcx
+    xor ecx, ecx
 .sugc_entry:
     cmp rcx, rax
     jge .sugc_read
@@ -17530,7 +17523,6 @@ suggest_correction:
     mov rbx, rax
     sub rbx, r13             ; length diff
     ; abs(diff)
-    test rbx, rbx
     jns .sugc_pos
     neg rbx
 .sugc_pos:
@@ -17687,9 +17679,8 @@ handle_save_session:
     mov rax, [hist_count]
     mov rcx, rax
     sub rcx, 50
-    test rcx, rcx
     jns .hss_hist_start
-    xor rcx, rcx
+    xor ecx, ecx
 .hss_hist_start:
 .hss_hist_loop:
     cmp rcx, [hist_count]
@@ -17968,7 +17959,7 @@ handle_list_sessions:
     test rax, rax
     jle .hlss_close
     mov r12, rax             ; bytes read
-    xor rcx, rcx
+    xor ecx, ecx
 .hlss_entry:
     cmp rcx, r12
     jge .hlss_read
@@ -18100,7 +18091,7 @@ try_run_plugin:
     call restore_child_signals
     ; Build argv on stack: [path, original_args..., NULL]
     ; Count args from r14 (skip argv[0] which is the :cmd)
-    xor rcx, rcx
+    xor ecx, ecx
     mov rsi, r14
 .trp_count:
     mov rax, [rsi + rcx*8]
@@ -18532,7 +18523,7 @@ tab_complete_colon:
     jz .tcc_done             ; sentinel
 
     ; Compare prefix against this command name
-    xor rcx, rcx
+    xor ecx, ecx
 .tcc_cmp:
     cmp rcx, r13
     jge .tcc_match           ; prefix fully matched
