@@ -225,6 +225,8 @@ str_time:       db "time", 0
 str_pushd:      db "pushd", 0
 str_popd:       db "popd", 0
 str_exec:       db "exec", 0
+script_err_msg: db "bare: cannot open script", 10
+script_err_msg_len equ $ - script_err_msg
 exec_usage_msg: db "exec: usage: exec COMMAND [ARG...]", 10
 exec_usage_len  equ $ - exec_usage_msg
 exec_notfound_pre: db "exec: "
@@ -678,6 +680,7 @@ exec_cache_path: resb 256
 ; Command-line flags
 login_flag:     resq 1              ; 1 if -l/--login
 cmd_flag:       resq 1              ; pointer to -c command string
+script_mode:    resq 1              ; 1 if invoked as `bare scriptfile` (#11)
 time_flag:      resq 1              ; 1 if "time" prefix was used
 git_status_cached: resb 1           ; cached git dirty result (0=clean, 1=dirty)
 git_status_cache_time: resq 1       ; monotonic time of last fork check
@@ -890,13 +893,58 @@ _start:
 
 .check_c_flag:
     cmp word [rax], '-c'
-    jne .no_args
+    jne .check_script
     cmp byte [rax + 2], 0
-    jne .no_args
+    jne .check_script
     ; -c mode: argv[2] is the command
     mov rax, [rsi + 16]
     mov [cmd_flag], rax
     jmp .no_args
+
+.check_script:
+    ; argv[1] is something other than a recognised flag. If it doesn't
+    ; start with '-', treat it as a script path: open the file, dup2
+    ; it onto stdin, and let the existing non-interactive read loop
+    ; consume the lines. The shebang line (#!) is skipped by the
+    ; comment-skip in .main_loop. Issue isene/bare#11.
+    cmp byte [rax], '-'
+    je .no_args                       ; unknown flag — ignore (current behaviour)
+    cmp byte [rax], 0
+    je .no_args                       ; empty argv[1]
+    ; Open the script file (O_RDONLY = 0).
+    mov rdi, rax
+    mov rax, SYS_OPEN
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .script_open_fail
+    ; Move fd onto stdin (fd 0). dup2 closes fd 0 first.
+    mov rdi, rax                       ; old fd
+    push rdi
+    xor esi, esi                       ; new fd = 0
+    mov rax, SYS_DUP2
+    syscall
+    pop rdi
+    ; Close the original (now we're reading via fd 0).
+    mov rax, SYS_CLOSE
+    syscall
+    mov qword [script_mode], 1
+    jmp .no_args
+
+.script_open_fail:
+    ; Couldn't open the file. Print a fixed-text error and exit 127.
+    ; (We don't decode -errno; "cannot open script" is enough for the
+    ; shebang use case where the kernel already verified the path.)
+    mov rax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [script_err_msg]
+    mov rdx, script_err_msg_len
+    syscall
+    mov rax, SYS_EXIT
+    mov edi, 127
+    syscall
+
 .set_login:
     mov qword [login_flag], 1
 .no_args:
@@ -1113,6 +1161,12 @@ _start:
     cmp byte [rsi], 0
     je .main_loop
     cmp byte [rsi], 10
+    je .main_loop
+    ; Skip comment lines (and shebang). A line whose first non-space
+    ; char is '#' is a comment in script mode. Interactively the user
+    ; rarely types '#' as a real command, so skipping it is harmless
+    ; and matches every other shell. Issue isene/bare#11.
+    cmp byte [rsi], '#'
     je .main_loop
 
     ; History expansion (!!, !N, !-N) - must be before add_history
