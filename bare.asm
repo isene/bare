@@ -419,6 +419,27 @@ line_buf:       resb 16384
 line_len:       resq 1
 cursor_pos:     resq 1
 
+; Partial-redraw state. prev_line_buf is a snapshot of line_buf taken
+; after each successful full or partial render. On the next keystroke,
+; full_redraw compares line_buf against the snapshot to find the first
+; differing byte and skips re-outputting the unchanged prefix (incl.
+; the prompt) — fixes the per-keystroke flicker noticed on low-
+; bandwidth connections. Issue isene/bare#5.
+;
+; needs_full_redraw forces the slow path on the next render. Set by:
+;   - read_line entry (terminal state unknown)
+;   - history navigation Up/Down (whole buffer changes)
+;   - Ctrl-L screen clear
+;   - tab completion (after drawing candidates)
+;   - SIGWINCH (terminal resized — wrap positions may have shifted)
+prev_line_buf:  resb 16384
+prev_line_len:  resq 1
+needs_full_redraw: resq 1
+pr_first_diff:  resq 1
+pr_first_diff_col: resq 1
+pr_byte_off:    resq 1
+pr_output_len:  resq 1
+
 ; Argument parsing
 argv_ptrs:      resq 128        ; max 128 args
 
@@ -1399,6 +1420,12 @@ read_line:
     xor r12d, r12d            ; cursor position
     mov qword [line_len], 0
     mov qword [prev_cursor_row], 0   ; cursor sits at end of prompt = row 0
+    ; Force a full redraw on the first keystroke — terminal state
+    ; (cursor row/col, anchor freshness, prompt presence) is unknown
+    ; on entry. After the first full render, full_redraw can switch
+    ; to the partial path for subsequent keystrokes.
+    mov qword [needs_full_redraw], 1
+    mov qword [prev_line_len], 0
 
     ; Save the cursor at the end of the just-printed prompt so every
     ; full_redraw can ESC[u back to a known anchor instead of trying
@@ -1449,6 +1476,9 @@ read_line:
     lea rsi, [.rl_save_cursor]
     mov rdx, 3
     syscall
+    ; Terminal width may have changed; partial-redraw's row/col math
+    ; would be wrong against the stale prev_line_buf snapshot.
+    mov qword [needs_full_redraw], 1
     call full_redraw
     jmp .read_char
 .winch_seq: db 27, "[2J", 27, "[H" ; clear screen + home
@@ -1821,6 +1851,10 @@ read_line:
     lea rsi, [.cls_save_seq]
     mov rdx, 3
     syscall
+    ; Screen was cleared + prompt reprinted; the anchor was re-saved.
+    ; Force a full redraw so the partial-redraw diff doesn't try to
+    ; output from a stale assumed position.
+    mov qword [needs_full_redraw], 1
     call full_redraw
     jmp .read_char
 .cls_save_seq: db 27, '[', 's'
@@ -3840,7 +3874,450 @@ reposition_cursor:
 
 ; Full redraw: CR, clear line, print prompt, print line
 ; All output batched into render_buf for single write (no flicker)
+; ──────────────────────────────────────────────────────────────────────
+; full_redraw — router. On most keystrokes (insert/delete/move) we can
+; skip re-printing the prompt and re-outputting unchanged bytes of the
+; line; that's the partial path, which slashes per-keystroke output
+; from ~150-500 bytes to ~10-50 bytes (issue isene/bare#5). The slow
+; path is the original do_full_redraw, used on first render, after
+; tab-completion, after Ctrl-L, after SIGWINCH, etc.
+; ──────────────────────────────────────────────────────────────────────
 full_redraw:
+    cmp qword [needs_full_redraw], 0
+    jne .fr_force_full
+    call do_partial_redraw
+    test rax, rax
+    jz .fr_snapshot
+.fr_force_full:
+    call do_full_redraw
+    mov qword [needs_full_redraw], 0
+.fr_snapshot:
+    ; Snapshot line_buf → prev_line_buf so the next call can compute
+    ; first-diff cheaply. Copy at most line_len bytes; prev_line_len
+    ; tracks how much is valid.
+    mov rcx, [line_len]
+    mov [prev_line_len], rcx
+    test rcx, rcx
+    jz .fr_done
+    lea rsi, [line_buf]
+    lea rdi, [prev_line_buf]
+.fr_copy:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .fr_copy
+.fr_done:
+    ret
+
+; ──────────────────────────────────────────────────────────────────────
+; do_partial_redraw — attempts a minimal redraw based on diff vs.
+; prev_line_buf. Returns rax = 0 on success, rax = 1 on "couldn't do
+; it, please call do_full_redraw instead".
+;
+; Algorithm:
+;   1. Find first byte where line_buf and prev_line_buf differ.
+;   2. If diff is at offset 0 → give up (no partial win, fall through).
+;   3. Compute visual column of that byte via cursor_display_width.
+;   4. Re-highlight the whole line into suggestion_buf (so colors
+;      that propagate past the edit point get refreshed).
+;   5. Walk suggestion_buf skipping ANSI escapes, count printable
+;      cells until we reach the first-diff column. Record byte offset.
+;   6. Emit:  ESC[u                       (restore to end-of-prompt)
+;             cursor-down N rows + abs col M   (to first-diff cell)
+;             suggestion_buf[byte_off..]  (tail of new render)
+;             ESC[J                       (clear remainder of screen)
+;             cursor reposition           (same logic as full path)
+;      in one SYS_WRITE.
+;
+; The prompt is not re-printed. The unchanged prefix of the line is
+; not re-output. ESC[J handles shrinks that drop a wrapped row.
+; ──────────────────────────────────────────────────────────────────────
+do_partial_redraw:
+    push r12
+    push r13
+    push r14
+    push rbx
+
+    ; --- 1. Find first_diff_byte ---
+    mov rbx, [line_len]
+    mov rcx, [prev_line_len]
+    cmp rbx, rcx
+    jle .dpr_min_ok
+    mov rbx, rcx
+.dpr_min_ok:
+    ; rbx = min(line_len, prev_line_len). Scan for first byte difference.
+    xor ecx, ecx
+.dpr_scan:
+    cmp rcx, rbx
+    jge .dpr_scan_done
+    mov al, [line_buf + rcx]
+    cmp al, [prev_line_buf + rcx]
+    jne .dpr_scan_done
+    inc rcx
+    jmp .dpr_scan
+.dpr_scan_done:
+    ; rcx = first_diff_byte (or min length if no diff in common prefix).
+    ; If the lines are identical entirely, no buffer change — just
+    ; reposition the cursor; the user moved it with arrow keys etc.
+    cmp rcx, [line_len]
+    jne .dpr_have_diff
+    cmp rcx, [prev_line_len]
+    jne .dpr_have_diff
+    ; No buffer change at all. Skip straight to cursor reposition.
+    mov qword [pr_first_diff], 0
+    mov qword [pr_first_diff_col], 0
+    mov qword [pr_output_len], 0
+    mov qword [pr_byte_off], 0
+    jmp .dpr_just_reposition
+.dpr_have_diff:
+    ; If diff is at offset 0, partial buys us nothing (would have to
+    ; re-output the whole line anyway and we lose the prompt-skip win
+    ; if first_diff_col is 0). Fall back to full redraw.
+    test rcx, rcx
+    jnz .dpr_have_nonzero_diff
+    mov rax, 1
+    pop rbx
+    pop r14
+    pop r13
+    pop r12
+    ret
+.dpr_have_nonzero_diff:
+    mov [pr_first_diff], rcx
+
+    ; --- 2. Visual column of first_diff_byte ---
+    push r12
+    mov r12, rcx
+    call cursor_display_width
+    pop r12
+    mov [pr_first_diff_col], rax
+
+    ; --- 3. Re-highlight (or copy plain) into suggestion_buf ---
+    cmp qword [is_tty], 0
+    je .dpr_plain
+    ; Make sure render_to_buf is off so syntax_highlight_line writes
+    ; into suggestion_buf (its normal output path).
+    mov qword [render_to_buf], 0
+    call syntax_highlight_line
+    mov rax, [shl_output_len]
+    mov [pr_output_len], rax
+    jmp .dpr_have_output
+.dpr_plain:
+    mov rcx, [line_len]
+    mov [pr_output_len], rcx
+    test rcx, rcx
+    jz .dpr_have_output
+    lea rsi, [line_buf]
+    lea rdi, [suggestion_buf]
+.dpr_copy_plain:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .dpr_copy_plain
+.dpr_have_output:
+
+    ; --- 4. Walk suggestion_buf, find byte offset for first_diff_col ---
+    mov r13, [pr_first_diff_col]   ; target column count
+    xor r14d, r14d                 ; byte position in suggestion_buf
+    xor ebx, ebx                   ; printable cells seen
+    mov rcx, [pr_output_len]
+.dpr_walk:
+    cmp r14, rcx
+    jge .dpr_walk_done
+    cmp rbx, r13
+    jge .dpr_walk_done
+    mov al, [suggestion_buf + r14]
+    cmp al, 0x1b                   ; ESC
+    je .dpr_walk_esc
+    ; UTF-8 continuation byte? (10xxxxxx)
+    mov dl, al
+    and dl, 0xC0
+    cmp dl, 0x80
+    je .dpr_walk_cont
+    ; Leading or ASCII byte — counts as one visible cell.
+    inc rbx
+.dpr_walk_cont:
+    inc r14
+    jmp .dpr_walk
+.dpr_walk_esc:
+    ; Skip ESC [ ... <final byte 0x40..0x7E>
+    inc r14
+    cmp r14, rcx
+    jge .dpr_walk_done
+    cmp byte [suggestion_buf + r14], '['
+    jne .dpr_walk                  ; bare ESC, skip just it
+    inc r14
+.dpr_walk_csi:
+    cmp r14, rcx
+    jge .dpr_walk_done
+    mov al, [suggestion_buf + r14]
+    inc r14
+    cmp al, 0x40
+    jl .dpr_walk_csi
+    cmp al, 0x7E
+    jg .dpr_walk_csi
+    jmp .dpr_walk
+.dpr_walk_done:
+    mov [pr_byte_off], r14
+
+    ; --- 5. Build the render_buf and emit it ---
+.dpr_just_reposition:
+    mov qword [render_pos], 0
+
+    ; (a) ESC[u — restore to end-of-prompt anchor
+    lea rdi, [render_buf]
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], 'u'
+    mov qword [render_pos], 3
+
+    ; If there's no buffer change at all (pure cursor reposition),
+    ; skip the line-content emit and just reposition.
+    cmp qword [pr_output_len], 0
+    jne .dpr_emit_line
+    cmp qword [pr_first_diff_col], 0
+    jne .dpr_emit_line
+    cmp qword [pr_first_diff], 0
+    je .dpr_skip_to_repos
+
+.dpr_emit_line:
+    ; (b) Move cursor to (first_diff_col + prompt_visible_width).
+    ; Same row/col math as the full-redraw reposition: rows = pos/tw,
+    ; cols = pos%tw, emit ESC[<rows>B then CR then ESC[<col+1>G.
+    mov rax, [pr_first_diff_col]
+    add rax, [prompt_visible_width]
+    mov rcx, [term_width]
+    test rcx, rcx
+    jz .dpr_pos_simple
+    cmp rcx, 1
+    jle .dpr_pos_simple
+    xor edx, edx
+    div rcx                        ; rax = row, edx = col
+    test rax, rax
+    jz .dpr_pos_no_down
+
+    ; ESC[<row>B
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    add rdi, 2
+    push rdx
+    push rax
+    push rdi
+    mov rax, [rsp + 8]             ; row count
+    lea rdi, [tmp_buf]
+    call itoa                      ; rax = number of digits
+    pop rdi
+    pop r8                          ; discard
+    pop rdx
+    push rdx
+    mov rcx, rax                   ; digit count
+    lea rsi, [tmp_buf]
+.dpr_pos_cpy_b:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .dpr_pos_cpy_b
+    mov byte [rdi], 'B'
+    inc rdi
+    lea rax, [render_buf]
+    sub rdi, rax
+    mov [render_pos], rdi
+    pop rdx
+
+.dpr_pos_no_down:
+    ; CR
+    mov rdi, [render_pos]
+    mov byte [render_buf + rdi], 13
+    inc qword [render_pos]
+    ; ESC[<col+1>G
+    inc rdx
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    add rdi, 2
+    push rdx
+    push rdi
+    mov rax, rdx
+    lea rdi, [tmp_buf]
+    call itoa
+    pop rdi
+    pop rdx
+    mov rcx, rax
+    lea rsi, [tmp_buf]
+.dpr_pos_cpy_g:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .dpr_pos_cpy_g
+    mov byte [rdi], 'G'
+    inc rdi
+    lea rax, [render_buf]
+    sub rdi, rax
+    mov [render_pos], rdi
+    jmp .dpr_emit_content
+
+.dpr_pos_simple:
+    ; Fallback for unknown term_width: just CR.
+    mov rdi, [render_pos]
+    mov byte [render_buf + rdi], 13
+    inc qword [render_pos]
+
+.dpr_emit_content:
+    ; (c) Copy suggestion_buf[byte_off .. output_len] into render_buf.
+    mov rcx, [pr_output_len]
+    sub rcx, [pr_byte_off]
+    jbe .dpr_after_content
+    mov rsi, [pr_byte_off]
+    lea rsi, [suggestion_buf + rsi]
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+.dpr_emit_cpy:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .dpr_emit_cpy
+    mov rax, rdi
+    lea rdi, [render_buf]
+    sub rax, rdi
+    mov [render_pos], rax
+
+.dpr_after_content:
+    ; (d) ESC[J — clear from cursor to end of screen (handles wrap shrinks)
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], 'J'
+    add qword [render_pos], 3
+
+.dpr_skip_to_repos:
+    ; (e) Reposition cursor to its current column (r12 = byte pos).
+    ; Mirror of the full-redraw .fd_repos block, writing into render_buf.
+    push r12
+    call cursor_display_width
+    pop r12
+    add rax, [prompt_visible_width]
+    mov rcx, [term_width]
+    test rcx, rcx
+    jz .dpr_repos_simple
+    cmp rcx, 1
+    jle .dpr_repos_simple
+    xor edx, edx
+    div rcx                        ; rax = row, edx = col
+
+    ; ESC[u to re-anchor
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], 'u'
+    add qword [render_pos], 3
+
+    test rax, rax
+    jz .dpr_repos_no_down
+
+    ; ESC[<rax>B
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    add rdi, 2
+    push rdx
+    push rax
+    push rdi
+    mov rax, [rsp + 8]
+    lea rdi, [tmp_buf]
+    call itoa
+    pop rdi
+    pop r8
+    pop rdx
+    mov rcx, rax
+    lea rsi, [tmp_buf]
+.dpr_repos_cpy_b:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .dpr_repos_cpy_b
+    mov byte [rdi], 'B'
+    inc rdi
+    lea rax, [render_buf]
+    sub rdi, rax
+    mov [render_pos], rdi
+
+.dpr_repos_no_down:
+    ; CR
+    mov rdi, [render_pos]
+    mov byte [render_buf + rdi], 13
+    inc qword [render_pos]
+    ; ESC[<col+1>G
+    inc rdx
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    add rdi, 2
+    push rdi
+    mov rax, rdx
+    lea rdi, [tmp_buf]
+    call itoa
+    pop rdi
+    mov rcx, rax
+    lea rsi, [tmp_buf]
+.dpr_repos_cpy_g:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .dpr_repos_cpy_g
+    mov byte [rdi], 'G'
+    inc rdi
+    lea rax, [render_buf]
+    sub rdi, rax
+    mov [render_pos], rdi
+    jmp .dpr_emit_write
+
+.dpr_repos_simple:
+    ; Fallback: just CR.
+    mov rdi, [render_pos]
+    mov byte [render_buf + rdi], 13
+    inc qword [render_pos]
+
+.dpr_emit_write:
+    ; --- 6. Single SYS_WRITE of the whole batch ---
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [render_buf]
+    mov rdx, [render_pos]
+    syscall
+
+    xor eax, eax                   ; success
+    pop rbx
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+; ──────────────────────────────────────────────────────────────────────
+; do_full_redraw — the original full redraw, kept verbatim. Called
+; from full_redraw via the router above when needs_full_redraw is set
+; or when do_partial_redraw declined.
+; ──────────────────────────────────────────────────────────────────────
+do_full_redraw:
     push r12
     push rbx
 
