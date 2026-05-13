@@ -3109,6 +3109,11 @@ read_line:
 
 ; ── Tab completion handler ──────────────────────────────────────────
 .handle_tab:
+    ; Tab completion may print candidates on a new line and rewrite
+    ; the prompt, which scrolls the terminal and invalidates the
+    ; partial-redraw anchor. Force the next full_redraw to take the
+    ; full path so the prompt is re-emitted and the snapshot resets.
+    mov qword [needs_full_redraw], 1
     ; Extract current word (from last space or beginning to cursor)
     ; Find start of current word
     mov rcx, r12
@@ -4171,6 +4176,83 @@ do_partial_redraw:
     mov rdi, [render_pos]
     mov byte [render_buf + rdi], 13
     inc qword [render_pos]
+
+    ; (c.0) Replay ANSI prefix. The cursor is now at the first-diff
+    ; cell, but the terminal's SGR state is whatever the previous frame
+    ; left behind. The suggestion_buf bytes from 0..byte_off may
+    ; contain ESC sequences that set the SGR state that should be live
+    ; at byte_off (e.g. "command word in cyan" set at col 0 carries
+    ; through to col first_diff_col when both are in the same word).
+    ; Reset, then re-emit every ESC sequence in suggestion_buf[0..off]
+    ; so the resumed output picks up the correct colours.
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    mov byte [rdi], 27
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '0'
+    mov byte [rdi+3], 'm'
+    add qword [render_pos], 4
+    cmp qword [pr_byte_off], 0
+    je .dpr_emit_content
+    xor r14d, r14d                       ; scan position in suggestion_buf
+    mov r13, [pr_byte_off]
+.dpr_replay:
+    cmp r14, r13
+    jge .dpr_emit_content
+    mov al, [suggestion_buf + r14]
+    cmp al, 0x1b
+    jne .dpr_replay_skip_text
+    ; Found ESC. Locate the sequence end and copy the run into
+    ; render_buf, then continue past it. Format: ESC [ ... <final>
+    ; where final is 0x40..0x7E.
+    mov rcx, r14                         ; start of sequence
+    inc r14
+    cmp r14, r13
+    jge .dpr_replay_copy
+    cmp byte [suggestion_buf + r14], '['
+    jne .dpr_replay_copy_bare_esc        ; bare ESC (rare), copy just it
+    inc r14
+.dpr_replay_csi:
+    cmp r14, r13
+    jge .dpr_replay_copy
+    mov dl, [suggestion_buf + r14]
+    inc r14
+    cmp dl, 0x40
+    jl .dpr_replay_csi
+    cmp dl, 0x7E
+    jg .dpr_replay_csi
+    ; r14 now points one past the final byte. Copy [rcx..r14) to render_buf.
+.dpr_replay_copy:
+    mov rdi, [render_pos]
+    lea rdi, [render_buf + rdi]
+    mov rsi, rcx
+    lea rsi, [suggestion_buf + rsi]
+    mov r8, r14
+    sub r8, rcx                          ; bytes to copy
+.dpr_replay_cpy:
+    test r8, r8
+    jz .dpr_replay_cpy_done
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec r8
+    jmp .dpr_replay_cpy
+.dpr_replay_cpy_done:
+    mov rax, rdi
+    lea rdi, [render_buf]
+    sub rax, rdi
+    mov [render_pos], rax
+    jmp .dpr_replay
+.dpr_replay_copy_bare_esc:
+    ; bare ESC alone — copy 1 byte
+    mov rdi, [render_pos]
+    mov byte [render_buf + rdi], 0x1b
+    inc qword [render_pos]
+    jmp .dpr_replay
+.dpr_replay_skip_text:
+    inc r14
+    jmp .dpr_replay
 
 .dpr_emit_content:
     ; (c) Copy suggestion_buf[byte_off .. output_len] into render_buf.
