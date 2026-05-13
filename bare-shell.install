@@ -1,0 +1,15 @@
+post_install() {
+    if ! grep -qx /usr/bin/bare etc/shells 2>/dev/null; then
+        echo /usr/bin/bare >> etc/shells
+    fi
+}
+
+post_upgrade() {
+    post_install "$@"
+}
+
+pre_remove() {
+    if grep -qx /usr/bin/bare etc/shells 2>/dev/null; then
+        sed -i '\|^/usr/bin/bare$|d' etc/shells
+    fi
+}
