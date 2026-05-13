@@ -224,6 +224,13 @@ str_help:       db ":help", 0
 str_time:       db "time", 0
 str_pushd:      db "pushd", 0
 str_popd:       db "popd", 0
+str_exec:       db "exec", 0
+exec_usage_msg: db "exec: usage: exec COMMAND [ARG...]", 10
+exec_usage_len  equ $ - exec_usage_msg
+exec_notfound_pre: db "exec: "
+exec_notfound_pre_len equ $ - exec_notfound_pre
+exec_notfound_suf: db ": not found", 10
+exec_notfound_suf_len equ $ - exec_notfound_suf
 
 ; Colon command dispatch table: pairs of (string_ptr, handler_ptr), sentinel (0,0)
 colon_dispatch_table:
@@ -6196,6 +6203,18 @@ check_builtin:
     test rax, rax
     jz .bi_popd
 
+    ; "exec" — replace bare's process image with the given command.
+    ; POSIX semantics: `exec PROG [ARGS...]` calls execve directly with
+    ; no intervening fork, so bare is gone after a successful exec.
+    ; On exec failure (program not found, permission denied), prints
+    ; an error and returns to the prompt — the shell stays alive.
+    ; Issue isene/bare#9.
+    mov rdi, [r12]
+    lea rsi, [str_exec]
+    call strcmp
+    test rax, rax
+    jz .bi_exec
+
     ; Check for colon commands (starts with ':')
     mov rdi, [r12]
     cmp byte [rdi], ':'
@@ -6455,6 +6474,97 @@ check_builtin:
 .bi_popd:
     mov rdi, r12
     call handle_popd
+    mov rax, 1
+    pop r12
+    pop rbx
+    ret
+
+; ──────────────────────────────────────────────────────────────────────
+; exec — replace bare's process image with COMMAND. No fork; bare is
+; gone on success. POSIX exec semantics. Issue isene/bare#9.
+; ──────────────────────────────────────────────────────────────────────
+.bi_exec:
+    ; argv[1] is the program. Without it, just print usage and return.
+    ; (POSIX `exec` with no args applies pending redirections to the
+    ; current shell — we don't support pipeline-rewrite redirections
+    ; in builtins yet, so usage is the safe response.)
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jz .bi_exec_usage
+
+    ; If argv[1] contains '/', use it as-is. Otherwise resolve via
+    ; find_in_path, which writes the full path to exec_path on hit.
+    mov rsi, rdi
+.bi_exec_check_slash:
+    mov al, [rsi]
+    test al, al
+    jz .bi_exec_search
+    cmp al, '/'
+    je .bi_exec_do
+    inc rsi
+    jmp .bi_exec_check_slash
+
+.bi_exec_search:
+    ; rdi still = argv[1]; find_in_path consults env_array's PATH.
+    call find_in_path
+    test rax, rax
+    jz .bi_exec_notfound
+    lea rdi, [exec_path]
+
+.bi_exec_do:
+    ; argv for the new program starts at argv[1] (POSIX: the new
+    ; program's argv[0] is the program name as the user typed it).
+    ; argv array is already NUL-terminated by the parser.
+    lea rsi, [r12 + 8]
+    lea rdx, [env_array]
+    mov rax, SYS_EXECVE
+    syscall
+    ; If we get here, exec failed even though the file existed (e.g.
+    ; ENOEXEC because the file is a script without a recognised
+    ; shebang, or EACCES because the file is not executable). Fall
+    ; through to the not-found path so the user sees the message.
+
+.bi_exec_notfound:
+    ; Two-segment write: prefix + the bad argv[1] + suffix.
+    mov rax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [exec_notfound_pre]
+    mov edx, exec_notfound_pre_len
+    syscall
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jz .bi_exec_skip_name
+    ; Compute the length of argv[1] (it's NUL-terminated).
+    xor ecx, ecx
+.bi_exec_strlen:
+    cmp byte [rdi + rcx], 0
+    je .bi_exec_strlen_done
+    inc rcx
+    jmp .bi_exec_strlen
+.bi_exec_strlen_done:
+    mov rax, SYS_WRITE
+    mov esi, edi                  ; clobber: edi has the path; copy to rsi
+    mov rsi, rdi
+    mov edi, 2
+    mov rdx, rcx
+    syscall
+.bi_exec_skip_name:
+    mov rax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [exec_notfound_suf]
+    mov edx, exec_notfound_suf_len
+    syscall
+    mov rax, 1                    ; handled (don't try to exec normally)
+    pop r12
+    pop rbx
+    ret
+
+.bi_exec_usage:
+    mov rax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [exec_usage_msg]
+    mov edx, exec_usage_len
+    syscall
     mov rax, 1
     pop r12
     pop rbx
