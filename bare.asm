@@ -3348,6 +3348,12 @@ read_line:
     ; cursor at end of prompt, drop a newline, print candidates
     ; underneath, and restore cursor back to the prompt line.
     call .tab_preview_selection
+    ; Force a full redraw on every cycle iteration: each redraw is
+    ; followed by manually printing the candidate list below, which
+    ; the partial-redraw path doesn't know about. Without this, the
+    ; second cycle (after partial cleared needs_full_redraw) would
+    ; leave stale candidate output below the line.
+    mov qword [needs_full_redraw], 1
     call full_redraw
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -3667,6 +3673,10 @@ read_line:
     lea rsi, [clr_eol_global]
     mov rdx, clr_eol_len
     syscall
+    ; The candidate list was drawn outside the partial-redraw model;
+    ; force the final redraw to take the full path so the prompt is
+    ; re-emitted and the line snapshot resets cleanly.
+    mov qword [needs_full_redraw], 1
     ; Redraw prompt + final line with syntax highlighting
     call full_redraw
     jmp .tab_done
@@ -3989,6 +3999,44 @@ do_partial_redraw:
     pop r12
     ret
 .dpr_have_nonzero_diff:
+    ; Conservative gate: partial-redraw is only safe when the COMMAND
+    ; word (the bytes up to the first space) is unchanged, because the
+    ; highlighter colours the command word differently from arguments,
+    ; and a one-character change there reflows the colouring of the
+    ; entire word. Two cases to fall back to full redraw on:
+    ;   (a) line_buf has no space yet — every keystroke is editing the
+    ;       command word, so we cannot reuse the previously-emitted
+    ;       command-word bytes.
+    ;   (b) first_diff_byte is <= first_space_byte — the change touches
+    ;       the command word.
+    push rcx                              ; save first_diff_byte
+    xor edx, edx
+.dpr_find_space:
+    cmp rdx, [line_len]
+    jge .dpr_no_space
+    cmp byte [line_buf + rdx], ' '
+    je .dpr_have_space
+    inc rdx
+    jmp .dpr_find_space
+.dpr_no_space:
+    pop rcx
+    mov rax, 1                            ; fall back to full redraw
+    pop rbx
+    pop r14
+    pop r13
+    pop r12
+    ret
+.dpr_have_space:
+    pop rcx                               ; restore first_diff_byte
+    cmp rcx, rdx
+    jg .dpr_partial_safe                  ; first_diff strictly past first space → safe
+    mov rax, 1                            ; touches command word → full
+    pop rbx
+    pop r14
+    pop r13
+    pop r12
+    ret
+.dpr_partial_safe:
     mov [pr_first_diff], rcx
 
     ; --- 2. Visual column of first_diff_byte ---
