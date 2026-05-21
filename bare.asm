@@ -9666,6 +9666,102 @@ load_history:
     mov rcx, MAX_HIST
     mov [hist_count], rcx
 .lh_no_trim:
+    ; --- Load-time dedup pass --------------------------------------
+    ; add_history dedups every NEW entry, but the file on disk may
+    ; carry dupes that pre-date dedup being on, or that accumulated
+    ; from a prior session with dedup off. Compact in-place per the
+    ; current config so the in-memory list matches the user's
+    ; expectation. If we drop any entries, set hist_dirty so the next
+    ; save_history rewrites the file via rewrite_history (the
+    ; append-only path can't shrink the file).
+    push rbx
+    push r12
+    mov rax, [config_flags]
+    test rax, (1 << CFG_HIST_DEDUP_SMART)
+    jnz .lh_smart
+    test rax, (1 << CFG_HIST_DEDUP_FULL)
+    jnz .lh_full
+    jmp .lh_dedup_done
+
+.lh_smart:
+    ; Collapse adjacent runs of identical commands. O(N) strcmps.
+    xor r10, r10                          ; write idx
+    xor r11, r11                          ; read idx
+.lh_sm_loop:
+    cmp r11, [hist_count]
+    jge .lh_sm_done
+    test r10, r10
+    jz .lh_sm_keep
+    mov rbx, r10
+    dec rbx
+    mov rdi, [hist_lines + rbx*8]
+    mov rsi, [hist_lines + r11*8]
+    push r10
+    push r11
+    call strcmp
+    pop r11
+    pop r10
+    test rax, rax
+    jz .lh_sm_skip                        ; same as previous kept
+.lh_sm_keep:
+    mov rax, [hist_lines + r11*8]
+    mov [hist_lines + r10*8], rax
+    inc r10
+.lh_sm_skip:
+    inc r11
+    jmp .lh_sm_loop
+.lh_sm_done:
+    cmp r10, [hist_count]
+    je .lh_dedup_done
+    mov [hist_count], r10
+    mov byte [hist_dirty], 1
+    jmp .lh_dedup_done
+
+.lh_full:
+    ; Keep only the LAST occurrence of each unique command. For each
+    ; entry i, drop it if the same string appears anywhere later.
+    ; O(N²) over N <= MAX_HIST (1000) ≈ 1M strcmps × ~50 ns = ~50 ms
+    ; worst case at startup. Cold path; acceptable.
+    xor r10, r10                          ; write idx
+    xor r11, r11                          ; read idx (i)
+.lh_fu_outer:
+    cmp r11, [hist_count]
+    jge .lh_fu_done
+    lea r12, [r11 + 1]                    ; j = i+1
+.lh_fu_inner:
+    cmp r12, [hist_count]
+    jge .lh_fu_keep
+    mov rdi, [hist_lines + r11*8]
+    mov rsi, [hist_lines + r12*8]
+    push r10
+    push r11
+    push r12
+    call strcmp
+    pop r12
+    pop r11
+    pop r10
+    test rax, rax
+    jz .lh_fu_skip                        ; duplicate later → drop
+    inc r12
+    jmp .lh_fu_inner
+.lh_fu_keep:
+    mov rax, [hist_lines + r11*8]
+    mov [hist_lines + r10*8], rax
+    inc r10
+.lh_fu_skip:
+    inc r11
+    jmp .lh_fu_outer
+.lh_fu_done:
+    cmp r10, [hist_count]
+    je .lh_dedup_done
+    mov [hist_count], r10
+    mov byte [hist_dirty], 1
+
+.lh_dedup_done:
+    pop r12
+    pop rbx
+    ; --- /dedup ----------------------------------------------------
+    mov rcx, [hist_count]
     mov [hist_persisted], rcx
     pop r13
     pop r12
