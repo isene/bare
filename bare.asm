@@ -9477,7 +9477,11 @@ add_history:
     jmp .ah_no_dedup
 
 .ah_check_full_dedup:
-    ; Full dedup: skip if anywhere in history
+    ; Full dedup: if the new entry already exists earlier in history,
+    ; REMOVE the older occurrence and fall through so the new entry is
+    ; appended at the tail. This is the "move-to-front" semantic the
+    ; user expects: typing `p` then later pressing Up retrieves the
+    ; just-run `p`, not whatever was on top before.
     test rax, (1 << CFG_HIST_DEDUP_FULL)
     jz .ah_no_dedup
     xor ecx, ecx
@@ -9491,13 +9495,49 @@ add_history:
     lea rsi, [line_buf]
     call strcmp
     test rax, rax
-    jz .ah_skip_dup_pop       ; found duplicate
+    jz .ah_full_remove        ; found duplicate at index rcx — remove it
 .ah_full_next:
     pop rcx
     inc rcx
     jmp .ah_full_scan
-.ah_skip_dup_pop:
+
+.ah_full_remove:
+    ; rcx is on the stack; reload into rcx as the removal index.
     pop rcx
+    ; Shift hist_lines[rcx+1 .. hist_count) down one slot. Pointers
+    ; (not data) move; the orphaned hist_buf bytes are overwriteable
+    ; garbage from this point on. Future add_history writes append
+    ; past the new tail's null terminator, which may sit at a lower
+    ; hist_buf position than before — fine, since no other hist_lines
+    ; entry points into the orphaned region.
+    push rbx
+    mov rbx, rcx
+.ah_fdup_shift:
+    mov rax, rbx
+    inc rax
+    cmp rax, [hist_count]
+    jge .ah_fdup_shift_done
+    mov rdi, [hist_lines + rax*8]
+    mov [hist_lines + rbx*8], rdi
+    inc rbx
+    jmp .ah_fdup_shift
+.ah_fdup_shift_done:
+    pop rbx
+    dec qword [hist_count]
+    ; save_history's append-only path can't represent a removal —
+    ; the on-disk file still has the older entry. Route the next
+    ; save through rewrite_history.
+    mov byte [hist_dirty], 1
+    ; hist_persisted may have included the removed entry. Clamp it
+    ; to hist_count so save_history doesn't try to re-append entries
+    ; that no longer exist in memory.
+    mov rax, [hist_count]
+    cmp [hist_persisted], rax
+    jbe .ah_full_removed
+    mov [hist_persisted], rax
+.ah_full_removed:
+    jmp .ah_no_dedup
+
 .ah_skip_dup:
     ret
 
