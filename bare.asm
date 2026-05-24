@@ -14606,9 +14606,11 @@ try_expand_abbrev:
     dec rax
     jmp .tea_find_start
 .tea_found_start:
-    inc rax
+    inc rax                  ; word starts AFTER the space we found
+    jmp .tea_have_start
 .tea_at_start:
-    xor eax, eax             ; word starts at position 0
+    xor eax, eax             ; hit beginning of line, word starts at 0
+.tea_have_start:
     mov r13, rax             ; word start index
 
     ; Extract word
