@@ -265,7 +265,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.38", 10, 0
+version_str:    db "bare 0.2.39", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -342,6 +342,7 @@ info_text:
     db "  No libc, no runtime, pure syscalls. Part of CHasm.", 10, 10
     db "  Features: dynamic prompt with git dirty indicator, multi-pipe, command substitution,", 10
     db "  brace/history/glob expansion (including **), nick/gnick/abbrev aliases, bookmarks,", 10
+    db "  inline NAME? help (type s? / show? / gs? to see what a name resolves to),", 10
     db "  interactive tab cycling with LS_COLORS, switch completion from --help, Ctrl-R search,", 10
     db "  inline suggestions, job control, 6 color themes, syntax highlighting, here-strings,", 10
     db "  auto-pair brackets, multi-line editing, calculator, backslash-space file escaping,", 10
@@ -351,9 +352,9 @@ info_text:
 info_text_len equ $ - info_text
 
 ; Startup tips
-tip_count equ 8
+tip_count equ 9
 tip_table:
-    dq .tip0, .tip1, .tip2, .tip3, .tip4, .tip5, .tip6, .tip7
+    dq .tip0, .tip1, .tip2, .tip3, .tip4, .tip5, .tip6, .tip7, .tip8
 .tip0: db "Tip: Use :nick to create command aliases", 10, 0
 .tip1: db "Tip: Ctrl-R searches history interactively", 10, 0
 .tip2: db "Tip: Type a directory name to auto-cd into it", 10, 0
@@ -362,6 +363,7 @@ tip_table:
 .tip5: db "Tip: $(cmd) for command substitution, {a,b,c} for braces", 10, 0
 .tip6: db "Tip: :abbrev gs = git status (expands on space)", 10, 0
 .tip7: db "Tip: Ctrl-Z suspends, :jobs lists, :fg resumes", 10, 0
+.tip8: db "Tip: Type NAME? (e.g. s? show?) to see what a name resolves to", 10, 0
 
 ; Plugin path suffix
 plugin_suffix:  db "/.bare/plugins/", 0
@@ -13554,6 +13556,7 @@ handle_help:
     db "  :gnick [name = val | -name]     Global aliases", 10
     db "  :abbrev [name = val | -name]    Abbreviations", 10
     db "  :bm [name [path] [#tags]]       Bookmarks (:bm ?tag to search)", 10
+    db "  NAME?                           Inline help (s? show? gs? home? :nick?)", 10
     db "  :dirs                           Directory history (cd N to jump)", 10
     db "  :theme [name]                   Color themes (6 built-in)", 10
     db "  :config [key [value]]           View/set config", 10
