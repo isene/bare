@@ -108,7 +108,8 @@ Local labels (`.name`) are scoped to the enclosing global label. A global label 
 - `read_line`: raw-mode line editor with all key handlers
 - `print_prompt_dynamic`: prompt with user@host:cwd/ git-indicator >
 - `check_builtin`: table-driven colon command dispatch
-- `parse_and_exec_simple`: nick expansion, fork/exec with cooked mode
+- `cmd_show_info`: NAME? inline help — looks the bare name up in nicks/gnicks/abbrevs/bookmarks/builtins/PATH and prints every match
+- `parse_and_exec_simple`: nick expansion, fork/exec with cooked mode (also dispatches NAME? before any expansion runs)
 - `execute_line`: multi-pipe handling (up to 16 segments)
 - `execute_chained_line`: splits by `;`, `&&`, `||`
 - `expand_line`: tilde/variable expansion
