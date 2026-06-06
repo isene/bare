@@ -265,7 +265,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.31", 10, 0
+version_str:    db "bare 0.2.38", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -5995,6 +5995,27 @@ parse_and_exec_simple:
     cmp qword [argc], 0
     je .paes_done
 
+    ; "what is X?" — when the first token ends with a literal '?', strip
+    ; the '?' and dispatch to cmd_show_info instead of executing. Has to
+    ; run BEFORE glob expansion (which would otherwise treat `s?` as a
+    ; glob pattern matching 2-char files in cwd) and before nick
+    ; expansion (which would substitute the alias and lose the user's
+    ; literal name). Only fires on argv[0]; `ls foo?` keeps its
+    ; existing glob behaviour on the argument.
+    mov rdi, [argv_ptrs]
+    call strlen
+    test eax, eax
+    jz .paes_no_info
+    lea rsi, [rdi + rax - 1]
+    cmp byte [rsi], '?'
+    jne .paes_no_info
+    mov byte [rsi], 0                       ; strip the '?'
+    ; rdi still points to argv[0] (strlen preserves rdi).
+    call cmd_show_info
+    mov qword [last_status], 0
+    jmp .paes_done
+.paes_no_info:
+
     ; Strip leading "VAR=val" tokens; saved in env_prefix_ptrs[].
     call extract_env_prefix
     cmp qword [argc], 0
@@ -10617,6 +10638,222 @@ is_nick_name:
     pop rbx
     xor eax, eax
     ret
+
+; ══════════════════════════════════════════════════════════════════════
+; cmd_show_info — "what is X?" inline help.
+;
+; Triggered when the user types a single word ending in '?' as the
+; command position (`s?`, `show?`, `:nick?`, etc.). The trailing '?'
+; is stripped by the caller before we're called.
+;
+; For each category that matches, emits one line:
+;     <name> = nick: <value>
+;     <name> = gnick: <value>
+;     <name> = abbrev: <value>
+;     <name> = bookmark: <path>
+;     <name> = builtin
+;     <name> = exe: <full PATH>
+;
+; If the name matches more than one category, all matching lines are
+; printed (so the user sees, e.g., that a nick shadows a real exe).
+; If nothing matches, prints "<name> = not found".
+;
+; rdi = NUL-terminated name with the '?' already stripped.
+; Preserves nothing the caller cares about; clobbers rax/rcx/rdx/rsi/rdi.
+; ══════════════════════════════════════════════════════════════════════
+cmd_show_info:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi                       ; user-supplied name
+    xor r13d, r13d                     ; r13 = 1 if any match found
+
+    ; Empty name → usage hint, return.
+    cmp byte [r12], 0
+    je .csi_usage
+
+    ; r14 is callee-saved AND survives SYSCALL (the kernel preserves
+    ; r12-r15), so we use it as the loop index throughout. rcx would
+    ; survive strcmp (we push it) but NOT the syscalls inside the
+    ; write_str_stdout calls that follow a match — bare's syscall
+    ; helpers don't save rcx and the SYSCALL instruction destroys it.
+
+    ; ── Nicks ──
+    xor r14d, r14d
+.csi_nk_loop:
+    cmp r14, [nick_count]
+    jge .csi_nk_done
+    mov rsi, [nick_names + r14*8]
+    test rsi, rsi
+    jz .csi_nk_next
+    mov rdi, r12
+    call strcmp
+    test rax, rax
+    jnz .csi_nk_next
+    mov r13d, 1
+    mov rsi, r12
+    call write_str_stdout
+    lea rsi, [.csi_eq_nick]
+    call write_str_stdout
+    mov rsi, [nick_values + r14*8]
+    call write_str_stdout
+    call write_nl
+.csi_nk_next:
+    inc r14
+    jmp .csi_nk_loop
+.csi_nk_done:
+
+    ; ── Global nicks ──
+    xor r14d, r14d
+.csi_gnk_loop:
+    cmp r14, [gnick_count]
+    jge .csi_gnk_done
+    mov rsi, [gnick_names + r14*8]
+    test rsi, rsi
+    jz .csi_gnk_next
+    mov rdi, r12
+    call strcmp
+    test rax, rax
+    jnz .csi_gnk_next
+    mov r13d, 1
+    mov rsi, r12
+    call write_str_stdout
+    lea rsi, [.csi_eq_gnick]
+    call write_str_stdout
+    mov rsi, [gnick_values + r14*8]
+    call write_str_stdout
+    call write_nl
+.csi_gnk_next:
+    inc r14
+    jmp .csi_gnk_loop
+.csi_gnk_done:
+
+    ; ── Abbreviations ──
+    xor r14d, r14d
+.csi_ab_loop:
+    cmp r14, [abbrev_count]
+    jge .csi_ab_done
+    mov rsi, [abbrev_names + r14*8]
+    test rsi, rsi
+    jz .csi_ab_next
+    mov rdi, r12
+    call strcmp
+    test rax, rax
+    jnz .csi_ab_next
+    mov r13d, 1
+    mov rsi, r12
+    call write_str_stdout
+    lea rsi, [.csi_eq_abbrev]
+    call write_str_stdout
+    mov rsi, [abbrev_values + r14*8]
+    call write_str_stdout
+    call write_nl
+.csi_ab_next:
+    inc r14
+    jmp .csi_ab_loop
+.csi_ab_done:
+
+    ; ── Bookmarks ──
+    xor r14d, r14d
+.csi_bm_loop:
+    cmp r14, [bm_count]
+    jge .csi_bm_done
+    mov rsi, [bm_names + r14*8]
+    test rsi, rsi
+    jz .csi_bm_next
+    mov rdi, r12
+    call strcmp
+    test rax, rax
+    jnz .csi_bm_next
+    mov r13d, 1
+    mov rsi, r12
+    call write_str_stdout
+    lea rsi, [.csi_eq_bm]
+    call write_str_stdout
+    mov rsi, [bm_paths + r14*8]
+    call write_str_stdout
+    call write_nl
+.csi_bm_next:
+    inc r14
+    jmp .csi_bm_loop
+.csi_bm_done:
+
+    ; ── Colon-prefixed builtins. Only check when the name starts with ':'
+    ;    so plain names don't accidentally match an internal handler.
+    ;    colon_dispatch_table has 16-byte entries (string ptr, handler
+    ;    ptr); x86-64 only supports scale factors of 1/2/4/8, so we walk
+    ;    by raw byte offset in r14 instead of an index.
+    cmp byte [r12], ':'
+    jne .csi_blt_skip
+    xor r14d, r14d                     ; byte offset into table
+.csi_blt_loop:
+    mov rsi, [colon_dispatch_table + r14]
+    test rsi, rsi
+    jz .csi_blt_skip
+    mov rdi, r12
+    call strcmp
+    test rax, rax
+    jnz .csi_blt_next
+    mov r13d, 1
+    mov rsi, r12
+    call write_str_stdout
+    lea rsi, [.csi_eq_builtin]
+    call write_str_stdout
+    call write_nl
+    jmp .csi_blt_skip                  ; builtins are unique by name
+.csi_blt_next:
+    add r14, 16
+    jmp .csi_blt_loop
+.csi_blt_skip:
+
+    ; ── Executable in PATH ──
+    mov rdi, r12
+    call find_in_path
+    test eax, eax
+    jz .csi_exe_done
+    mov r13d, 1
+    mov rsi, r12
+    call write_str_stdout
+    lea rsi, [.csi_eq_exe]
+    call write_str_stdout
+    lea rsi, [exec_path]
+    call write_str_stdout
+    call write_nl
+.csi_exe_done:
+
+    ; Nothing matched anywhere?
+    test r13d, r13d
+    jnz .csi_done
+    mov rsi, r12
+    call write_str_stdout
+    lea rsi, [.csi_notfound]
+    call write_str_stdout
+    call write_nl
+.csi_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.csi_usage:
+    lea rsi, [.csi_usage_msg]
+    call write_str_stdout
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.csi_eq_nick:    db " = nick: ", 0
+.csi_eq_gnick:   db " = gnick: ", 0
+.csi_eq_abbrev:  db " = abbrev: ", 0
+.csi_eq_bm:      db " = bookmark: ", 0
+.csi_eq_builtin: db " = builtin", 0
+.csi_eq_exe:     db " = exe: ", 0
+.csi_notfound:   db " = not found", 0
+.csi_usage_msg:  db "Usage: NAME? shows what NAME resolves to (nick / gnick / abbrev / bookmark / builtin / exe)", 10, 0
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Initialize default color settings
