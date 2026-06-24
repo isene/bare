@@ -265,7 +265,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.39", 10, 0
+version_str:    db "bare 0.2.40", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -809,6 +809,16 @@ _start:
     ; Parse command-line flags (-l/--login, -c "cmd")
     mov qword [login_flag], 0
     mov qword [cmd_flag], 0
+    ; Login shell convention: login(1)/getty/sshd exec the shell with
+    ; argv[0] starting with '-'. Detect that so a raw TTY login sources
+    ; ~/.bare_profile (without it PATH (~/bin) and LS_COLORS stay unset).
+    mov rax, [rsi]           ; argv[0]
+    test rax, rax
+    jz .argv0_login_done
+    cmp byte [rax], '-'
+    jne .argv0_login_done
+    mov qword [login_flag], 1
+.argv0_login_done:
     cmp rdi, 1
     jle .no_args
     ; Check argv[1]
