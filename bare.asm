@@ -265,7 +265,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.40", 10, 0
+version_str:    db "bare 0.2.41", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -733,6 +733,15 @@ valid_storage:  resb 4096
 
 ; Config save timestamp (to prevent overwriting newer config from another terminal)
 config_save_time: resq 1
+
+; Config dirty flag: set ONLY by commands that mutate config state
+; (:nick/:gnick/:abbrev/:bm/:theme/:config/color-set/:save/:restore).
+; save_config is a no-op when clear, so the many bares that exit
+; without changing anything (shell exits, shutdown SIGTERM stampede)
+; never touch ~/.barerc. A never-loaded bare (started while the file
+; was missing or mid-rename) can therefore never publish its compiled
+; defaults over a real config -- the repeat ".barerc nuked" incident.
+config_dirty: resq 1
 
 ; Switch completion buffers
 switch_cmd_buf:  resb 256               ; command name extracted from line
@@ -11787,6 +11796,7 @@ config_add_bookmark:
 ; config_set_color: rdi = color name (after "c_"), rsi = value string
 ; Table-driven: searches color_name_table for match
 config_set_color:
+    mov qword [config_dirty], 1
     push rbx
     push r12
     push r13
@@ -12862,6 +12872,7 @@ handle_nick:
     mov rdi, [r12 + 8]
     test rdi, rdi
     jz .hn_list
+    mov qword [config_dirty], 1
 
     ; Check for -name (delete)
     cmp byte [rdi], '-'
@@ -13005,6 +13016,7 @@ handle_gnick:
     mov rdi, [r12 + 8]
     test rdi, rdi
     jz .hg_list
+    mov qword [config_dirty], 1
 
     cmp byte [rdi], '-'
     je .hg_delete
@@ -13130,6 +13142,7 @@ handle_abbrev:
     mov rdi, [r12 + 8]
     test rdi, rdi
     jz .hab_list
+    mov qword [config_dirty], 1
 
     cmp byte [rdi], '-'
     je .hab_delete
@@ -13278,6 +13291,7 @@ handle_rehash:
 .hr_msg_len equ $ - .hr_msg
 
 handle_save:
+    mov qword [config_dirty], 1
     call save_config
     mov rax, SYS_WRITE
     mov rdi, 1
@@ -13613,6 +13627,7 @@ handle_bm:
     mov rdi, [r12 + 8]
     test rdi, rdi
     jz .hbm_list
+    mov qword [config_dirty], 1
 
     ; Check for -name (delete)
     cmp byte [rdi], '-'
@@ -15574,6 +15589,7 @@ handle_theme:
     mov rdi, [r12 + 8]
     test rdi, rdi
     jz .ht_list
+    mov qword [config_dirty], 1
 
     ; Find theme by name
     lea r13, [theme_names]
@@ -15806,6 +15822,7 @@ handle_config:
     mov rsi, [r12 + 16]
     test rsi, rsi
     jz .hcfg_show_key
+    mov qword [config_dirty], 1
 
     ; Set key = value (delegate to config parser logic)
     ; For now, handle known keys
@@ -16095,6 +16112,11 @@ save_config:
     push r12
     push r13
 
+    ; Nothing changed in THIS shell -> no-op. Also skips the two
+    ; rename(2) calls that used to dominate idle-exit runtime.
+    cmp qword [config_dirty], 0
+    je .sc_done_clean
+
     ; Check if config file on disk is newer than our last save
     ; (another terminal may have saved a newer config)
     sub rsp, 144
@@ -16107,9 +16129,10 @@ save_config:
     mov rax, [rsp + 88]       ; file mtime
     cmp rax, [config_save_time]
     jle .sc_no_stat           ; file is older or same, safe to write
-    ; File is newer than our last save, skip to avoid overwriting
-    cmp qword [config_save_time], 0
-    je .sc_no_stat            ; first save (time=0), always write
+    ; File is newer than our last save: another shell (or the user)
+    ; wrote it after we loaded. NEVER overwrite -- this held for
+    ; loaded shells but a time=0 bypass let never-loaded shells
+    ; clobber a real config with compiled defaults (removed 2026-07-07).
     add rsp, 144
     jmp .sc_done
 .sc_no_stat:
@@ -16590,6 +16613,7 @@ save_config:
     mov [config_save_time], rax
     add rsp, 144
 
+.sc_done_clean:
 .sc_done:
     pop r13
     pop r12
