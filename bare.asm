@@ -26,6 +26,8 @@ DEFAULT REL
 %define SYS_PIPE      22
 %define SYS_DUP2      33
 %define SYS_RENAME    82
+%define SYS_LINK      86
+%define SYS_UNLINK    87
 %define SYS_FORK      57
 %define SYS_EXECVE    59
 %define SYS_EXIT      60
@@ -265,7 +267,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.41", 10, 0
+version_str:    db "bare 0.2.42", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -16155,8 +16157,13 @@ save_config:
     inc rdi
     jmp .sc_cp_tmp
 .sc_cp_tmp_done:
-    mov dword [rdi], '.tmp'             ; overwrites NUL with .tmp + ...
-    mov byte [rdi + 4], 0
+    ; Per-process tmp (".tmp<pid>"): concurrent exit-saves (a session
+    ; zap ends every bare at once) must not share one tmp file — the
+    ; first publisher renames it away and corrupts or starves the rest.
+    mov dword [rdi], '.tmp'             ; overwrites NUL
+    add rdi, 4
+    mov rax, [my_pid]
+    call itoa                           ; appends decimal pid + NUL
     lea rsi, [config_path]
     lea rdi, [config_path_bak]
 .sc_cp_bak:
@@ -16580,17 +16587,19 @@ save_config:
     mov rax, SYS_CLOSE
     mov rdi, r12
     syscall
-    ; Atomic publish: rename(config_path, config_path_bak), then
-    ; rename(config_path_tmp, config_path). The first may fail with
-    ; ENOENT on a brand-new install (no prior config_path exists);
-    ; that's fine — we just don't write a .bak this round. The second
-    ; rename MUST succeed for the new config to take effect; on
-    ; failure, unlink the .tmp so we don't leave a half-written file.
-    mov rax, SYS_RENAME
+    ; No-gap publish: snapshot the current config to .bak via link(2)
+    ; (same bytes under a second name; the config file itself never
+    ; moves), then rename the tmp over config_path in ONE atomic step.
+    ; The old rename(rc→bak) + rename(tmp→rc) pair left a window with
+    ; no .barerc at all; a session zap killing several exiting bares
+    ; inside that window nuked the config (2026-07-14, second nuke).
+    mov rax, SYS_UNLINK
+    lea rdi, [config_path_bak]
+    syscall                              ; ignore: first save has no .bak
+    mov rax, SYS_LINK
     lea rdi, [config_path]
     lea rsi, [config_path_bak]
-    syscall
-    ; (ignore result — first save has no original to back up)
+    syscall                              ; ignore: first save has no rc
     mov rax, SYS_RENAME
     lea rdi, [config_path_tmp]
     lea rsi, [config_path]
