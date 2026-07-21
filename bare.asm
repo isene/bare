@@ -21,6 +21,7 @@ DEFAULT REL
 %define SYS_MUNMAP    11
 %define SYS_BRK       12
 %define SYS_IOCTL     16
+%define SYS_FCNTL     72
 %define SYS_POLL      7
 %define POLLIN        1
 %define SYS_PIPE      22
@@ -1562,9 +1563,35 @@ read_line:
 .winch_seq_len equ $ - .winch_seq
 .not_eintr:
     test rax, rax
-    jle .read_eof
+    jle .read_err_or_eof
 
     movzx eax, byte [tmp_buf]
+    jmp .read_have_byte
+
+.read_err_or_eof:
+    ; -EAGAIN means a child process left O_NONBLOCK set on the tty's
+    ; shared open-file description (e.g. Ruby's read_nonblock in a
+    ; picker script). That is NOT end-of-input: clear the flag with
+    ; fcntl and retry, instead of treating it as EOF and exiting the
+    ; shell (which took the whole terminal window down).
+    cmp rax, -11             ; EAGAIN
+    jne .read_eof
+    mov rax, SYS_FCNTL
+    xor edi, edi             ; stdin
+    mov esi, 3               ; F_GETFL
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .read_eof
+    and eax, ~0x800          ; clear O_NONBLOCK (0o4000)
+    mov edx, eax
+    mov rax, SYS_FCNTL
+    xor edi, edi
+    mov esi, 4               ; F_SETFL
+    syscall
+    jmp .read_char
+
+.read_have_byte:
 
     ; Clear any displayed suggestion (erase gray text)
     ; But NOT on ESC (27) - right arrow (ESC[C) needs suggestion intact
