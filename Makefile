@@ -32,4 +32,20 @@ clean:
 bench: bare
 	./bare --bench
 
-.PHONY: install install-plugins uninstall clean bench
+.PHONY: install install-plugins uninstall clean bench deb
+
+# ── Debian package ─────────────────────────────────────────────────────
+# Version comes from the README badge (the repo's single version marker).
+VERSION := $(shell grep -oP 'version-\K[0-9.]+(?=-blue)' README.md)
+
+deb: bare
+	rm -rf pkgroot
+	$(MAKE) install DESTDIR=$(CURDIR)/pkgroot PREFIX=/usr
+	install -Dm644 LICENSE pkgroot/usr/share/doc/bare/copyright
+	install -d pkgroot/DEBIAN
+	printf 'Package: bare\nVersion: $(VERSION)\nArchitecture: amd64\nMaintainer: Geir Isene <g@isene.com>\nSection: shells\nPriority: optional\nHomepage: https://github.com/isene/bare\nDescription: Interactive shell in x86_64 assembly\n No libc, no runtime, pure syscalls. Single static binary with\n microsecond startup: prompt with git integration, tab completion,\n syntax highlighting, nicks, bookmarks, themes, plugins.\n' > pkgroot/DEBIAN/control
+	printf '#!/bin/sh\nset -e\nif command -v add-shell >/dev/null 2>&1; then add-shell /usr/bin/bare; fi\n' > pkgroot/DEBIAN/postinst
+	printf '#!/bin/sh\nset -e\nif command -v remove-shell >/dev/null 2>&1; then remove-shell /usr/bin/bare; fi\n' > pkgroot/DEBIAN/prerm
+	chmod 755 pkgroot/DEBIAN/postinst pkgroot/DEBIAN/prerm
+	dpkg-deb --build --root-owner-group pkgroot bare_$(VERSION)_amd64.deb
+	rm -rf pkgroot
