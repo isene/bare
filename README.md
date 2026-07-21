@@ -201,6 +201,23 @@ The same shell, three languages:
 
 Companion: [bareconf](https://github.com/isene/bareconf) (TUI configurator, built on [crust](https://github.com/isene/crust))
 
+## Packages
+
+**Debian/Ubuntu**: every release ships a dependency-free static amd64
+`.deb` — grab it from the
+[latest release](https://github.com/isene/bare/releases/latest) and:
+
+```bash
+sudo apt install ./bare_*_amd64.deb
+```
+
+**Arch**: a `PKGBUILD` is included in the repo root:
+
+```bash
+git clone https://github.com/isene/bare.git && cd bare && makepkg -si
+```
+
+
 ## License
 
 [Unlicense](https://unlicense.org/) - public domain.

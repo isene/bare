@@ -1,2 +1,4 @@
 bare
 *.o
+*.deb
+pkgroot/
