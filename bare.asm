@@ -9716,12 +9716,17 @@ load_history:
     mov rdi, r12
     syscall
 
+    xor ecx, ecx             ; 0 entries BEFORE the early-out: a 0-byte
+                             ; history (written by exiting a fresh shell)
+                             ; jumped to .lh_done with garbage rcx →
+                             ; huge hist_count → trim indexed hist_lines
+                             ; wild → startup segfault on every later
+                             ; interactive run (2026-07-26)
     test r13, r13
     jle .lh_done
 
     ; Parse lines
     lea rsi, [hist_buf]
-    xor ecx, ecx
 .lh_parse:
     cmp rsi, hist_buf
     jb .lh_done
