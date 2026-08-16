@@ -268,7 +268,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.42", 10, 0
+version_str:    db "bare 0.2.44", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -11580,17 +11580,35 @@ config_add_nick:
     push rbx
     push r12
     push r13
+    push r14
     mov r12, rdi            ; name
     mov r13, rsi            ; value
-    mov rax, [nick_count]
-    cmp rax, MAX_NICKS
+    ; Does this name already exist? Redefining a nick REPLACES it.
+    ; Appending a second entry left expand_nicks — which takes the first
+    ; match — handing back the old value for ever, so `:nick x = new`
+    ; looked like it did nothing.
+    xor r14d, r14d
+.can_find:
+    cmp r14, [nick_count]
+    jge .can_new
+    mov rdi, r12
+    mov rsi, [nick_names + r14*8]
+    call strcmp
+    test rax, rax
+    jz .can_store           ; r14 = the entry to overwrite
+    inc r14
+    jmp .can_find
+.can_new:
+    cmp r14, MAX_NICKS      ; r14 = nick_count here
     jge .can_done
+.can_store:
     ; Get storage position
     lea rbx, [nick_storage]
     add rbx, [nick_storage_pos]
-.can_store:
+    cmp r14, [nick_count]
+    jb .can_value_only      ; replacing: the name is already stored
     ; Copy name
-    mov [nick_names + rax*8], rbx
+    mov [nick_names + r14*8], rbx
     mov rsi, r12
 .can_copy_name:
     mov cl, [rsi]
@@ -11602,9 +11620,11 @@ config_add_nick:
     jmp .can_copy_name
 .can_name_done:
     inc rbx                 ; past null
-    ; Copy value
-    mov rax, [nick_count]
-    mov [nick_values + rax*8], rbx
+.can_value_only:
+    ; Copy value. On a replace the old value's bytes stay in the arena:
+    ; a nick is redefined a handful of times at most, and reclaiming
+    ; them would need a compactor.
+    mov [nick_values + r14*8], rbx
     mov rsi, r13
 .can_copy_val:
     mov cl, [rsi]
@@ -11617,11 +11637,14 @@ config_add_nick:
 .can_val_done:
     ; Update storage position
     inc rbx                  ; past null
-    lea rax, [rbx]
+    mov rax, rbx
     sub rax, nick_storage
     mov [nick_storage_pos], rax
+    cmp r14, [nick_count]
+    jb .can_done             ; replaced in place → the count is unchanged
     inc qword [nick_count]
 .can_done:
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -11632,16 +11655,29 @@ config_add_gnick:
     push rbx
     push r12
     push r13
+    push r14
     mov r12, rdi
     mov r13, rsi
-    mov rax, [gnick_count]
-    cmp rax, MAX_GNICKS
+    xor r14d, r14d                ; redefining replaces — see config_add_nick
+.cag_find:
+    cmp r14, [gnick_count]
+    jge .cag_new
+    mov rdi, r12
+    mov rsi, [gnick_names + r14*8]
+    call strcmp
+    test rax, rax
+    jz .cag_store
+    inc r14
+    jmp .cag_find
+.cag_new:
+    cmp r14, MAX_GNICKS
     jge .cag_done
+.cag_store:
     lea rbx, [gnick_storage]
     add rbx, [gnick_storage_pos]
-.cag_store:
-    mov rax, [gnick_count]
-    mov [gnick_names + rax*8], rbx
+    cmp r14, [gnick_count]
+    jb .cag_value_only
+    mov [gnick_names + r14*8], rbx
     mov rsi, r12
 .cag_copy_name:
     mov cl, [rsi]
@@ -11653,8 +11689,8 @@ config_add_gnick:
     jmp .cag_copy_name
 .cag_name_done:
     inc rbx
-    mov rax, [gnick_count]
-    mov [gnick_values + rax*8], rbx
+.cag_value_only:
+    mov [gnick_values + r14*8], rbx
     mov rsi, r13
 .cag_copy_val:
     mov cl, [rsi]
@@ -11666,11 +11702,14 @@ config_add_gnick:
     jmp .cag_copy_val
 .cag_val_done:
     inc rbx
-    lea rax, [rbx]
+    mov rax, rbx
     sub rax, gnick_storage
     mov [gnick_storage_pos], rax
+    cmp r14, [gnick_count]
+    jb .cag_done
     inc qword [gnick_count]
 .cag_done:
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -11681,16 +11720,29 @@ config_add_abbrev:
     push rbx
     push r12
     push r13
+    push r14
     mov r12, rdi
     mov r13, rsi
-    mov rax, [abbrev_count]
-    cmp rax, MAX_ABBREVS
+    xor r14d, r14d                ; redefining replaces — see config_add_nick
+.cab_find:
+    cmp r14, [abbrev_count]
+    jge .cab_new
+    mov rdi, r12
+    mov rsi, [abbrev_names + r14*8]
+    call strcmp
+    test rax, rax
+    jz .cab_store
+    inc r14
+    jmp .cab_find
+.cab_new:
+    cmp r14, MAX_ABBREVS
     jge .cab_done
+.cab_store:
     lea rbx, [abbrev_storage]
     add rbx, [abbrev_storage_pos]
-.cab_store:
-    mov rax, [abbrev_count]
-    mov [abbrev_names + rax*8], rbx
+    cmp r14, [abbrev_count]
+    jb .cab_value_only
+    mov [abbrev_names + r14*8], rbx
     mov rsi, r12
 .cab_copy_name:
     mov cl, [rsi]
@@ -11702,8 +11754,8 @@ config_add_abbrev:
     jmp .cab_copy_name
 .cab_name_done:
     inc rbx
-    mov rax, [abbrev_count]
-    mov [abbrev_values + rax*8], rbx
+.cab_value_only:
+    mov [abbrev_values + r14*8], rbx
     mov rsi, r13
 .cab_copy_val:
     mov cl, [rsi]
@@ -11715,11 +11767,14 @@ config_add_abbrev:
     jmp .cab_copy_val
 .cab_val_done:
     inc rbx
-    lea rax, [rbx]
+    mov rax, rbx
     sub rax, abbrev_storage
     mov [abbrev_storage_pos], rax
+    cmp r14, [abbrev_count]
+    jb .cab_done
     inc qword [abbrev_count]
 .cab_done:
+    pop r14
     pop r13
     pop r12
     pop rbx
