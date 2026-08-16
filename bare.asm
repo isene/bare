@@ -268,7 +268,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.44", 10, 0
+version_str:    db "bare 0.2.45", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -617,6 +617,11 @@ bm_paths:       resq MAX_BOOKMARKS      ; path strings
 bm_tags:        resq MAX_BOOKMARKS      ; tag strings (space-separated)
 bm_count:       resq 1
 bm_storage:     resb MAX_BM_STORAGE
+bm_storage_pos: resq 1                  ; next free byte in bm_storage. Was
+                                        ; derived by walking the last entry's
+                                        ; strings, which only holds while every
+                                        ; write appends; redefining a bookmark
+                                        ; writes in the middle of the list.
 
 ; Color settings (256-color codes, one byte each)
 color_settings: resb NUM_COLORS
@@ -11788,33 +11793,30 @@ config_add_bookmark:
     push r14
     mov r12, rdi            ; name
     mov r13, rsi            ; value (path + optional tags)
-    mov rax, [bm_count]
-    cmp rax, MAX_BOOKMARKS
+    ; Does this name already exist? Re-bookmarking a name REPLACES it,
+    ; the same as :nick. A second entry would shadow the first for ever
+    ; (lookups take the first match) and both would go into ~/.barerc.
+    xor r14d, r14d
+.cabm_find:
+    cmp r14, [bm_count]
+    jge .cabm_new
+    mov rdi, r12
+    mov rsi, [bm_names + r14*8]
+    call strcmp
+    test rax, rax
+    jz .cabm_store          ; r14 = the entry to overwrite
+    inc r14
+    jmp .cabm_find
+.cabm_new:
+    cmp r14, MAX_BOOKMARKS  ; r14 = bm_count here
     jge .cabm_done
-
-    lea rbx, [bm_storage]
-    mov rcx, rax
-    test rcx, rcx
-    jz .cabm_store
-    ; Find end of storage (after last tag string or path)
-    mov rdi, [bm_paths + rcx*8 - 8]
-    call strlen
-    add rdi, rax
-    inc rdi
-    ; Check if there's a tag string too
-    mov rsi, [bm_tags + rcx*8 - 8]
-    test rsi, rsi
-    jz .cabm_use_path_end
-    mov rdi, rsi
-    call strlen
-    add rdi, rax
-    inc rdi
-.cabm_use_path_end:
-    mov rbx, rdi
 .cabm_store:
-    mov rax, [bm_count]
+    lea rbx, [bm_storage]
+    add rbx, [bm_storage_pos]
+    cmp r14, [bm_count]
+    jb .cabm_value_only     ; replacing: the name is already stored
     ; Copy name
-    mov [bm_names + rax*8], rbx
+    mov [bm_names + r14*8], rbx
     mov rsi, r12
 .cabm_cn:
     mov cl, [rsi]
@@ -11827,11 +11829,11 @@ config_add_bookmark:
 .cabm_cn_done:
     inc rbx
 
+.cabm_value_only:
     ; Parse value: path is before first #, tags after
-    mov rax, [bm_count]
-    mov [bm_paths + rax*8], rbx
+    mov [bm_paths + r14*8], rbx
     mov rsi, r13
-    mov qword [bm_tags + rax*8], 0
+    mov qword [bm_tags + r14*8], 0
 .cabm_cp:
     mov cl, [rsi]
     test cl, cl
@@ -11856,8 +11858,7 @@ config_add_bookmark:
     inc rbx
 .cabm_save_tags:
     ; Copy tags
-    mov rax, [bm_count]
-    mov [bm_tags + rax*8], rbx
+    mov [bm_tags + r14*8], rbx
 .cabm_ct:
     mov cl, [rsi]
     mov [rbx], cl
@@ -11873,6 +11874,11 @@ config_add_bookmark:
     mov byte [rbx], 0
     inc rbx
 .cabm_inc:
+    mov rax, rbx
+    sub rax, bm_storage
+    mov [bm_storage_pos], rax
+    cmp r14, [bm_count]
+    jb .cabm_done            ; replaced in place → the count is unchanged
     inc qword [bm_count]
 .cabm_done:
     pop r14
@@ -15108,6 +15114,14 @@ expand_gnicks:
     push r14
 
     cmp qword [gnick_count], 0
+    je .eg_done
+
+    ; A colon line is a directive to bare itself, not a command line, so
+    ; global aliases stay out of it. They match by substring, so a gnick
+    ; named g rewrote the g in `:gnick g = new` (and in the word gnick)
+    ; before the handler ever saw it: a gnick could not be redefined by
+    ; name, and `:bm w = ~/work` lost its path the same way.
+    cmp byte [line_buf], ':'
     je .eg_done
 
     ; Up to 3 expansion passes
