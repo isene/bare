@@ -268,7 +268,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.46", 10, 0
+version_str:    db "bare 0.2.47", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -14537,6 +14537,8 @@ expand_cmd_subst:
     sub rdx, r13
     jle .ecs_read_done
     syscall
+    cmp rax, -4               ; EINTR: a signal here would otherwise cut
+    je .ecs_read_loop         ; the substitution output short
     test rax, rax
     jle .ecs_read_done
     add r13, rax
@@ -17332,6 +17334,8 @@ tab_complete_switch:
     jle .tcs_read_done
 .tcs_read_ok:
     syscall
+    cmp rax, -4               ; EINTR: keep reading, a short help text
+    je .tcs_read_loop         ; loses the switch list
     test rax, rax
     jle .tcs_read_done
     add r12, rax
@@ -19574,11 +19578,14 @@ check_git_dirty:
     syscall
 
     sub rsp, 16
+.cgd_read:
     mov rax, SYS_READ
     mov edi, [pipe_fds]
     mov rsi, rsp
     mov rdx, 1
     syscall
+    cmp rax, -4               ; EINTR: a cut read here reads as a clean
+    je .cgd_read              ; tree, and the prompt loses its mark
     mov r12, rax              ; bytes read
     add rsp, 16
 
