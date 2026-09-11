@@ -268,7 +268,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.45", 10, 0
+version_str:    db "bare 0.2.46", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -11047,18 +11047,20 @@ init_timezone:
     syscall
 
     sub rsp, 16
+.itz_read:
     mov rax, SYS_READ
     mov edi, [pipe_fds]
     mov rsi, rsp
     mov rdx, 10
     syscall
+    cmp rax, -4              ; EINTR: tile resizes a window born into a
+    je .itz_read             ; split, and SIGWINCH cuts this read short
     mov rbx, rax             ; bytes read
 
-    mov rax, SYS_CLOSE
-    mov edi, [pipe_fds]
-    syscall
-
-    ; Wait for child
+    ; Wait for the child BEFORE closing the read end. Ubuntu 26.04 ships
+    ; the Rust date, which can send "+0200" and its newline as two writes.
+    ; Closing here hands the second one a broken pipe, and date prints
+    ; "date: write error: Broken pipe" into the fresh terminal.
     sub rsp, 16
     mov rax, SYS_WAIT4
     mov rdi, r12
@@ -11067,6 +11069,10 @@ init_timezone:
     xor r10d, r10d
     syscall
     add rsp, 16
+
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
 
     ; Parse "+HHMM" or "-HHMM" from stack
     cmp rbx, 5
