@@ -268,7 +268,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.47", 10, 0
+version_str:    db "bare 0.2.48", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -705,6 +705,7 @@ prompt_visible_width: resq 1
 
 ; Nick expansion buffer
 nick_expand_buf: resb 4096
+nick_depth:      resb 1                ; nick_run_line nesting, capped
 
 ; Command substitution
 subst_buf:      resb 8192
@@ -6088,17 +6089,26 @@ parse_and_exec_simple:
     call expand_nicks
     test rax, rax
     jz .paes_no_nick
-    ; Nick was expanded, re-parse argv from updated line_buf
+    ; A value with ; && || | or & is a line: run it as typed.
+    lea rdi, [nick_expand_buf]
+    call nick_has_operator
+    test eax, eax
+    jnz .paes_nick_line
+    ; Otherwise re-parse argv from the expansion (line_buf stays intact)
     mov qword [redir_out], 0
     mov qword [redir_in], 0
     mov qword [redir_herestring], 0
     mov qword [redir_append], 0
-    lea rsi, [line_buf]
+    lea rsi, [nick_expand_buf]
     call parse_argv
     cmp qword [argc], 0
     je .paes_done
     call glob_expand_argv
     ; Don't expand nicks again (prevents recursion)
+    jmp .paes_no_nick
+.paes_nick_line:
+    call nick_run_line
+    jmp .paes_done
 .paes_no_nick:
 
     ; Check builtins (use expanded_argv if glob expanded)
@@ -6309,24 +6319,33 @@ parse_and_exec_child:
     call expand_nicks
     test rax, rax
     jz .paec_no_nick
+    ; A value with ; && || | or & is a line: run it here in the pipe
+    ; child, terminal mode switches off, and exit with its status.
+    lea rdi, [nick_expand_buf]
+    call nick_has_operator
+    test eax, eax
+    jnz .paec_nick_line
     mov qword [redir_out], 0
     mov qword [redir_in], 0
     mov qword [redir_herestring], 0
     mov qword [redir_append], 0
-    ; expand_nicks writes the expanded line to line_buf starting at
-    ; offset 0. For a non-pipe command r12 already pointed at line_buf,
-    ; so the old `mov rsi, r12` happened to work. For a pipe segment
-    ; r12 points 9+ bytes into line_buf (where the segment was after
-    ; the splitter NUL-terminated at '|'), so re-parsing from r12 reads
-    ; into the MIDDLE of the just-written expansion — produced
-    ; "command not found: lor=auto" for `... | grep five` because r12
-    ; landed on the 'l' of "color". Always re-parse from line_buf.
-    lea rsi, [line_buf]
+    ; Re-parse from the expansion itself. Before v0.2.48 it was copied
+    ; over line_buf, and re-parsing from r12 (a segment pointer 9+
+    ; bytes into line_buf) read the middle of the new text: "command
+    ; not found: lor=auto" for `... | grep five`.
+    lea rsi, [nick_expand_buf]
     mov r12, rsi
     call parse_argv
     cmp qword [argc], 0
     je .paec_done
     call glob_expand_argv
+    jmp .paec_no_nick
+.paec_nick_line:
+    mov qword [is_tty], 0
+    call nick_run_line
+    mov rax, SYS_EXIT
+    mov rdi, [last_status]
+    syscall
 .paec_no_nick:
     call parse_and_exec_child_argv
 .paec_done:
@@ -12941,11 +12960,9 @@ expand_nicks:
 
 .en_apply:
     mov byte [rdi], 0
-    ; Copy expanded line back to line_buf
-    lea rsi, [nick_expand_buf]
-    lea rdi, [line_buf]
-    call strcpy_rsi_rdi
-    mov [line_len], rax
+    ; The expansion stays in nick_expand_buf. Copying it over line_buf
+    ; (as before v0.2.48) moved the chain runner's pointers into the
+    ; middle of the new text: `w; echo b` ran `o`.
     mov rax, 1
     pop r13
     pop r12
@@ -12957,6 +12974,72 @@ expand_nicks:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; rdi = text. eax = 1 when it holds ; | or & outside quotes, so it is a
+; line to run through the chain parser, not a word list.
+nick_has_operator:
+    xor eax, eax
+    xor ecx, ecx            ; 0 = unquoted, else the open quote byte
+.nho_loop:
+    movzx edx, byte [rdi]
+    test dl, dl
+    jz .nho_ret
+    inc rdi
+    test ecx, ecx
+    jnz .nho_quoted
+    cmp dl, '"'
+    je .nho_open
+    cmp dl, 0x27
+    je .nho_open
+    cmp dl, ';'
+    je .nho_yes
+    cmp dl, '|'
+    je .nho_yes
+    cmp dl, '&'
+    je .nho_yes
+    jmp .nho_loop
+.nho_open:
+    mov ecx, edx
+    jmp .nho_loop
+.nho_quoted:
+    cmp dl, cl
+    jne .nho_loop
+    xor ecx, ecx
+    jmp .nho_loop
+.nho_yes:
+    mov eax, 1
+.nho_ret:
+    ret
+
+; Run nick_expand_buf as if typed. The chain arrays are shared, so the
+; caller's chain is saved around the call, and the text moves to the
+; stack so an inner nick may reuse nick_expand_buf. nick_depth stops a
+; nick whose value names itself.
+%define NICK_MAX_DEPTH 8
+%define NRL_TEXT  4096
+%define NRL_FRAME 4688                  ; text + chain state, 16-aligned
+nick_run_line:
+    cmp byte [nick_depth], NICK_MAX_DEPTH
+    jae .nrl_done
+    inc byte [nick_depth]
+    sub rsp, NRL_FRAME
+    lea rsi, [chain_cmds]
+    lea rdi, [rsp + NRL_TEXT]
+    mov ecx, chain_count + 8 - chain_cmds
+    rep movsb
+    lea rsi, [nick_expand_buf]
+    mov rdi, rsp
+    call strcpy_rsi_rdi
+    mov rdi, rsp
+    call execute_chained_line
+    lea rsi, [rsp + NRL_TEXT]
+    lea rdi, [chain_cmds]
+    mov ecx, chain_count + 8 - chain_cmds
+    rep movsb
+    add rsp, NRL_FRAME
+    dec byte [nick_depth]
+.nrl_done:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
