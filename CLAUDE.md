@@ -109,7 +109,7 @@ Local labels (`.name`) are scoped to the enclosing global label. A global label 
 - `print_prompt_dynamic`: prompt with user@host:cwd/ git-indicator >
 - `check_builtin`: table-driven colon command dispatch
 - `cmd_show_info`: NAME? inline help — looks the bare name up in nicks/gnicks/abbrevs/bookmarks/builtins/PATH and prints every match
-- `parse_and_exec_simple`: nick expansion, fork/exec with cooked mode (also dispatches NAME? before any expansion runs)
+- `parse_and_exec_simple`: nick expansion, fork/exec with cooked mode (also dispatches NAME? before any expansion runs). The expansion stays in `nick_expand_buf`, never over `line_buf`, since the chain runner points into it. A value with `;`, `&&`, `||`, `|` or `&` goes through `nick_run_line`. That saves the chain arrays, copies the text to the stack and re-enters `execute_chained_line`, depth capped at 8
 - `execute_line`: multi-pipe handling (up to 16 segments)
 - `execute_chained_line`: splits by `;`, `&&`, `||`
 - `expand_line`: tilde/variable expansion
