@@ -286,7 +286,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.52", 10, 0
+version_str:    db "bare 0.2.53", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -492,6 +492,8 @@ exp_word_start: resq 1          ; expand_line: start of the current word
 esc_mode:       resb 1          ; put_escaped: 0 plain, 1 in "...", 2 one word
 ecs_in_dq:      resb 1          ; expand_cmd_subst: inside "..."
 cd_dash_print:  resb 1          ; cd - prints the directory it went to
+stdin_seekable: resb 1          ; 0 unknown, 1 a file, 2 a pipe
+input_fd:       resd 1          ; where commands come from: 0, or the script
 
 ; Leading-env prefix support: `VAR=val [VAR2=val2 ...] cmd args`.
 ; Detected after parse_argv; applied in the child between fork and
@@ -1001,16 +1003,25 @@ _start:
     syscall
     test rax, rax
     js .script_open_fail
-    ; Move fd onto stdin (fd 0). dup2 closes fd 0 first.
-    mov rdi, rax                       ; old fd
+    ; Keep the script on a high fd, closed on exec (bash uses 255). It
+    ; used to go onto stdin, so a command in the script read the rest
+    ; of the script instead of the keyboard or the piped-in data.
+    mov rdi, rax
     push rdi
-    xor esi, esi                       ; new fd = 0
-    mov rax, SYS_DUP2
+    mov esi, F_DUPFD_CLOEXEC
+    mov edx, 200
+    mov rax, SYS_FCNTL
     syscall
     pop rdi
-    ; Close the original (now we're reading via fd 0).
+    test eax, eax
+    js .script_keep_fd
+    mov [input_fd], eax
     mov rax, SYS_CLOSE
     syscall
+    jmp .script_fd_set
+.script_keep_fd:
+    mov [input_fd], edi
+.script_fd_set:
     mov qword [script_mode], 1
     jmp .no_args
 
@@ -1059,6 +1070,8 @@ _start:
     ; `echo cmd | shell` benchmark even though it's not a fair test of
     ; bare's interactive use case. Now non-interactive bare skips all
     ; the editline / history / completion setup.
+    cmp qword [script_mode], 0     ; a script never edits lines, even
+    jne .not_tty                   ; with the keyboard on stdin
     mov rax, SYS_IOCTL
     xor edi, edi
     mov esi, TCGETS
@@ -1275,11 +1288,18 @@ _start:
     mov [line_len], rax
 .no_time_prefix:
 
-    ; Record start time
+    ; Record start time: for `time`, and for the slow-command notice
+    ; and right prompt, which only the interactive shell shows
+    cmp qword [is_tty], 0
+    jne .rec_start
+    cmp qword [time_flag], 0
+    je .no_rec_start
+.rec_start:
     mov rax, SYS_CLOCK_GETTIME
     mov rdi, CLOCK_MONOTONIC
     lea rsi, [cmd_start_time]
     syscall
+.no_rec_start:
 
     ; Execute the line (handles chains, pipes, background)
     mov byte [chain_abort], 0
@@ -1363,16 +1383,17 @@ _start:
     syscall
 .no_time_output:
 
+    ; Interactive only: a script printed "[bare] Command took 5s" into
+    ; its output, and stat'ed ~/.pointer/lastdir after every line.
+    cmp qword [is_tty], 0
+    je .main_loop
     ; Record end time and show duration
     mov rax, SYS_CLOCK_GETTIME
     mov rdi, CLOCK_MONOTONIC
     lea rsi, [cmd_end_time]
     syscall
     call show_cmd_duration
-    cmp qword [is_tty], 0
-    je .skip_rprompt
     call show_rprompt
-.skip_rprompt:
 
     ; Check ~/.pointer/lastdir for file manager auto-cd
     call check_lastdir
@@ -1521,9 +1542,55 @@ read_line:
 
     ; Non-interactive: read until newline or EOF
     xor r12d, r12d
+    cmp byte [stdin_seekable], 0     ; 0 = not yet known
+    jne .rl_seek_known
+    mov rax, SYS_LSEEK
+    mov edi, [input_fd]
+    xor esi, esi
+    mov edx, 1                       ; SEEK_CUR
+    syscall
+    mov byte [stdin_seekable], 2     ; 2 = a pipe
+    test rax, rax
+    js .rl_seek_known
+    mov byte [stdin_seekable], 1     ; 1 = a file
+.rl_seek_known:
+    cmp byte [stdin_seekable], 1
+    jne .rl_pipe_read
+    ; A script file: read a block, keep its first line and seek back to
+    ; just after it, so a command that reads stdin still gets the rest.
+    ; Two syscalls a line; it was one per byte. A pipe cannot seek, so
+    ; it keeps the byte reads, as in bash.
+    mov rax, SYS_READ
+    mov edi, [input_fd]
+    lea rsi, [line_buf]
+    mov edx, 16382
+    syscall
+    test rax, rax
+    jle .rl_pipe_eof
+    xor ecx, ecx
+.rl_blk_scan:
+    cmp rcx, rax
+    jae .rl_blk_noeol
+    cmp byte [line_buf + rcx], 10
+    je .rl_blk_eol
+    inc rcx
+    jmp .rl_blk_scan
+.rl_blk_eol:
+    mov r12, rcx
+    lea rsi, [rcx + 1]
+    sub rsi, rax                     ; minus the bytes after the newline
+    jz .rl_pipe_done
+    mov rax, SYS_LSEEK
+    mov edi, [input_fd]
+    mov edx, 1                       ; SEEK_CUR
+    syscall
+    jmp .rl_pipe_done
+.rl_blk_noeol:
+    mov r12, rax                     ; last line has no newline
+    jmp .rl_pipe_done
 .rl_pipe_read:
     mov rax, SYS_READ
-    xor edi, edi
+    mov edi, [input_fd]
     lea rsi, [line_buf + r12]
     mov rdx, 1
     syscall
@@ -6425,6 +6492,24 @@ parse_and_exec_simple:
     and eax, 0xF000
     cmp eax, 0x4000         ; S_IFDIR
     jne .paes_not_dir
+    ; A folder named like a program (./test, ./man) used to win over
+    ; the program. A bare name found in the program list runs it; the
+    ; list is only searched in this rare case.
+    mov rdi, [r13]
+.paes_ad_slash:
+    mov al, [rdi]
+    test al, al
+    jz .paes_ad_name
+    cmp al, '/'
+    je .paes_ad_cd
+    inc rdi
+    jmp .paes_ad_slash
+.paes_ad_name:
+    mov rdi, [r13]
+    call init_exe_cache.iec_is_dup
+    test eax, eax
+    jnz .paes_not_dir
+.paes_ad_cd:
     add rsp, 144
     mov rdi, [r13]
     mov rax, SYS_CHDIR
@@ -6707,6 +6792,45 @@ parse_and_exec_child_argv:
     lea rdx, [env_array]     ; use custom env
     syscall
     ; If we get here, exec failed
+
+    ; A program file with no #! line: run it with /bin/sh, as other
+    ; shells do. It used to open in the editor.
+    cmp rax, -8                   ; ENOEXEC
+    jne .exec_not_script
+    mov r12, rdi                  ; the file (syscall keeps rdi)
+    xor ecx, ecx
+.sh_count:
+    cmp qword [rbx + rcx*8], 0
+    je .sh_counted
+    inc rcx
+    jmp .sh_count
+.sh_counted:
+    lea rax, [rcx*8 + 16 + 15]    ; "sh", file, argv[1..], NULL
+    and rax, ~15
+    sub rsp, rax
+    lea rax, [.sh_name]
+    mov [rsp], rax
+    mov [rsp + 8], r12
+    mov edx, 1
+.sh_copy:
+    mov rax, [rbx + rdx*8]
+    mov [rsp + rdx*8 + 8], rax
+    test rax, rax
+    jz .sh_exec
+    inc rdx
+    jmp .sh_copy
+.sh_exec:
+    lea rdi, [.sh_path]
+    mov rsi, rsp
+    lea rdx, [env_array]
+    mov rax, SYS_EXECVE
+    syscall
+    mov rax, SYS_EXIT
+    mov edi, 126
+    syscall
+.sh_path: db "/bin/sh", 0
+.sh_name: db "sh", 0
+.exec_not_script:
 
     ; Auto-open: typed name resolves to a regular non-executable file
     ; → dispatch via the bare-open helper, which queries xdg-mime for
@@ -7866,6 +7990,13 @@ check_builtin:
     lea rdi, [exec_path]
 
 .bi_exec_do:
+    ; The shell ignores SIGINT, SIGTSTP and more, and an ignored signal
+    ; stays ignored across exec: after `exec cat`, Ctrl-C did nothing.
+    ; Save the config first, as exit does.
+    push rdi
+    call save_config
+    call restore_child_signals
+    pop rdi
     ; argv for the new program starts at argv[1] (POSIX: the new
     ; program's argv[0] is the program name as the user typed it).
     ; argv array is already NUL-terminated by the parser.
@@ -7873,6 +8004,7 @@ check_builtin:
     lea rdx, [env_array]
     mov rax, SYS_EXECVE
     syscall
+    call setup_signals       ; still here: the shell ignores them again
     ; If we get here, exec failed even though the file existed (e.g.
     ; ENOEXEC because the file is a script without a recognised
     ; shebang, or EACCES because the file is not executable). Fall
