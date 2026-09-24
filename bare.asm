@@ -136,6 +136,7 @@ DEFAULT REL
 %define HIST_CLINES_MAX 8192        ; lines kept while compacting
 %define MAX_PIPE_SEGMENTS 16
 %define MAX_JOBS 32
+%define JOB_CMD_MAX 128             ; bytes kept of a job's command
 
 ; Color setting indices
 %define C_USER     0
@@ -284,7 +285,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.50", 10, 0
+version_str:    db "bare 0.2.51", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -707,7 +708,8 @@ job_pgids:      resq MAX_JOBS
 job_status:     resq MAX_JOBS           ; 0=running, 1=stopped, 2=done
 job_cmds:       resq MAX_JOBS           ; pointers to command strings
 job_count:      resq 1
-job_cmd_storage: resb 4096
+job_cmd_storage: resb MAX_JOBS * JOB_CMD_MAX
+pipe_pgid:      resq 1          ; process group of the pipe being started
 
 ; Prompt building
 hostname_buf:   resb 256
@@ -1202,6 +1204,10 @@ _start:
     je .main_loop
     call enable_raw_mode
 .main_loop:
+    cmp qword [job_count], 0
+    je .no_reap
+    call reap_jobs
+.no_reap:
     ; Print prompt (tty only)
     cmp qword [is_tty], 0
     je .no_prompt
@@ -1278,6 +1284,16 @@ _start:
     mov byte [chain_abort], 0
     mov rdi, line_buf
     call execute_chained_line
+    ; A script or piped-in commands stop at Ctrl-C, as in bash; only
+    ; the interactive shell goes on to the next prompt.
+    cmp qword [is_tty], 0
+    jne .no_script_abort
+    cmp byte [chain_abort], 0
+    je .no_script_abort
+    mov edi, 130
+    mov rax, SYS_EXIT
+    syscall
+.no_script_abort:
 
     ; If "time" was used, print elapsed
     cmp qword [time_flag], 0
@@ -2166,12 +2182,11 @@ read_line:
     ; Parent: wait
     mov rbx, rax
     sub rsp, 16
-    mov rax, SYS_WAIT4
     mov rdi, rbx
     lea rsi, [rsp]
     xor edx, edx
     xor r10d, r10d
-    syscall
+    call wait4_retry
     add rsp, 16
     ; Read file back into line_buf
     mov rax, SYS_OPEN
@@ -5613,7 +5628,9 @@ execute_line_bg:
     mov r12, rax             ; save pid
     mov rdi, r12
     mov rsi, r15             ; command string
-    call add_bg_job          ; returns rax = job number (1-based), 0 on overflow
+    xor edx, edx             ; running
+    mov rcx, r12             ; its own group (setpgid in the child)
+    call job_add             ; rax = job number (1-based), 0 on overflow
     mov r13, rax             ; save job num
     ; Print "["
     mov rax, SYS_WRITE
@@ -5675,12 +5692,13 @@ execute_line_bg:
     ; orphans the stopped child's pgrp and delivers SIGHUP + SIGCONT,
     ; which vim treats as fatal.
 .bg_wait_remaining:
-    mov rax, SYS_WAIT4
     mov rdi, -1
     xor esi, esi
     xor edx, edx             ; no WUNTRACED -> only return on real exit
     xor r10d, r10d
-    syscall
+    call wait4_retry
+    cmp rax, -4              ; EINTR: a resize must not orphan the job
+    je .bg_wait_remaining
     test rax, rax
     jg .bg_wait_remaining
     mov rax, SYS_EXIT
@@ -5704,6 +5722,9 @@ execute_line_bg:
     pop r12
     pop rbx
     ret
+
+job_stopped_msg: db 10, "[stopped]", 10
+job_stopped_msg_len equ $ - job_stopped_msg
 
 ; Restore default signal handlers (for child processes)
 restore_child_signals:
@@ -5937,7 +5958,10 @@ execute_line:
     jmp .mp_create_pipes
 .mp_pipes_created:
 
-    ; Step 3: fork children for each segment
+    ; Step 3: fork children for each segment. Interactive: all of them
+    ; join the first one's group, which gets the terminal, so Ctrl-Z
+    ; stops the whole pipe as one job (the shell used to hang on it).
+    mov qword [pipe_pgid], 0
     xor r13d, r13d             ; segment index
 .mp_fork_loop:
     cmp r13, [pipe_seg_count]
@@ -5950,6 +5974,21 @@ execute_line:
     js .pipe_error
     ; Parent: save child pid
     mov [pipe_child_pids + r13*8], rax
+    cmp qword [is_tty], 0
+    je .mp_parent_next
+    cmp qword [pipe_pgid], 0
+    jne .mp_join
+    mov [pipe_pgid], rax
+.mp_join:
+    mov rdi, rax
+    mov rsi, [pipe_pgid]
+    mov rax, SYS_SETPGID
+    syscall                  ; the child does it too; either may win
+    test r13, r13
+    jnz .mp_parent_next
+    mov rdi, [pipe_pgid]
+    call tty_set_fg_pgrp
+.mp_parent_next:
     inc r13
     jmp .mp_fork_loop
 
@@ -5958,6 +5997,21 @@ execute_line:
     ; and SIGTSTP, and an ignored signal stays ignored across exec: a
     ; pipeline like `tail -f log | grep x` could not be stopped with
     ; Ctrl-C. Put the defaults back, as the single-command path does.
+    cmp qword [is_tty], 0
+    je .mp_child_nojc
+    mov rax, SYS_SETPGID
+    xor edi, edi
+    mov rsi, [pipe_pgid]     ; 0 in the first child = its own pid
+    syscall
+    mov rdi, [pipe_pgid]
+    test rdi, rdi
+    jnz .mp_child_fg
+    mov rax, SYS_GETPID
+    syscall
+    mov rdi, rax
+.mp_child_fg:
+    call tty_set_fg_pgrp
+.mp_child_nojc:
     call restore_child_signals
     ; Set up stdin from previous pipe (if not first segment)
     test r13, r13
@@ -6024,28 +6078,70 @@ execute_line:
 .mp_wait_all:
     ; Wait for all children
     sub rsp, 16
+    mov qword [rsp], 0
     mov r14, [pipe_seg_count]
     xor r13d, r13d
 .mp_wait_loop:
     cmp r13, r14
     jge .mp_wait_done
-.mp_wait_retry:
-    mov rax, SYS_WAIT4
     mov rdi, [pipe_child_pids + r13*8]
     lea rsi, [rsp]
     xor edx, edx
+    cmp qword [is_tty], 0
+    je .mp_wait_one
+    mov edx, WUNTRACED
+.mp_wait_one:
     xor r10d, r10d
-    syscall
-    cmp rax, -4              ; EINTR (e.g. SIGWINCH while child owns terminal)
-    je .mp_wait_retry
+    call wait4_retry
+    mov eax, [rsp]
+    and eax, 0xFF
+    cmp eax, 0x7F            ; stopped by Ctrl-Z
+    je .mp_stopped
     inc r13
     jmp .mp_wait_loop
 .mp_wait_done:
+    mov rdi, [my_pid]        ; take the terminal back
+    call tty_set_fg_pgrp
     ; Get exit status of last child
     mov eax, [rsp]
     call decode_wait_status
     mov [last_status], rax
     add rsp, 16
+    jmp .pipe_done
+
+.mp_stopped:
+    add rsp, 16
+    mov rdi, [my_pid]
+    call tty_set_fg_pgrp
+    call post_child_restore
+    ; Put the '|' back so :jobs shows the whole line (the children have
+    ; their own copies by now).
+    mov ecx, 1
+.mp_unsplit:
+    cmp rcx, [pipe_seg_count]
+    jae .mp_unsplit_done
+    mov rax, [pipe_segments + rcx*8]
+.mp_unsplit_back:
+    dec rax
+    cmp byte [rax], 0
+    jne .mp_unsplit_back
+    mov byte [rax], '|'
+    inc rcx
+    jmp .mp_unsplit
+.mp_unsplit_done:
+    ; :fg waits for the last command and wakes the whole group
+    mov rax, [pipe_seg_count]
+    mov rdi, [pipe_child_pids + rax*8 - 8]
+    mov rsi, r15
+    mov edx, 1
+    mov rcx, [pipe_pgid]
+    call job_add
+    mov rax, SYS_WRITE
+    mov edi, 1
+    lea rsi, [job_stopped_msg]
+    mov edx, job_stopped_msg_len
+    syscall
+    mov qword [last_status], 148  ; 128 + SIGTSTP(20)
     jmp .pipe_done
 
 .mp_single:
@@ -6360,24 +6456,31 @@ parse_and_exec_simple:
     ; result is the same). Without this, the controlling tty's tpgid
     ; stays as bare's pgrp, which breaks tools that read /proc/PID/stat
     ; to find the foreground process (e.g. tile's exec-here action).
+    ; Only an interactive shell does this (job control). A script and a
+    ; background job keep the command in their own group, as bash does:
+    ; Ctrl-C then reaches a script's command, and :fg can wake a
+    ; background job's command (it hung in a group :fg never woke).
+    cmp qword [is_tty], 0
+    je .paes_no_jobctl
     mov rax, SYS_SETPGID
     mov rdi, r13             ; child pid
     mov rsi, r13             ; pgid = child pid
     syscall                  ; ignore errors (race with child's own setpgid is fine)
     mov rdi, r13
     call tty_set_fg_pgrp     ; tcsetpgrp(0, child_pid)
+.paes_no_jobctl:
     call enable_cooked_mode  ; ICANON + ECHO + ISIG for child
     sub rsp, 16
-    ; Blocking wait with WUNTRACED (detect Ctrl-Z via ISIG)
-.paes_wait_retry:
+    ; Blocking wait; WUNTRACED (see Ctrl-Z) only with job control
     mov rdi, r13
     lea rsi, [rsp]
+    xor edx, edx
+    cmp qword [is_tty], 0
+    je .paes_wait
     mov edx, WUNTRACED
+.paes_wait:
     xor r10d, r10d
-    mov rax, SYS_WAIT4
-    syscall
-    cmp rax, -4              ; EINTR (e.g. SIGWINCH while child owns terminal)
-    je .paes_wait_retry
+    call wait4_retry
 
     ; Check if child was stopped (WIFSTOPPED: status & 0xFF == 0x7F)
     mov eax, [rsp]
@@ -6405,7 +6508,9 @@ parse_and_exec_simple:
     call enable_raw_mode
     mov rdi, r13             ; pid
     lea rsi, [line_buf]      ; command string
-    call add_job
+    mov edx, 1               ; stopped
+    mov rcx, r13             ; its group
+    call job_add
     ; Print job notification
     call write_nl
     mov rax, SYS_WRITE
@@ -6421,11 +6526,21 @@ parse_and_exec_simple:
 
 .child_exec:
     ; Race-free pair with parent's setpgid: whichever side wins, the
-    ; child ends up in its own pgrp == its own pid.
+    ; child ends up in its own pgrp == its own pid. It takes the
+    ; terminal itself too: if the parent was slower, a command that read
+    ; the terminal at once got SIGTTIN and a false "[stopped]". SIGTTOU
+    ; is still ignored here, so this cannot stop us.
+    cmp qword [is_tty], 0
+    je .child_no_jobctl
     mov rax, SYS_SETPGID
     xor edi, edi             ; pid 0 = self
     xor esi, esi             ; pgid 0 = use own pid
     syscall
+    mov rax, SYS_GETPID
+    syscall
+    mov rdi, rax
+    call tty_set_fg_pgrp
+.child_no_jobctl:
     ; Restore default signals in child (SIG_DFL for SIGTSTP etc.)
     call restore_child_signals
     call parse_and_exec_child_argv
@@ -10156,9 +10271,12 @@ setup_signals:
 ; is dicey here (we touch the file system), but the alternative is
 ; losing user state.
 sighup_handler:
+    push rdi                 ; the signal number
     call save_config
     call save_history
-    xor edi, edi
+    call restore_termios     ; after SIGTERM the terminal is still in use
+    pop rdi
+    add edi, 128             ; 128 + signal, not 0: the shell was killed
     mov rax, SYS_EXIT
     syscall
 
@@ -12078,12 +12196,11 @@ init_timezone:
     ; Closing here hands the second one a broken pipe, and date prints
     ; "date: write error: Broken pipe" into the fresh terminal.
     sub rsp, 16
-    mov rax, SYS_WAIT4
     mov rdi, r12
     mov rsi, rsp
     xor edx, edx
     xor r10d, r10d
-    syscall
+    call wait4_retry
     add rsp, 16
 
     mov rax, SYS_CLOSE
@@ -15662,12 +15779,11 @@ expand_cmd_subst:
 
     ; Wait for child
     sub rsp, 8
-    mov rax, SYS_WAIT4
     mov rdi, rbx
     lea rsi, [rsp]
     xor edx, edx
     xor r10d, r10d
-    syscall
+    call wait4_retry
     add rsp, 8
 
     ; Strip trailing newlines from output
@@ -16411,53 +16527,52 @@ show_cmd_duration:
 ; Job control
 ; ══════════════════════════════════════════════════════════════════════
 
-; Add a stopped/background job to the job table
-; rdi = pid, rsi = command string
-; Register a running background job. rdi=pid, rsi=command string.
-; Returns 1-based job number in rax (0 if table is full).
-add_bg_job:
+; job_add — rdi = pid to wait for, rsi = command, edx = status (0
+; running, 1 stopped), rcx = process group. Takes the first free slot,
+; so numbers come back once their jobs are done. The command is cut to
+; fit its slot; it used to be copied whole into a shared 4 KB buffer,
+; and long commands wrote past it. Returns the 1-based job number in
+; rax, 0 when all MAX_JOBS slots are busy.
+job_add:
     push rbx
-    push r12
-    push r13
-    mov r12, rdi             ; pid
-    mov r13, rsi             ; command string
-    mov rax, [job_count]
-    cmp rax, MAX_JOBS
-    jge .abj_full
-    mov [job_pids + rax*8], r12
-    mov qword [job_status + rax*8], 0       ; 0 = running
-    ; Allocate command storage just like add_job does
-    lea rdi, [job_cmd_storage]
-    test rax, rax
-    jz .abj_store
-    mov rdi, [job_cmds + rax*8 - 8]
-    push rax
-    call strlen
+    xor ebx, ebx
+.ja_find:
+    cmp rbx, [job_count]
+    jae .ja_append
+    cmp qword [job_status + rbx*8], 2
+    je .ja_use
+    inc rbx
+    jmp .ja_find
+.ja_append:
+    cmp rbx, MAX_JOBS
+    jae .ja_full
+    inc qword [job_count]
+.ja_use:
+    mov [job_pids + rbx*8], rdi
+    mov [job_pgids + rbx*8], rcx
+    mov [job_status + rbx*8], rdx
+    mov rdi, rbx
+    shl rdi, 7                     ; * JOB_CMD_MAX
+    lea rax, [job_cmd_storage]
     add rdi, rax
-    inc rdi
-    pop rax
-.abj_store:
-    mov [job_cmds + rax*8], rdi
-    mov rsi, r13
-.abj_copy:
-    mov cl, [rsi]
-    mov [rdi], cl
-    test cl, cl
-    jz .abj_copied
+    mov [job_cmds + rbx*8], rdi
+    mov ecx, JOB_CMD_MAX - 1
+.ja_copy:
+    mov al, [rsi]
+    test al, al
+    jz .ja_end
+    mov [rdi], al
     inc rsi
     inc rdi
-    jmp .abj_copy
-.abj_copied:
-    inc qword [job_count]
-    mov rax, [job_count]     ; 1-based job number
-    pop r13
-    pop r12
+    dec ecx
+    jnz .ja_copy
+.ja_end:
+    mov byte [rdi], 0
+    lea rax, [rbx + 1]
     pop rbx
     ret
-.abj_full:
+.ja_full:
     xor eax, eax
-    pop r13
-    pop r12
     pop rbx
     ret
 
@@ -16474,46 +16589,6 @@ tty_set_fg_pgrp:
     syscall
     pop rdi
 .tsfp_ret:
-    ret
-
-add_job:
-    push rbx
-    push r12
-    mov r12, rdi             ; pid
-    mov rax, [job_count]
-    cmp rax, MAX_JOBS
-    jge .aj_done
-
-    mov [job_pids + rax*8], r12
-    mov qword [job_status + rax*8], 1  ; 1 = stopped
-
-    ; Copy command to job_cmd_storage
-    lea rdi, [job_cmd_storage]
-    ; Find end of storage
-    test rax, rax
-    jz .aj_store
-    mov rdi, [job_cmds + rax*8 - 8]
-    push rax
-    call strlen
-    add rdi, rax
-    inc rdi
-    pop rax
-.aj_store:
-    mov [job_cmds + rax*8], rdi
-    ; Copy command string
-.aj_copy:
-    mov cl, [rsi]
-    mov [rdi], cl
-    test cl, cl
-    jz .aj_copied
-    inc rsi
-    inc rdi
-    jmp .aj_copy
-.aj_copied:
-    inc qword [job_count]
-.aj_done:
-    pop r12
-    pop rbx
     ret
 
 ; :jobs - list all jobs
@@ -16639,35 +16714,31 @@ handle_fg:
 
 .hfg_resume:
     cmp rax, [job_count]
-    jge .hfg_no_job
+    jae .hfg_no_job           ; unsigned: `:fg 0` gave -1 and read job -1
     cmp qword [job_status + rax*8], 2
     je .hfg_no_job            ; job already done
 
     mov rbx, rax              ; job index
 
-    ; Send SIGCONT to the whole process group of the job (negative pid).
-    ; Bg children were placed in their own pgrp via setpgid(0,0), so the
-    ; pgid equals the wrapper's pid. Signaling the pgrp wakes the actual
-    ; payload (vim, etc.), not just the wrapper that is stuck in wait4.
-    mov rdi, [job_pids + rbx*8]
+    ; Hand the terminal to the job's group, then wake the whole group:
+    ; a pipe's commands and a background job's command all live there.
+    mov rdi, [job_pgids + rbx*8]
+    call tty_set_fg_pgrp
+    mov rdi, [job_pgids + rbx*8]
     neg rdi
     mov rax, SYS_KILL
     mov rsi, SIGCONT
     syscall
+    mov qword [job_status + rbx*8], 0
 
-    ; Hand the controlling terminal to the job's pgrp so it can read
-    ; keystrokes without re-tripping SIGTTIN.
-    mov rdi, [job_pids + rbx*8]
-    call tty_set_fg_pgrp
-
-    ; Wait for the wrapper (with WUNTRACED so we still see suspends)
+    ; Wait for its last command (WUNTRACED so Ctrl-Z stops it again)
     sub rsp, 16
+    mov qword [rsp], 0
     mov rdi, [job_pids + rbx*8]
     lea rsi, [rsp]
     mov edx, WUNTRACED
     xor r10d, r10d
-    mov rax, SYS_WAIT4
-    syscall
+    call wait4_retry
 
     ; Take the terminal back regardless of how the wait ended.
     push rax
@@ -16677,8 +16748,11 @@ handle_fg:
     syscall
     mov rdi, rax
     call tty_set_fg_pgrp
+    call post_child_restore
     pop rcx
     pop rax
+    test rax, rax
+    jle .hfg_gone             ; already reaped: nothing left to wait for
     ; Check if stopped again
     mov eax, [rsp]
     mov ecx, eax
@@ -16689,6 +16763,12 @@ handle_fg:
     mov qword [job_status + rbx*8], 2
     call decode_wait_status
     mov [last_status], rax
+    add rsp, 16
+    pop r12
+    pop rbx
+    ret
+.hfg_gone:
+    mov qword [job_status + rbx*8], 2
     add rsp, 16
     pop r12
     pop rbx
@@ -16739,10 +16819,13 @@ handle_bg:
     js .hbg_no_job
 .hbg_resume:
     cmp rax, [job_count]
-    jge .hbg_no_job
+    jae .hbg_no_job
+    cmp qword [job_status + rax*8], 2
+    je .hbg_no_job
     mov rbx, rax
-    ; Send SIGCONT
-    mov rdi, [job_pids + rbx*8]
+    ; SIGCONT to the whole group (it went to one process only)
+    mov rdi, [job_pgids + rbx*8]
+    neg rdi
     mov rax, SYS_KILL
     mov rsi, SIGCONT
     syscall
@@ -16766,37 +16849,56 @@ handle_bg:
 .hbg_no_msg: db "bare: no such job", 10
 .hbg_no_len equ $ - .hbg_no_msg
 
-; Reap finished background jobs (non-blocking waitpid)
+; reap_jobs — collect every finished child without blocking, mark its
+; job done, then drop done jobs from the end of the table. The main loop
+; calls it before each prompt while jobs exist; finished background
+; jobs used to stay zombies until :jobs, and the table never shrank.
 reap_jobs:
-    push rbx
-    push r12
     sub rsp, 16
-
-    xor r12d, r12d
-.rj_loop:
-    cmp r12, [job_count]
-    jge .rj_done
-    ; Only check running jobs
-    cmp qword [job_status + r12*8], 0
-    jne .rj_next
-
-    mov rdi, [job_pids + r12*8]
+.rj_wait:
+    mov rdi, -1
     lea rsi, [rsp]
     mov edx, WNOHANG
     xor r10d, r10d
+    call wait4_retry
+    test rax, rax
+    jle .rj_trim                   ; none finished, or no children left
+    xor ecx, ecx
+.rj_find:
+    cmp rcx, [job_count]
+    jae .rj_wait                   ; a pipe's other commands: no job
+    cmp [job_pids + rcx*8], rax
+    jne .rj_find_next
+    cmp qword [job_status + rcx*8], 2
+    jne .rj_mark
+.rj_find_next:
+    inc rcx
+    jmp .rj_find
+.rj_mark:
+    mov qword [job_status + rcx*8], 2
+    jmp .rj_wait
+.rj_trim:
+    mov rcx, [job_count]
+.rj_trim_loop:
+    test rcx, rcx
+    jz .rj_done
+    cmp qword [job_status + rcx*8 - 8], 2
+    jne .rj_done
+    dec rcx
+    jmp .rj_trim_loop
+.rj_done:
+    mov [job_count], rcx
+    add rsp, 16
+    ret
+
+; wait4_retry — wait4 with rdi, rsi, rdx, r10 as for the syscall, again
+; after EINTR. A window resize (SIGWINCH) used to end the wait early:
+; the Ctrl-G editor then read its file back before the edit was done.
+wait4_retry:
     mov rax, SYS_WAIT4
     syscall
-    test rax, rax
-    jle .rj_next             ; not finished yet
-    ; Job finished, mark as done
-    mov qword [job_status + r12*8], 2
-.rj_next:
-    inc r12
-    jmp .rj_loop
-.rj_done:
-    add rsp, 16
-    pop r12
-    pop rbx
+    cmp rax, -4
+    je wait4_retry
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
@@ -18461,12 +18563,11 @@ tab_complete_switch:
 
     ; Wait for child
     sub rsp, 16
-    mov rax, SYS_WAIT4
     mov rdi, r15
     lea rsi, [rsp]
     xor edx, edx
     xor r10d, r10d
-    syscall
+    call wait4_retry
     add rsp, 16
 
     ; Parse help output for switches
@@ -20480,8 +20581,7 @@ try_run_plugin:
     lea rsi, [rsp]
     mov edx, WUNTRACED
     xor r10d, r10d
-    mov rax, SYS_WAIT4
-    syscall
+    call wait4_retry
     ; Extract exit status
     mov eax, [rsp]
     call decode_wait_status
@@ -20704,12 +20804,11 @@ check_git_dirty:
 
     ; Wait for child
     sub rsp, 16
-    mov rax, SYS_WAIT4
     mov rdi, rbx
     lea rsi, [rsp]
     xor edx, edx
     xor r10d, r10d
-    syscall
+    call wait4_retry
     add rsp, 16
 
     ; Cache result
