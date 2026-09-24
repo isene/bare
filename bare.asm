@@ -104,7 +104,8 @@ DEFAULT REL
 %define MAX_ENV_STORAGE 65536
 %define MAX_GLOB_RESULTS 4096
 %define MAX_GLOB_BUF 262144
-%define MAX_TAB_RESULTS 128
+%define MAX_TAB_RESULTS 1024
+%define TAB_BUF_SIZE (MAX_TAB_RESULTS * 300) ; names are cut at 255
 %define MAX_NICKS 64
 %define MAX_NICK_STORAGE 8192
 %define MAX_GNICKS 64
@@ -285,7 +286,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.51", 10, 0
+version_str:    db "bare 0.2.52", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -618,7 +619,7 @@ expanded_argc:  resq 1
 tab_results:    resq MAX_TAB_RESULTS   ; matching completions
 tab_types:      resb MAX_TAB_RESULTS   ; file type for each match (d_type)
 tab_count:      resq 1
-tab_buf:        resb 8192              ; storage for tab matches
+tab_buf:        resb TAB_BUF_SIZE      ; storage for tab matches
 tab_buf_pos:    resq 1
 tab_word_buf:   resb 256               ; current word being completed
 csi_params:     resb 32                ; collected CSI parameter bytes
@@ -9106,7 +9107,7 @@ tab_complete_command:
     ; Get PATH
     push r12
     push r13
-    mov rdi, [envp]
+    lea rdi, [env_array]     ; the live PATH, after `export PATH=...`
     call find_env_path
     pop r13
     pop r12
@@ -9237,6 +9238,7 @@ tab_complete_command:
     inc rcx
     mov rax, [tab_count]
     mov [tab_results + rax*8], rbx
+    mov byte [tab_types + rax], 8    ; DT_REG: a program, never a directory
     inc qword [tab_count]
     add rcx, [tab_buf_pos]
     mov [tab_buf_pos], rcx
@@ -9502,6 +9504,13 @@ tab_complete_file:
     mov [tab_saved_dtype], al
     cmp qword [tab_count], MAX_TAB_RESULTS - 1
     jge .tcf_skip_f
+    ; Room for the typed directory, the name (cut at 255) and a NUL? A
+    ; deep path in a full folder wrote past tab_buf and crashed bare.
+    mov rax, [tab_buf_pos]
+    add rax, r14
+    add rax, 257
+    cmp rax, TAB_BUF_SIZE
+    jae .tcf_skip_f
 
     ; Copy name to tab_buf. Use r9 (not rbx) as the destination cursor:
     ; rbx holds the directory fd, needed for the next getdents64 call.
@@ -19959,7 +19968,7 @@ suggest_correction:
 
     ; Search PATH for similar commands
     ; Simple heuristic: same first char, length within 2
-    mov rdi, [envp]
+    lea rdi, [env_array]
     call find_env_path
     test rax, rax
     jnz .sugc_have_path
