@@ -27,6 +27,7 @@ DEFAULT REL
 %define SYS_PIPE      22
 %define SYS_DUP2      33
 %define SYS_RENAME    82
+%define SYS_WRITEV    20
 %define SYS_LINK      86
 %define SYS_UNLINK    87
 %define SYS_FORK      57
@@ -118,6 +119,10 @@ DEFAULT REL
 ; accumulates in months. Older entries roll off when the cap is hit so
 ; suggestion / Ctrl-R lookups stay O(N) at a small N.
 %define MAX_HIST 1024
+%define HIST_BUF_SIZE   524288      ; in-memory history text (hist_buf)
+%define HIST_LOAD_MAX   262144      ; newest bytes of the file read at startup
+%define HIST_CBUF_SIZE  1048576     ; newest bytes read when compacting the file
+%define HIST_CLINES_MAX 8192        ; lines kept while compacting
 %define MAX_PIPE_SEGMENTS 16
 %define MAX_JOBS 32
 
@@ -268,7 +273,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.48", 10, 0
+version_str:    db "bare 0.2.49", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -379,6 +384,8 @@ shell_name:     db "bare", 0
 
 ; History file path suffix
 hist_suffix:    db "/.bare_history", 0
+hist_tmp_suffix: db ".tmp.", 0
+hex_digits:     db "0123456789abcdef"
 
 ; Background job message
 bg_open:        db "[", 0
@@ -472,7 +479,7 @@ orig_termios:   resb 60
 raw_termios:    resb 60
 
 ; History
-hist_buf:       resb 524288     ; 512KB history buffer
+hist_buf:       resb HIST_BUF_SIZE ; 512KB history buffer
 hist_lines:     resq 8192       ; pointers to history lines
 hist_count:     resq 1
 hist_dirty:     resq 1          ; 1 if an entry rolled off via cap rotation
@@ -485,6 +492,11 @@ hist_persisted: resq 1          ; entries already written to disk; save
                                 ; other's history
 hist_pos:       resq 1          ; current position when browsing
 hist_path:      resb 256        ; full path to history file
+hist_tmp_path:  resb 272        ; <hist_path>.tmp, for the compaction rename
+hist_stat:      resb 144        ; struct stat for the history file size
+hist_cbuf:      resb HIST_CBUF_SIZE ; compaction: the file as read (BSS, untouched until used)
+hist_obuf:      resb HIST_CBUF_SIZE ; compaction: the file as written
+hist_clines:    resq HIST_CLINES_MAX
 
 ; Pipe file descriptors
 pipe_fds:       resd 2
@@ -2369,7 +2381,8 @@ read_line:
     ; Up enters .hp_search_back from a valid spot.
     mov [hist_pos], r8
     mov qword [hist_prefix_len], 0
-    call rewrite_history
+    mov rsi, rdx                    ; the template: delete it from the file
+    call hist_compact
     mov qword [suggestion_ptr], 0
     mov qword [suggestion_len], 0
     call full_redraw
@@ -2381,6 +2394,8 @@ read_line:
     ; position via Up/Down and wants that particular instance gone, not
     ; all duplicates of its content.
     push rcx                        ; preserve mode across shift
+    mov r9, [hist_lines + rax*8]    ; the line being deleted (its bytes
+                                    ; stay in hist_buf until overwritten)
     mov rcx, rax
     inc rax
 .dhe_shift:
@@ -2394,10 +2409,10 @@ read_line:
 .dhe_shift_done:
     dec qword [hist_count]
     mov qword [hist_lines + rcx*8], 0
-    ; Persist: rewrite the file from scratch so the deleted entry is
-    ; gone on disk too. Resets hist_persisted = hist_count so a later
-    ; save_history (called on exit) doesn't append duplicates.
-    call rewrite_history
+    ; Persist: rebuild the file from the file, minus this line. Memory
+    ; is never written over the file: other terminals' lines live there.
+    mov rsi, r9
+    call hist_compact
     mov qword [suggestion_ptr], 0
     mov qword [suggestion_len], 0
     pop rcx
@@ -9552,6 +9567,14 @@ build_hist_path:
     ret
 
 add_history:
+    ; Only an interactive shell keeps history: a script or -c command
+    ; used to add every one of its lines.
+    cmp qword [is_tty], 0
+    je .ah_skip_dup
+    cmp qword [script_mode], 0
+    jne .ah_skip_dup
+    cmp qword [cmd_flag], 0
+    jne .ah_skip_dup
     ; History deduplication check
     mov rax, [config_flags]
 
@@ -9621,7 +9644,7 @@ add_history:
     dec qword [hist_count]
     ; save_history's append-only path can't represent a removal —
     ; the on-disk file still has the older entry. Route the next
-    ; save through rewrite_history.
+    ; save through hist_compact.
     mov byte [hist_dirty], 1
     ; hist_persisted may have included the removed entry. Clamp it
     ; to hist_count so save_history doesn't try to re-append entries
@@ -9663,7 +9686,7 @@ add_history:
 .ah_cap_rotate:
     ; History at MAX_HIST entries — drop the oldest (slot 0), shift the
     ; rest down by one, append at the new tail. Disk file goes through
-    ; rewrite_history at next sync point because save_history is append-
+    ; hist_compact at next sync point because save_history is append-
     ; only and would otherwise re-emit duplicates.
     push rbx
     xor ebx, ebx
@@ -9681,7 +9704,7 @@ add_history:
     dec qword [hist_count]
     ; Reset persisted to 0: next save_history will append the (still
     ; intact) tail of the in-memory list, but the rolled-off oldest
-    ; entry stays in the on-disk file until rewrite_history runs (e.g.
+    ; entry stays in the on-disk file until hist_compact runs (e.g.
     ; via Ctrl-X or :exit). Acceptable: in-memory truncation is what
     ; controls suggestion-lookup cost; on-disk overflow gets compacted
     ; on the next interactive exit.
@@ -9701,85 +9724,193 @@ add_history:
     inc rdi
     ; Mark the in-memory list as needing a full disk rewrite at next
     ; sync — rolled-off oldest entries are still on disk via the
-    ; append-only save_history path. rewrite_history compacts them
+    ; append-only save_history path. hist_compact compacts them
     ; out. Triggering it from the .eof / .bi_exit save path keeps the
     ; common case (no cap hit) on the cheap append-only fast path.
     mov byte [hist_dirty], 1
 
 .ah_store:
+    ; hist_buf never reused freed space, so after 512 KB of commands the
+    ; next copy ran past its end onto hist_lines and crashed the shell.
+    ; Make room first: pack the live entries to the front, dropping the
+    ; oldest if that is still not enough.
+    push rdi
+    lea rdi, [line_buf]
+    call strlen
+    pop rdi
+    lea rdx, [rax + 1]
+    lea rax, [rdi + rdx]
+    cmp rax, hist_buf + HIST_BUF_SIZE
+    jbe .ah_fits
+    call hist_buf_make_room        ; rdi = free position, rcx = hist_count
+.ah_fits:
     mov [hist_lines + rcx*8], rdi
     ; Copy line_buf to hist_buf at rdi
     lea rsi, [line_buf]
     call strcpy_rsi_rdi
     inc qword [hist_count]
+    ; Append it to the file now. Saving only at exit lost the whole
+    ; session on a crash, and let the last terminal to exit overwrite
+    ; what the others had added.
+    mov rax, [hist_count]
+    mov [hist_persisted], rax
+    mov rsi, [hist_lines + rax*8 - 8]
+    call hist_append_disk
+    ret
+
+; hist_buf_make_room — rdx = bytes needed. Packs the live entries to the
+; front of hist_buf in list order (their addresses rise with the index,
+; so each copy moves down), and drops the oldest until rdx bytes fit.
+; Returns rdi = first free byte, rcx = hist_count.
+hist_buf_make_room:
+    push rbx
+    push r12
+    mov r12, rdx
+.hmr_again:
+    lea rdi, [hist_buf]
+    xor ebx, ebx
+.hmr_entry:
+    cmp rbx, [hist_count]
+    jae .hmr_packed
+    mov rsi, [hist_lines + rbx*8]
+    mov [hist_lines + rbx*8], rdi
+.hmr_copy:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz .hmr_copy
+    inc rbx
+    jmp .hmr_entry
+.hmr_packed:
+    lea rax, [rdi + r12]
+    cmp rax, hist_buf + HIST_BUF_SIZE
+    jbe .hmr_done
+    cmp qword [hist_count], 0
+    je .hmr_done
+    xor ebx, ebx                   ; drop the oldest, then pack again
+.hmr_shift:
+    lea rax, [rbx + 1]
+    cmp rax, [hist_count]
+    jae .hmr_shift_done
+    mov rsi, [hist_lines + rax*8]
+    mov [hist_lines + rbx*8], rsi
+    inc rbx
+    jmp .hmr_shift
+.hmr_shift_done:
+    dec qword [hist_count]
+    jmp .hmr_again
+.hmr_done:
+    mov rcx, [hist_count]
+    cmp [hist_persisted], rcx
+    jbe .hmr_ret
+    mov [hist_persisted], rcx
+.hmr_ret:
+    pop r12
+    pop rbx
+    ret
+
+; hist_append_disk — rsi = one history line (NUL-terminated). Appends it
+; plus a newline to the history file in one writev, so two terminals
+; appending at once cannot interleave inside a line. Three syscalls.
+hist_append_disk:
+    cmp byte [hist_path], 0
+    je .had_none                   ; no HOME: no history file
+    push rbx
+    push r12
+    mov r12, rsi
+    mov rdi, rsi
+    call strlen
+    mov rbx, rax
+    mov rax, SYS_OPEN
+    lea rdi, [hist_path]
+    mov esi, O_WRONLY | O_CREAT | O_APPEND
+    mov edx, 0o600
+    syscall
+    test eax, eax
+    js .had_ret
+    push rax                       ; fd
+    sub rsp, 32                    ; two struct iovec
+    mov [rsp], r12
+    mov [rsp + 8], rbx
+    lea rax, [newline]
+    mov [rsp + 16], rax
+    mov qword [rsp + 24], 1
+    mov edi, [rsp + 32]
+    mov rsi, rsp
+    mov edx, 2
+    mov eax, SYS_WRITEV
+    syscall
+    add rsp, 32
+    pop rdi
+    mov eax, SYS_CLOSE
+    syscall
+.had_ret:
+    pop r12
+    pop rbx
+.had_none:
     ret
 
 load_history:
     push rbx
     push r12
     push r13
-    ; Open history file
-    mov rax, SYS_OPEN
-    lea rdi, [hist_path]
-    xor esi, esi             ; O_RDONLY
-    xor edx, edx
-    syscall
+    ; Read the NEWEST end of the file. Reading from the start used to
+    ; stop at 512 KB / 8190 lines and keep the 1024 lines before that
+    ; point, so the next save erased everything newer.
+    lea rdi, [hist_buf]
+    mov esi, HIST_LOAD_MAX
+    call hist_read_file            ; rax = end offset, rdx = start offset
+    xor ecx, ecx                   ; 0 entries BEFORE any early-out: a
+                                   ; garbage rcx here once meant a huge
+                                   ; hist_count and a startup segfault
     test rax, rax
-    js .lh_no_file           ; file doesn't exist
-    mov r12, rax             ; fd
-
-    ; Read into hist_buf (capped to slightly under buffer size).
-    mov rax, SYS_READ
-    mov rdi, r12
-    lea rsi, [hist_buf]
-    mov rdx, 524000
-    syscall
-    mov r13, rax             ; bytes read
-
-    mov rax, SYS_CLOSE
-    mov rdi, r12
-    syscall
-
-    xor ecx, ecx             ; 0 entries BEFORE the early-out: a 0-byte
-                             ; history (written by exiting a fresh shell)
-                             ; jumped to .lh_done with garbage rcx →
-                             ; huge hist_count → trim indexed hist_lines
-                             ; wild → startup segfault on every later
-                             ; interactive run (2026-07-26)
-    test r13, r13
     jle .lh_done
-
-    ; Parse lines
-    lea rsi, [hist_buf]
+    test rdx, rdx                  ; started mid-file: the file is too big,
+    jz .lh_whole                   ; so trim it at exit
+    mov byte [hist_dirty], 1
+.lh_whole:
+    lea r13, [hist_buf + rax]      ; end of text
+    lea rsi, [hist_buf + rdx]
 .lh_parse:
-    cmp rsi, hist_buf
-    jb .lh_done
-    lea rax, [hist_buf + r13]
-    cmp rsi, rax
-    jge .lh_done
-    cmp ecx, 8190
-    jge .lh_done
-
-    mov [hist_lines + rcx*8], rsi
-    inc ecx
-    ; Find end of line
+    cmp rsi, r13
+    jae .lh_done
+    mov rbx, rsi                   ; line start
 .lh_find_nl:
-    cmp byte [rsi], 0
-    je .lh_done
-    cmp byte [rsi], 10
-    je .lh_nl
-    lea rax, [hist_buf + r13]
-    cmp rsi, rax
-    jge .lh_done
+    cmp rsi, r13
+    jae .lh_eol
+    mov al, [rsi]
+    cmp al, 10
+    je .lh_eol
+    test al, al                    ; a NUL ends the line, not the file:
+    je .lh_eol                     ; stopping there erased what followed
     inc rsi
     jmp .lh_find_nl
-.lh_nl:
-    mov byte [rsi], 0
+.lh_eol:
+    mov byte [rsi], 0              ; hist_read_file leaves room at r13
     inc rsi
+    cmp rsi, rbx
+    je .lh_parse
+    cmp byte [rbx], 0
+    je .lh_parse                   ; empty line
+    cmp ecx, 8190
+    jb .lh_store
+    ; Pointer table full: keep the newer half and go on.
+    push rsi
+    push rcx
+    lea rsi, [hist_lines + 4095*8]
+    lea rdi, [hist_lines]
+    mov ecx, 8190 - 4095
+    rep movsq
+    pop rcx
+    pop rsi
+    mov ecx, 8190 - 4095
+.lh_store:
+    mov [hist_lines + rcx*8], rbx
+    inc ecx
     jmp .lh_parse
 
-.lh_no_file:
-    xor ecx, ecx
 .lh_done:
     mov [hist_count], rcx
     ; Trim to MAX_HIST: stale .bare_history files from before the cap
@@ -9805,6 +9936,7 @@ load_history:
     pop rbx
     mov rcx, MAX_HIST
     mov [hist_count], rcx
+    mov byte [hist_dirty], 1       ; the file is over the cap: trim it at exit
 .lh_no_trim:
     ; --- Load-time dedup pass --------------------------------------
     ; add_history dedups every NEW entry, but the file on disk may
@@ -9812,7 +9944,7 @@ load_history:
     ; from a prior session with dedup off. Compact in-place per the
     ; current config so the in-memory list matches the user's
     ; expectation. If we drop any entries, set hist_dirty so the next
-    ; save_history rewrites the file via rewrite_history (the
+    ; save_history rewrites the file via hist_compact (the
     ; append-only path can't shrink the file).
     push rbx
     push r12
@@ -9908,121 +10040,362 @@ load_history:
     pop rbx
     ret
 
-; Rewrite the on-disk history file from scratch to reflect the current
-; in-memory hist_lines. Used after an interactive deletion (Ctrl-X) —
-; the regular save_history is append-only and cannot remove entries.
-; Sets hist_persisted = hist_count so a subsequent save_history at
-; exit doesn't re-append the entries we just persisted.
-rewrite_history:
+; hist_read_file — rdi = buffer, esi = buffer size. Reads the NEWEST
+; (size - 1) bytes of the history file and NUL-terminates them. When it
+; had to start mid-file it skips the partial first line.
+; Returns rax = end offset of the text (0 if there is no file yet, -1 on
+; any other error) and rdx = offset of the first whole line.
+hist_read_file:
     push rbx
     push r12
     push r13
-    mov rax, SYS_OPEN
+    push r14
+    mov r12, rdi
+    lea r13, [rsi - 1]             ; room for text; one byte kept for a NUL
+    xor r14d, r14d                 ; 1 = started mid-file
+    cmp byte [hist_path], 0
+    je .hrf_err                    ; no HOME: no history file
+    mov eax, SYS_OPEN
     lea rdi, [hist_path]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test eax, eax
+    jns .hrf_open
+    cmp eax, -2                    ; ENOENT: no file yet, read as empty
+    jne .hrf_err
+    xor eax, eax
+    jmp .hrf_ret
+.hrf_open:
+    mov ebx, eax
+    mov eax, SYS_FSTAT
+    mov edi, ebx
+    lea rsi, [hist_stat]
+    syscall
+    test eax, eax
+    js .hrf_err_close
+    mov rax, [hist_stat + 48]      ; st_size
+    cmp rax, r13
+    jbe .hrf_read
+    sub rax, r13                   ; only the newest r13 bytes
+    mov rsi, rax
+    mov eax, SYS_LSEEK
+    mov edi, ebx
+    xor edx, edx                   ; SEEK_SET
+    syscall
+    test rax, rax
+    js .hrf_err_close
+    mov r14d, 1
+.hrf_read:
+    xor r8d, r8d                   ; bytes read (r8 survives syscall)
+.hrf_loop:
+    cmp r8, r13
+    jae .hrf_eof
+    mov eax, SYS_READ
+    mov edi, ebx
+    lea rsi, [r12 + r8]
+    mov rdx, r13
+    sub rdx, r8
+    syscall
+    test rax, rax
+    jz .hrf_eof
+    js .hrf_read_err
+    add r8, rax
+    jmp .hrf_loop
+.hrf_read_err:
+    cmp rax, -4                    ; EINTR: a resize signal, read on
+    je .hrf_loop
+    jmp .hrf_err_close
+.hrf_eof:
+    mov byte [r12 + r8], 0
+    mov eax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    xor edx, edx
+    test r14d, r14d
+    jz .hrf_ok
+.hrf_skip:
+    cmp rdx, r8
+    jae .hrf_ok
+    cmp byte [r12 + rdx], 10
+    je .hrf_skipped
+    inc rdx
+    jmp .hrf_skip
+.hrf_skipped:
+    inc rdx
+.hrf_ok:
+    mov rax, r8
+    jmp .hrf_out
+.hrf_err_close:
+    mov eax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+.hrf_err:
+    mov rax, -1
+.hrf_ret:
+    xor edx, edx
+.hrf_out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; hist_compact — rsi = a line to delete everywhere, or 0. Rewrites the
+; history file from the file itself, never from this shell's memory: the
+; file holds every terminal's commands, since each one appends as it
+; runs. Drops the deleted line, applies history_dedup, keeps the newest
+; MAX_HIST lines, writes <hist_path>.tmp.<pid> and renames it into place,
+; so a crash leaves either the old file or the new one, never half.
+; Called at exit when this session trimmed or deduped (hist_dirty), and
+; by Ctrl-X.
+hist_compact:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, rsi
+    lea rdi, [hist_cbuf]
+    mov esi, HIST_CBUF_SIZE
+    call hist_read_file
+    test rax, rax
+    js .hc_ret                     ; unreadable: never replace it
+    lea r12, [hist_cbuf + rax]     ; end of text
+    lea rbx, [hist_cbuf + rdx]     ; cursor
+    xor r13d, r13d                 ; lines kept
+.hc_line:
+    cmp rbx, r12
+    jae .hc_split_done
+    mov rsi, rbx
+.hc_eol:
+    cmp rsi, r12
+    jae .hc_eol_at
+    mov al, [rsi]
+    cmp al, 10
+    je .hc_eol_at
+    test al, al
+    je .hc_eol_at
+    inc rsi
+    jmp .hc_eol
+.hc_eol_at:
+    mov byte [rsi], 0              ; hist_read_file left room at r12
+    cmp rsi, rbx
+    je .hc_next                    ; empty line
+    test r15, r15
+    jz .hc_keep
+    push rsi
+    mov rdi, rbx
+    mov rsi, r15
+    call strcmp
+    pop rsi
+    test eax, eax
+    jz .hc_next                    ; the line being deleted
+.hc_keep:
+    cmp r13, HIST_CLINES_MAX
+    jb .hc_store
+    push rsi                       ; table full: keep the newer half
+    lea rsi, [hist_clines + (HIST_CLINES_MAX / 2) * 8]
+    lea rdi, [hist_clines]
+    mov ecx, HIST_CLINES_MAX / 2
+    rep movsq
+    pop rsi
+    mov r13d, HIST_CLINES_MAX / 2
+.hc_store:
+    mov [hist_clines + r13*8], rbx
+    inc r13
+.hc_next:
+    lea rbx, [rsi + 1]
+    jmp .hc_line
+.hc_split_done:
+    mov rax, [config_flags]
+    test rax, (1 << CFG_HIST_DEDUP_SMART)
+    jnz .hc_smart
+    test rax, (1 << CFG_HIST_DEDUP_FULL)
+    jnz .hc_full
+    jmp .hc_trim
+
+.hc_smart:                         ; collapse runs of the same line
+    xor r8d, r8d                   ; write index
+    xor r9d, r9d                   ; read index
+.hc_sm:
+    cmp r9, r13
+    jae .hc_sm_done
+    test r8, r8
+    jz .hc_sm_keep
+    mov rdi, [hist_clines + r8*8 - 8]
+    mov rsi, [hist_clines + r9*8]
+    push r8
+    push r9
+    call strcmp
+    pop r9
+    pop r8
+    test eax, eax
+    jz .hc_sm_skip
+.hc_sm_keep:
+    mov rax, [hist_clines + r9*8]
+    mov [hist_clines + r8*8], rax
+    inc r8
+.hc_sm_skip:
+    inc r9
+    jmp .hc_sm
+.hc_sm_done:
+    mov r13, r8
+    jmp .hc_trim
+
+.hc_full:                          ; keep the last occurrence of each line
+    cmp r13, 4 * MAX_HIST          ; O(N^2): look at the newest 4096 only
+    jbe .hc_fu_go
+    mov rcx, r13
+    sub rcx, 4 * MAX_HIST
+    lea rsi, [hist_clines + rcx*8]
+    lea rdi, [hist_clines]
+    mov ecx, 4 * MAX_HIST
+    rep movsq
+    mov r13d, 4 * MAX_HIST
+.hc_fu_go:
+    xor r8d, r8d                   ; write index
+    xor r9d, r9d                   ; i
+.hc_fu_outer:
+    cmp r9, r13
+    jae .hc_fu_done
+    lea r10, [r9 + 1]              ; j
+.hc_fu_inner:
+    cmp r10, r13
+    jae .hc_fu_keep
+    mov rdi, [hist_clines + r9*8]
+    mov rsi, [hist_clines + r10*8]
+    push r8
+    push r9
+    push r10
+    call strcmp
+    pop r10
+    pop r9
+    pop r8
+    test eax, eax
+    jz .hc_fu_skip                 ; a later copy exists
+    inc r10
+    jmp .hc_fu_inner
+.hc_fu_keep:
+    mov rax, [hist_clines + r9*8]
+    mov [hist_clines + r8*8], rax
+    inc r8
+.hc_fu_skip:
+    inc r9
+    jmp .hc_fu_outer
+.hc_fu_done:
+    mov r13, r8
+
+.hc_trim:
+    xor r14d, r14d                 ; first line to write
+    cmp r13, MAX_HIST
+    jbe .hc_out
+    lea r14, [r13 - MAX_HIST]
+.hc_out:
+    lea rdi, [hist_obuf]
+.hc_out_line:
+    cmp r14, r13
+    jae .hc_out_done
+    mov rsi, [hist_clines + r14*8]
+.hc_out_copy:
+    mov al, [rsi]
+    test al, al
+    jz .hc_out_nl
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .hc_out_copy
+.hc_out_nl:
+    mov byte [rdi], 10
+    inc rdi
+    inc r14
+    jmp .hc_out_line
+.hc_out_done:
+    lea rax, [hist_obuf]
+    sub rdi, rax
+    mov r12, rdi                   ; bytes to write
+
+    ; <hist_path>.tmp.<pid in hex>: two terminals compacting at once must
+    ; not write into the same temporary file.
+    lea rdi, [hist_tmp_path]
+    lea rsi, [hist_path]
+    call strcpy_rsi_rdi
+    lea rsi, [hist_tmp_suffix]
+    call strcpy_rsi_rdi
+    push rdi
+    mov eax, SYS_GETPID
+    syscall
+    pop rdi
+    mov ecx, 8
+.hc_pid:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0xf
+    movzx edx, byte [hex_digits + rdx]
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .hc_pid
+    mov byte [rdi], 0
+
+    mov eax, SYS_OPEN
+    lea rdi, [hist_tmp_path]
     mov esi, O_WRONLY | O_CREAT | O_TRUNC
-    mov edx, 0o644
+    mov edx, 0o600
+    syscall
+    test eax, eax
+    js .hc_ret
+    mov ebx, eax
+    xor r13d, r13d                 ; bytes written
+.hc_write:
+    cmp r13, r12
+    jae .hc_written
+    mov eax, SYS_WRITE
+    mov edi, ebx
+    lea rsi, [hist_obuf + r13]
+    mov rdx, r12
+    sub rdx, r13
     syscall
     test rax, rax
-    js .rh_done
-    mov r12, rax                         ; fd
-    xor r13d, r13d
-.rh_loop:
-    cmp r13, [hist_count]
-    jge .rh_close
-    mov rsi, [hist_lines + r13*8]
-    test rsi, rsi
-    jz .rh_next
-    push r13
-    mov rdi, rsi
-    call strlen
-    mov rdx, rax
-    mov rax, SYS_WRITE
-    mov rdi, r12
-    mov rsi, [hist_lines + r13*8]
+    jle .hc_write_fail
+    add r13, rax
+    jmp .hc_write
+.hc_write_fail:
+    cmp rax, -4                    ; EINTR
+    je .hc_write
+    mov eax, SYS_CLOSE             ; disk full or similar: keep the old file
+    mov edi, ebx
     syscall
-    mov rax, SYS_WRITE
-    mov rdi, r12
-    lea rsi, [newline]
-    mov rdx, 1
+    mov eax, SYS_UNLINK
+    lea rdi, [hist_tmp_path]
     syscall
-    pop r13
-.rh_next:
-    inc r13
-    jmp .rh_loop
-.rh_close:
-    mov rax, SYS_CLOSE
-    mov rdi, r12
+    jmp .hc_ret
+.hc_written:
+    mov eax, SYS_CLOSE
+    mov edi, ebx
     syscall
-    mov rax, [hist_count]
-    mov [hist_persisted], rax
-.rh_done:
+    mov eax, SYS_RENAME
+    lea rdi, [hist_tmp_path]
+    lea rsi, [hist_path]
+    syscall
+.hc_ret:
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
     ret
 
+; save_history — every command is already on disk (hist_append_disk).
+; What is left at exit: if this session trimmed or deduped its list,
+; compact the file so it stays small.
 save_history:
-    ; If the cap rolled an entry off this session, the disk file holds
-    ; entries that aren't in memory anymore — append-only writes would
-    ; leave them stranded. Detour through rewrite_history (full O_TRUNC
-    ; rewrite) and clear the flag. Concurrent-bare-instance protection
-    ; still holds for the common case (no cap hit, hist_dirty == 0).
     cmp byte [hist_dirty], 0
-    je .sh_append_path
+    je .sh_ret
     mov byte [hist_dirty], 0
-    call rewrite_history
-    ret
-.sh_append_path:
-    push rbx
-    push r12
-    push r13
-    ; Append-only: open with O_APPEND (no O_TRUNC) and write only the
-    ; entries added since the last save. Concurrent bare instances
-    ; can both write without clobbering each other's additions.
-    mov rax, SYS_OPEN
-    lea rdi, [hist_path]
-    mov esi, O_WRONLY | O_CREAT | O_APPEND
-    mov edx, 0o644
-    syscall
-    test rax, rax
-    js .sh_done
-    mov r12, rax             ; fd
-
-    mov r13, [hist_persisted]
-.sh_loop:
-    cmp r13, [hist_count]
-    jge .sh_close
-    mov rsi, [hist_lines + r13*8]
-    test rsi, rsi
-    jz .sh_next
-    push r13
-    mov rdi, rsi
-    call strlen
-    mov rdx, rax
-    mov rax, SYS_WRITE
-    mov rdi, r12
-    mov rsi, [hist_lines + r13*8]
-    syscall
-    mov rax, SYS_WRITE
-    mov rdi, r12
-    lea rsi, [newline]
-    mov rdx, 1
-    syscall
-    pop r13
-.sh_next:
-    inc r13
-    jmp .sh_loop
-
-.sh_close:
-    mov rax, SYS_CLOSE
-    mov rdi, r12
-    syscall
-    mov rax, [hist_count]
-    mov [hist_persisted], rax
-.sh_done:
-    pop r13
-    pop r12
-    pop rbx
+    xor esi, esi
+    call hist_compact
+.sh_ret:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
@@ -14040,6 +14413,23 @@ handle_dirs:
 handle_rmhistory:
     mov qword [hist_count], 0
     mov qword [hist_pos], 0
+    mov qword [hist_persisted], 0
+    mov byte [hist_dirty], 0
+    ; Empty the file too: it used to clear only this shell's memory, and
+    ; the file (now appended on every command) kept everything.
+    cmp byte [hist_path], 0
+    je .rmh_said
+    mov eax, SYS_OPEN
+    lea rdi, [hist_path]
+    mov esi, O_WRONLY | O_TRUNC
+    xor edx, edx
+    syscall
+    test eax, eax
+    js .rmh_said
+    mov edi, eax
+    mov eax, SYS_CLOSE
+    syscall
+.rmh_said:
     mov rax, SYS_WRITE
     mov rdi, 1
     lea rsi, [.rmh_msg]
