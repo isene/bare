@@ -104,6 +104,7 @@ DEFAULT REL
 %define MAX_ENV_STORAGE 65536
 %define MAX_GLOB_RESULTS 4096
 %define MAX_GLOB_BUF 262144
+%define GLOB_QUEUE_MAX 262144
 %define MAX_TAB_RESULTS 1024
 %define TAB_BUF_SIZE (MAX_TAB_RESULTS * 300) ; names are cut at 255
 %define MAX_NICKS 64
@@ -286,7 +287,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.53", 10, 0
+version_str:    db "bare 0.2.54", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -609,7 +610,9 @@ glob_buf:       resb MAX_GLOB_BUF      ; storage for matched filenames
 glob_buf_pos:   resq 1
 glob_dir_buf:   resb 4096              ; buffer for getdents64
 glob_path_buf:  resb 4096              ; temp for building paths
-glob_queue:     resb 32768             ; BFS queue for ** glob (null-separated dir paths)
+glob_queue:     resb GLOB_QUEUE_MAX    ; BFS queue for ** glob (null-separated dir paths)
+glob_cur_dir:   resb 4096              ; the ** folder being scanned
+glob_dot_implied: resb 1               ; ** had no folder in front: print no ./
 glob_queue_wpos: resq 1               ; write position in queue
 glob_queue_rpos: resq 1               ; read position in queue
 
@@ -8529,6 +8532,7 @@ glob_recursive:
     ; Build starting directory in glob_queue
     mov qword [glob_queue_wpos], 0
     mov qword [glob_queue_rpos], 0
+    mov byte [glob_dot_implied], 0
     cmp r13, r12
     je .gr_prefix_dot
     ; Copy prefix (before **)
@@ -8542,6 +8546,8 @@ glob_recursive:
 .gr_cp_pre:
     test rcx, rcx
     jz .gr_prefix_dot
+    cmp rcx, 3000                  ; paths are built below the pattern
+    ja .gr_done
     xor eax, eax
 .gr_cp_pre_loop:
     cmp rax, rcx
@@ -8557,6 +8563,7 @@ glob_recursive:
     jmp .gr_bfs_loop
 
 .gr_prefix_dot:
+    mov byte [glob_dot_implied], 1
     mov byte [glob_queue], '.'
     mov byte [glob_queue + 1], 0
     mov qword [glob_queue_wpos], 2
@@ -8567,13 +8574,14 @@ glob_recursive:
     cmp rax, [glob_queue_wpos]
     jge .gr_done
 
-    ; Get current directory path from queue
-    lea r15, [glob_queue + rax]  ; r15 = current dir path
-    ; Advance rpos past this entry
-    mov rdi, r15
-    call strlen
+    ; Take the next folder off the queue, into its own buffer so the
+    ; queue can be compacted while this folder is scanned
+    lea rsi, [glob_queue + rax]
+    lea rdi, [glob_cur_dir]
+    call strcpy_rsi_rdi
     inc rax                  ; skip null
     add [glob_queue_rpos], rax
+    lea r15, [glob_cur_dir]  ; r15 = current dir path
 
     ; Scan this directory
     mov rax, SYS_OPEN
@@ -8635,17 +8643,10 @@ glob_recursive:
     ; Match! Build full path: dir/name -> glob_buf
     cmp qword [glob_count], MAX_GLOB_RESULTS - 1
     jge .gr_no_file_match
-    mov rdi, [rsp]           ; d_name
-    ; Build path in glob_path_buf
-    push rdi
-    lea rdi, [glob_path_buf]
-    mov rsi, r15             ; dir path
-    call strcpy_rsi_rdi
-    lea rdi, [glob_path_buf + rax]
-    mov byte [rdi], '/'
-    inc rdi
-    pop rsi                  ; d_name
-    call strcpy_rsi_rdi
+    mov rsi, [rsp]           ; d_name
+    call .gr_join
+    test rax, rax
+    js .gr_no_file_match
     ; Copy to glob_buf
     lea rsi, [glob_path_buf]
     mov rdi, rsi
@@ -8681,26 +8682,28 @@ glob_recursive:
     ; If directory, add to BFS queue
     cmp r13d, 4              ; DT_DIR
     jne .gr_skip_entry
-    ; Build subdir path: dir/name
-    lea rdi, [glob_path_buf]
-    mov rsi, r15
-    call strcpy_rsi_rdi
-    lea rdi, [glob_path_buf + rax]
-    mov byte [rdi], '/'
-    inc rdi
-    ; rdi = after slash, now copy entry name from d_name
-    ; We need d_name again, reconstruct from stack
+    ; Build subdir path: dir/name (d_name again, from the stack)
     mov rcx, [rsp + 8]      ; offset (second item on stack)
     lea rsi, [glob_dir_buf + rcx + DIRENT64_D_NAME]
-    call strcpy_rsi_rdi
-    ; Add to queue if space
-    lea rdi, [glob_path_buf]
-    call strlen
+    call .gr_join
+    test rax, rax
+    js .gr_skip_entry
     inc rax                  ; include null
+    ; Room in the queue? Reuse the space of folders already scanned
+    ; first. The queue used to fill up in a big tree and quietly stop
+    ; going deeper, so matches went missing.
     mov rcx, [glob_queue_wpos]
     add rcx, rax
-    cmp rcx, 32000
-    jge .gr_skip_entry       ; queue full
+    cmp rcx, GLOB_QUEUE_MAX
+    jb .gr_q_room
+    push rax
+    call .gr_q_compact
+    pop rax
+    mov rcx, [glob_queue_wpos]
+    add rcx, rax
+    cmp rcx, GLOB_QUEUE_MAX
+    jae .gr_skip_entry       ; the folders still to scan fill it alone
+.gr_q_room:
     lea rdi, [glob_queue]
     add rdi, [glob_queue_wpos]
     lea rsi, [glob_path_buf]
@@ -8736,6 +8739,48 @@ glob_recursive:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; .gr_join — glob_path_buf = r15 "/" rsi, with no "./" in front when **
+; had no folder before it (bash prints sub/x.txt, not ./sub/x.txt).
+; rax = length, or -1 when it would reach the pattern kept at
+; glob_path_buf + 3072 (a long path used to overwrite it).
+.gr_join:
+    push rsi
+    lea rdi, [glob_path_buf]
+    cmp byte [glob_dot_implied], 0
+    je .grj_dir
+    cmp word [r15], 0x002E           ; "."
+    je .grj_name
+.grj_dir:
+    mov rsi, r15
+    call strcpy_rsi_rdi
+    mov byte [rdi], '/'
+    inc rdi
+.grj_name:
+    pop rsi
+    lea rax, [glob_path_buf + 3072 - 256]
+    cmp rdi, rax
+    ja .grj_long
+    call strcpy_rsi_rdi
+    lea rax, [glob_path_buf]
+    sub rdi, rax
+    mov rax, rdi
+    ret
+.grj_long:
+    mov rax, -1
+    ret
+
+; .gr_q_compact — move the folders not yet scanned to the queue's start
+.gr_q_compact:
+    mov rsi, [glob_queue_rpos]
+    mov rcx, [glob_queue_wpos]
+    sub rcx, rsi
+    mov [glob_queue_wpos], rcx
+    mov qword [glob_queue_rpos], 0
+    lea rdi, [glob_queue]
+    lea rsi, [glob_queue + rsi]
+    rep movsb                        ; forward copy, dst below src: safe
     ret
 
 has_glob_chars:
@@ -8783,6 +8828,9 @@ glob_expand_single:
 .ges_do_recursive:
     mov rdi, r12
     call glob_recursive
+    lea rdi, [glob_results]
+    mov rsi, [glob_count]
+    call sort_str_ptrs
     jmp .ges_done
 .ges_no_dstar:
 
