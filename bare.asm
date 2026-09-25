@@ -287,7 +287,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.55", 10, 0
+version_str:    db "bare 0.2.56", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -507,6 +507,8 @@ argc:           resq 1
 
 ; Working directory
 cwd_buf:        resb 4096
+lcd_buf:        resb 8192          ; chdir_logical: cwd + "/" + target, cleaned
+lcd_ok:         resb 1             ; 1 = lcd_buf is the new cwd (cwd_changed)
 
 ; Path search buffer
 path_buf:       resb 4096
@@ -6339,8 +6341,7 @@ parse_and_exec_simple:
 .paes_bm_cd:
     ; cd to bookmark path
     mov rdi, [bm_paths + rcx*8]
-    mov rax, SYS_CHDIR
-    syscall
+    call chdir_logical
     test rax, rax
     js .paes_not_bm
     call cwd_changed
@@ -6382,8 +6383,7 @@ parse_and_exec_simple:
 .paes_ad_cd:
     add rsp, 144
     mov rdi, [r13]
-    mov rax, SYS_CHDIR
-    syscall
+    call chdir_logical
     test rax, rax
     js .paes_cd_fail
     call cwd_changed
@@ -7603,24 +7603,10 @@ check_builtin:
     inc rcx
     jmp .cd_dash_cp
 .cd_dash_ready:
-    ; Save current cwd to prev_dir
-    lea rsi, [cwd_buf]
-    lea rdi, [prev_dir]
-    call strcpy_rsi_rdi
-    lea rdi, [path_buf]     ; target dir
+    lea rdi, [path_buf]     ; target dir (cwd_changed then saves prev_dir)
     mov byte [cd_dash_print], 1
-    jmp .cd_do_chdir
-
 .cd_dir:
-    ; Save current dir before changing
-    push rdi
-    lea rdi, [prev_dir]
-    lea rsi, [cwd_buf]
-    call strcpy_rsi_rdi
-    pop rdi
-.cd_do_chdir:
-    mov rax, SYS_CHDIR
-    syscall
+    call chdir_logical
     test rax, rax
     jns .cd_ok
     ; Error
@@ -7678,8 +7664,7 @@ check_builtin:
     syscall
 
 .bi_pwd:
-    call update_cwd
-    lea rdi, [cwd_buf]
+    lea rdi, [cwd_buf]                   ; logical, like bash's pwd
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
@@ -8059,6 +8044,9 @@ env_storage_pack:
 cwd_changed:
     cmp byte [cwd_buf], 0
     je .cc_new
+    lea rdi, [prev_dir]                  ; cd - comes back here, whatever
+    lea rsi, [cwd_buf]                   ; moved us (autocd skipped it)
+    call strcpy_rsi_rdi
     lea rdi, [pwd_env_buf]
     lea rsi, [cwd_changed_old]
     call strcpy_rsi_rdi
@@ -8067,7 +8055,16 @@ cwd_changed:
     lea rdi, [pwd_env_buf]
     call env_set_entry
 .cc_new:
+    cmp byte [lcd_ok], 0
+    je .cc_physical
+    mov byte [lcd_ok], 0
+    lea rdi, [cwd_buf]
+    lea rsi, [lcd_buf]
+    call strcpy_rsi_rdi                  ; the path chdir_logical used
+    jmp .cc_env
+.cc_physical:
     call update_cwd
+.cc_env:
     lea rdi, [pwd_env_buf]
     lea rsi, [cwd_changed_new]
     call strcpy_rsi_rdi
@@ -11206,6 +11203,103 @@ update_cwd:
     lea rdi, [cwd_buf]
     mov rsi, 4096
     syscall
+    ret
+
+; chdir_logical — rdi = target, rax = the chdir result. cd keeps the path
+; the user typed: a symlinked folder stays in the prompt and $PWD, and ".."
+; climbs back out of it, like bash's default cd -L. The target is joined
+; onto cwd_buf and "." and ".." are dropped as text. If that path fails,
+; plain chdir(target) runs and cwd_changed asks the kernel (isene/bare#14).
+chdir_logical:
+    push rbx
+    mov rbx, rdi
+    mov byte [lcd_ok], 0
+    call strlen
+    cmp eax, 4095
+    ja .cl_physical
+    lea rdi, [lcd_buf]
+    cmp byte [rbx], '/'
+    je .cl_target
+    cmp byte [cwd_buf], '/'
+    jne .cl_physical                     ; no logical cwd to build on
+    lea rsi, [cwd_buf]
+    call strcpy_rsi_rdi                  ; rdi → the NUL
+    mov byte [rdi], '/'
+    inc rdi
+.cl_target:
+    mov rsi, rbx
+    call strcpy_rsi_rdi
+    ; Clean in place. rsi reads, rdi writes; rdi never passes rsi, since
+    ; each written byte stands for one read byte.
+    lea rsi, [lcd_buf + 1]
+    lea rdi, [lcd_buf + 1]
+.cl_comp:
+    mov al, [rsi]
+    cmp al, '/'
+    jne .cl_not_slash
+    inc rsi                              ; "//" → "/"
+    jmp .cl_comp
+.cl_not_slash:
+    test al, al
+    jz .cl_end
+    cmp al, '.'
+    jne .cl_copy
+    mov al, [rsi + 1]
+    test al, al
+    jz .cl_dot
+    cmp al, '/'
+    je .cl_dot
+    cmp al, '.'
+    jne .cl_copy
+    mov al, [rsi + 2]
+    test al, al
+    jz .cl_dotdot
+    cmp al, '/'
+    jne .cl_copy                         ; "..foo" is a name
+.cl_dotdot:
+    add rsi, 2                           ; ".." drops the last written name
+    lea rcx, [lcd_buf + 1]
+.cl_up:
+    cmp rdi, rcx
+    jbe .cl_comp                         ; already at "/"
+    dec rdi
+    cmp byte [rdi], '/'
+    jne .cl_up
+    jmp .cl_comp
+.cl_dot:
+    inc rsi                              ; "." drops out
+    jmp .cl_comp
+.cl_copy:
+    lea rcx, [lcd_buf + 1]
+    cmp rdi, rcx
+    jbe .cl_copy_ch                      ; first name: "/" is already there
+    mov byte [rdi], '/'
+    inc rdi
+.cl_copy_ch:
+    mov al, [rsi]
+    test al, al
+    jz .cl_end
+    cmp al, '/'
+    je .cl_comp
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .cl_copy_ch
+.cl_end:
+    mov byte [rdi], 0
+    mov rax, SYS_CHDIR
+    lea rdi, [lcd_buf]
+    syscall
+    test rax, rax
+    js .cl_physical
+    mov byte [lcd_ok], 1
+    pop rbx
+    ret
+.cl_physical:
+    mov rax, SYS_CHDIR
+    mov rdi, rbx
+    syscall
+    pop rbx
     ret
 
 ; ──────────────────────────────────────────────────────────────────────
@@ -15285,8 +15379,7 @@ handle_pushd:
     jz .hpd_done
     mov rdi, rax
 .hpd_cd:
-    mov rax, SYS_CHDIR
-    syscall
+    call chdir_logical
     test rax, rax
     js .hpd_err
     call cwd_changed
@@ -15331,8 +15424,7 @@ handle_popd:
     dec rax
     mov [dir_stack_count], rax
     mov rdi, [dir_stack + rax*8]
-    mov rax, SYS_CHDIR
-    syscall
+    call chdir_logical
     test rax, rax
     js .hpopd_err
     call cwd_changed
@@ -21049,9 +21141,8 @@ check_lastdir:
 .cld_no_strip:
 
     ; cd to the directory
-    mov rax, SYS_CHDIR
     lea rdi, [suggestion_buf]
-    syscall
+    call chdir_logical
     test rax, rax
     js .cld_done
     call cwd_changed
