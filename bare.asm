@@ -287,7 +287,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.56", 10, 0
+version_str:    db "bare 0.2.57", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix

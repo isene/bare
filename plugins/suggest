@@ -16,8 +16,6 @@ if [ -n "$ANTHROPIC_API_KEY" ]; then
     API_KEY="$ANTHROPIC_API_KEY"
 elif [ -f "$HOME/.config/bare/anthropic_key" ]; then
     API_KEY=$(cat "$HOME/.config/bare/anthropic_key" | tr -d '\n')
-elif [ -f "/home/.safe/anthropic.txt" ]; then
-    API_KEY=$(cat "/home/.safe/anthropic.txt" | tr -d '\n')
 else
     echo "No API key found. Set ANTHROPIC_API_KEY or create ~/.config/bare/anthropic_key"
     exit 1
