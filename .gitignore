@@ -2,3 +2,4 @@ bare
 *.o
 *.deb
 pkgroot/
+.claude/
