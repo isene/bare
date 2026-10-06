@@ -287,7 +287,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.57", 10, 0
+version_str:    db "bare 0.2.58", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -6379,6 +6379,15 @@ parse_and_exec_simple:
     mov rdi, [r13]
     call init_exe_cache.iec_is_dup
     test eax, eax
+    jnz .paes_not_dir
+    ; A script and -c never load the program list, so there every folder
+    ; still won: `test -d x` in a project with a test/ folder did a cd
+    ; and reported success. With no list, ask PATH.
+    cmp qword [exe_cache_pos], 0
+    jne .paes_ad_cd
+    mov rdi, [r13]
+    call find_in_path
+    test rax, rax
     jnz .paes_not_dir
 .paes_ad_cd:
     add rsp, 144
