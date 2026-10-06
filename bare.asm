@@ -287,7 +287,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.58", 10, 0
+version_str:    db "bare 0.2.59", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -6040,8 +6040,7 @@ execute_line:
     inc r13
     jmp .mp_wait_loop
 .mp_wait_done:
-    mov rdi, [my_pid]        ; take the terminal back
-    call tty_set_fg_pgrp
+    call tty_take_back
     ; Get exit status of last child
     mov eax, [rsp]
     call decode_wait_status
@@ -6051,8 +6050,7 @@ execute_line:
 
 .mp_stopped:
     add rsp, 16
-    mov rdi, [my_pid]
-    call tty_set_fg_pgrp
+    call tty_take_back
     call post_child_restore
     ; Put the '|' back so :jobs shows the whole line (the children have
     ; their own copies by now).
@@ -6458,8 +6456,7 @@ parse_and_exec_simple:
     mov [last_status], rax
     add rsp, 16
     ; Take the terminal back before restoring raw mode.
-    mov rdi, [my_pid]
-    call tty_set_fg_pgrp
+    call tty_take_back
     call post_child_restore
     call enable_raw_mode
     jmp .paes_done
@@ -6467,8 +6464,7 @@ parse_and_exec_simple:
 .paes_stopped:
     ; Child was stopped by Ctrl-Z, add to job table
     add rsp, 16
-    mov rdi, [my_pid]
-    call tty_set_fg_pgrp
+    call tty_take_back
     call post_child_restore
     call enable_raw_mode
     mov rdi, r13             ; pid
@@ -16746,6 +16742,22 @@ tty_set_fg_pgrp:
     syscall
     pop rdi
 .tsfp_ret:
+    ret
+
+; tty_take_back: the terminal goes back to bare's own process group.
+; The group is asked for, not taken to be bare's pid: started as a plain
+; child (`sh -c 'bare; ...'`, script(1), su -c) bare sits in its parent's
+; group. Naming its pid there failed, the terminal stayed with the dead
+; command, and the next read of a key ended bare (v0.2.59).
+tty_take_back:
+    cmp qword [is_tty], 0
+    je .ttb_ret
+    mov rax, SYS_GETPGID
+    xor edi, edi
+    syscall
+    mov rdi, rax
+    call tty_set_fg_pgrp
+.ttb_ret:
     ret
 
 ; :jobs - list all jobs
