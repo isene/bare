@@ -2,7 +2,7 @@
 
 <img src="img/bare.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.2.57-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-9%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.2.58-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-9%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, 126KB. **9 microsecond startup.**
 
@@ -189,6 +189,16 @@ See [plugins/README.md](plugins/README.md) for setup and writing your own.
 - `:env`, `:rehash`, `:reload`, `:rmhistory`, `:info`, `:version`, `:help`
 - Auto-correct suggestions on command not found
 - Startup tips (configurable)
+
+## Tests
+
+```bash
+make && test/run.sh
+```
+
+Each check is a fault that was once reported, and it fails on the build
+from before its fix. No screen is needed: bare runs with `-c`, as a
+script, or on a pty made by `script`. GitHub runs them on every push.
 
 ## Part of CHasm (CHange to ASM)
 

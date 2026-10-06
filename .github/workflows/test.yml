@@ -1,0 +1,26 @@
+name: Tests
+
+# Each check in test/run.sh is a fault that was once reported. They need no
+# screen: bare runs with -c, as a script, or on a pty made by script(1).
+
+on:
+  push:
+    paths:
+      - bare.asm
+      - test/**
+      - .github/workflows/test.yml
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm
+      - name: Build
+        run: make
+      - name: Run the checks
+        run: test/run.sh

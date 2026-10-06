@@ -121,6 +121,22 @@ Local labels (`.name`) are scoped to the enclosing global label. A global label 
 - `save_config` / `load_config`: ~/.barerc persistence with multi-terminal safety
 - `handle_backup` / `handle_restore`: config/history snapshots
 
+## Tests
+
+`test/run.sh` holds one check per reported fault. A fix ships with a check
+that fails without it: build the old `bare.asm` (`git show REV^:bare.asm`)
+and run `BARE=/path/to/old test/run.sh` to see it fail.
+
+- The script unsets `DISPLAY` and puts dummy `bare-open` and `xdg-open`
+  first on PATH. An old bare hands a file with no `#!` to `xdg-open`,
+  which opened LibreOffice on the live screen once. Keep both lines.
+- `keys TEXT...` types into bare on a pty. It runs `exec bare`, so bare
+  leads the session; without that, Ctrl-Z on a pipe stops bare itself.
+- The program list is not loaded for `-c` or a script. Code that asks
+  "is this a program?" there must ask `find_in_path`.
+- `bare --version` does not exist; it starts a shell that waits for keys.
+  Use `bare -c ':version'`.
+
 ## Syscalls used
 
 READ, WRITE, OPEN, CLOSE, STAT, IOCTL, PIPE, DUP2, FORK, EXECVE, EXIT, WAIT4, GETCWD, CHDIR, GETDENTS64, GETPID, RT_SIGACTION, CLOCK_GETTIME, GETUID
