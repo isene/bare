@@ -131,7 +131,10 @@ and run `BARE=/path/to/old test/run.sh` to see it fail.
   first on PATH. An old bare hands a file with no `#!` to `xdg-open`,
   which opened LibreOffice on the live screen once. Keep both lines.
 - `keys TEXT...` types into bare on a pty. It runs `exec bare`, so bare
-  leads the session; without that, Ctrl-Z on a pipe stops bare itself.
+  leads the session, as in a terminal. `RUN="$BARE; :" keys ...` starts it
+  as a plain child of sh instead. There bare is in its parent's process
+  group, so its pid is not a group: take the terminal back with
+  `tty_take_back`, never with `my_pid` (v0.2.59).
 - The program list is not loaded for `-c` or a script. Code that asks
   "is this a program?" there must ask `find_in_path`.
 - `bare --version` does not exist; it starts a shell that waits for keys.

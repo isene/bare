@@ -28,10 +28,10 @@ fresh() { cd /; rm -rf "$T/home" "$W"; mkdir "$T/home" "$W"; cd "$W"; }
 b() { HOME=$T/home EDITOR=/bin/true timeout 10 "$BARE" "$@" 2>&1; }
 # keys TEXT...: start bare on a pty and type each TEXT, 0.3 s apart.
 # bare is the session leader there, as in a real terminal. What the
-# terminal was sent ends up in $T/pty.
+# terminal was sent ends up in $T/pty. RUN=... starts bare another way.
 keys() {
     { sleep 0.5; for k; do printf '%b' "$k"; sleep 0.3; done; } |
-        HOME=$T/home SHELL=/bin/sh TERM=xterm timeout 30 script -qec "exec $BARE" /dev/null >"$T/pty" 2>&1
+        HOME=$T/home SHELL=/bin/sh TERM=xterm timeout 30 script -qec "${RUN:-exec $BARE}" /dev/null >"$T/pty" 2>&1
 }
 # is NAME GOT WANT
 is() {
@@ -102,6 +102,17 @@ n=$(wc -c < "$T/pty")
 echo "== v0.2.56: cd keeps the path you typed"
 fresh; mkdir real; ln -s real link
 is "a symlinked folder stays in pwd, .. climbs out" "$(b -c 'cd link; pwd; cd ..; pwd')" "$W/link"$'\n'"$W"
+
+echo "== v0.2.59: bare started as a plain child of another program"
+# sh -c 'bare; :' keeps sh alive, so bare neither leads the session nor
+# its process group. It used to end after its first command there.
+fresh; RUN="$BARE; :" keys '/bin/true\n' 'echo alive > out\n' 'exit\n'
+is "bare lives on after a command"      "$(cat out 2>/dev/null)" alive
+fresh; RUN="$BARE; :" keys 'sleep 9 | sleep 9 | cat\n' '\x1a' ':jobs > out\n' 'exit\n' 'exit\n'
+case $(cat out 2>/dev/null) in
+    *Stopped*'sleep 9 | sleep 9 | cat'*) printf '  ok    Ctrl-Z on a pipe stops the pipe, not bare\n' ;;
+    *) printf '  FAIL  Ctrl-Z on a pipe stops the pipe, not bare: :jobs said %q\n' "$(cat out 2>/dev/null)"; fail=1 ;;
+esac
 
 echo
 [ $fail = 0 ] && echo "bare tests: all good" || echo "bare tests: FAILED"
