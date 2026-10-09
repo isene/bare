@@ -114,6 +114,15 @@ case $(cat out 2>/dev/null) in
     *) printf '  FAIL  Ctrl-Z on a pipe stops the pipe, not bare: :jobs said %q\n' "$(cat out 2>/dev/null)"; fail=1 ;;
 esac
 
+echo "== v0.2.60: a tab list longer than completion_limit"
+# 5 matches and a limit of 3: the list showed f1 f2 f3 and gave no sign of
+# the other two. Tabbing on to f4 picked it, with the list still at f1 f2 f3.
+fresh; printf 'completion_limit = 3\n' > "$T/home/.barerc"; touch f1 f2 f3 f4 f5
+keys 'ls f\t' '\t\t\t' '\n' 'exit\n'
+has() { grep -qF -- "$1" "$T/pty" && echo yes || echo no; }
+is "the list says how many names it left out" "$(has '+2')" yes
+is "tabbing past the last name shown lists the next ones" "$(has 'f5')" yes
+
 echo
 [ $fail = 0 ] && echo "bare tests: all good" || echo "bare tests: FAILED"
 exit $fail
