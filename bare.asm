@@ -287,7 +287,7 @@ colon_dispatch_table:
     dq 0, 0
 
 ; Version string
-version_str:    db "bare 0.2.59", 10, 0
+version_str:    db "bare 0.2.60", 10, 0
 version_str_len equ $ - version_str - 1
 
 ; Config file suffix
@@ -496,6 +496,8 @@ cd_dash_print:  resb 1          ; cd - prints the directory it went to
 stdin_seekable: resb 1          ; 0 unknown, 1 a file, 2 a pipe
 tab_reinject:   resb 1          ; key that closed the tab list, to process
 tab_list_cells: resq 1          ; cells the tab list printed
+tab_page_first: resq 1          ; first name of the page the tab list shows
+tab_page_end:   resq 1          ;   and the one behind its last
 input_fd:       resd 1          ; where commands come from: 0, or the script
 
 ; Leading-env prefix support: `VAR=val [VAR2=val2 ...] cmd args`.
@@ -3604,16 +3606,28 @@ read_line:
     call full_redraw
     call write_nl
     mov qword [tab_list_cells], 0
+    ; completion_limit names are listed at a time (0 = all of them): the
+    ; page that has the selected one, so tabbing on brings the next page.
+    ; It used to list the first page only, whatever was selected.
     xor ecx, ecx
+    mov rax, [tab_count]
+    mov rdi, [completion_limit]
+    test rdi, rdi
+    jz .tab_page_set
+    mov rax, r15
+    xor edx, edx
+    div rdi
+    imul rax, rdi
+    mov rcx, rax                 ; the page's first name
+    add rax, rdi                 ; and the one behind its last
+    cmp rax, [tab_count]
+    jbe .tab_page_set
+    mov rax, [tab_count]
+.tab_page_set:
+    mov [tab_page_first], rcx
+    mov [tab_page_end], rax
 .tab_cycle_print:
-    ; Limit display to completion_limit
-    mov rax, [completion_limit]
-    test rax, rax
-    jz .tab_cycle_use_count
-    cmp rcx, rax
-    jge .tab_cycle_printed
-.tab_cycle_use_count:
-    cmp rcx, [tab_count]
+    cmp rcx, [tab_page_end]
     jge .tab_cycle_printed
     push rcx
     ; Check if this is the selected item
@@ -3745,6 +3759,33 @@ read_line:
 .tab_color_link_len equ $ - .tab_color_link_seq
 
 .tab_cycle_printed:
+    ; Names the limit left out of this page: say how many, as "+11".
+    mov rax, [tab_count]
+    sub rax, [tab_page_end]
+    add rax, [tab_page_first]
+    jz .tab_more_done
+    push rax
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_hl_dim]
+    mov rdx, .tab_hl_dim_len
+    syscall
+    pop rax
+    mov byte [tmp_buf], '+'
+    lea rdi, [tmp_buf + 1]
+    call itoa                    ; rax = digits written
+    lea rdx, [rax + 1]
+    add [tab_list_cells], rdx
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [tmp_buf]
+    syscall
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [.tab_hl_off]
+    mov rdx, 4
+    syscall
+.tab_more_done:
     ; Back to the cursor on the prompt line, by rows. It used ESC[u,
     ; which went one row too low whenever the list scrolled the screen
     ; at the bottom. The list is a newline plus tab_list_cells cells.

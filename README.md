@@ -2,7 +2,7 @@
 
 <img src="img/bare.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.2.59-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-9%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.2.60-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![Binary](https://img.shields.io/badge/binary-~126KB-orange) ![Startup](https://img.shields.io/badge/startup-9%C2%B5s-ff6600) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Interactive shell written in x86_64 Linux assembly. No libc, no runtime, pure syscalls. Single static binary, 126KB. **9 microsecond startup.**
 
@@ -142,6 +142,8 @@ magnitude (h/t @romforth and @Corbin on lobste.rs for prodding).
 ### Line Editing and Completion
 - Interactive tab cycling with LS_COLORS (dirs blue, symlinks gray)
 - Tab completion list rendered visibly below the prompt (no overwrite)
+- A list longer than `completion_limit` shows one page at a time, with `+N`
+  for the names left out; Tab past the last name brings the next page
 - Tab completion for `:commands` (`:th<TAB>` -> `:theme`)
 - `$VAR` tab completion, subcommand completion (git, apt, cargo)
 - Bare path to a non-executable file (e.g. `notes.md`) auto-opens in `$EDITOR`
